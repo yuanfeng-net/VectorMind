@@ -1,0 +1,32 @@
+{
+  "name": "@coreyuan/vector-mind",
+  "version": "1.0.37",
+  "description": "VectorMind MCP: requirement-driven context memory linking file changes to developer intent.",
+  "type": "module",
+  "bin": {
+    "vector-mind": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc && node --input-type=module -e \"import { chmodSync } from 'node:fs'; try { chmodSync('dist/index.js', 0o755); } catch {}\"",
+    "smoke": "node scripts/smoke.mjs",
+    "prepublishOnly": "npm run build"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "latest",
+    "@xenova/transformers": "latest",
+    "better-sqlite3": "latest",
+    "chokidar": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "latest",
+    "@types/node": "latest",
+    "typescript": "latest"
+  }
+}
