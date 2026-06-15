@@ -22,6 +22,8 @@ import { BUILTIN_CONVENTIONS } from "./builtin-conventions.js";
 import {
   BUILTIN_ARCHITECTURE_AND_CODE_ORGANIZATION_INSTRUCTIONS,
   BUILTIN_DESTRUCTIVE_OPERATION_GUARD_INSTRUCTIONS,
+  BUILTIN_FRONTEND_OUTPUT_PURITY_INSTRUCTIONS,
+  BUILTIN_GIT_COMMIT_SUMMARY_INSTRUCTIONS,
   BUILTIN_LOW_OVERHEAD_WORKFLOW_INSTRUCTIONS,
   BUILTIN_PAYLOAD_GUARD_INSTRUCTIONS,
   BUILTIN_PLAN_LITE_INSTRUCTIONS,
@@ -67,14 +69,37 @@ type MemoryItemRow = {
   updated_at: string;
 };
 
+type PendingChangeRow = {
+  file_path: string;
+  last_event: string;
+  updated_at: string;
+  source?: "watcher" | "git";
+  git_status?: string;
+  file_state_hash?: string;
+};
+
 type ExtractedSymbol = {
   name: string;
   type: string;
   signature: string;
 };
 
+type RtkDetection = {
+  available: boolean;
+  version?: string;
+  command: string;
+  note: string;
+  gain_ok?: boolean;
+  gain_preview?: string;
+  path?: string;
+  source?: "path" | "package_shim";
+  exec_command?: string;
+  exec_args_prefix?: string[];
+  exec_shell?: boolean;
+};
+
 const SERVER_NAME = "vector-mind";
-const SERVER_VERSION = "1.0.37";
+const SERVER_VERSION = "1.0.41";
 
 type RootSource = "tool_arg" | "env" | "mcp_roots" | "cwd" | "fallback";
 
@@ -231,9 +256,13 @@ let getConventionByKeyStmt: Database.Statement;
 let insertConventionStmt: Database.Statement;
 let updateConventionByIdStmt: Database.Statement;
 let listConventionsStmt: Database.Statement;
+let upsertDecisionStmt: Database.Statement;
+let getDecisionByKeyStmt: Database.Statement;
+let listCurrentDecisionsStmt: Database.Statement;
 let upsertProjectSummaryStmt: Database.Statement;
 let getProjectSummaryStmt: Database.Statement;
 let listRecentNotesStmt: Database.Statement;
+let getLatestChangeIntentForFileStmt: Database.Statement;
 let deleteFileChunkItemsStmt: Database.Statement;
 let getEmbeddingMetaStmt: Database.Statement;
 let upsertEmbeddingStmt: Database.Statement;
@@ -248,6 +277,10 @@ let deleteOldestPendingChangesStmt: Database.Statement | null = null;
 let deleteSymbolsForFileStmt: Database.Statement;
 let upsertSymbolStmt: Database.Statement;
 let searchSymbolsStmt: Database.Statement;
+let insertTokenSavingsStmt: Database.Statement;
+let summarizeTokenSavingsStmt: Database.Statement;
+let summarizeTokenSavingsByToolStmt: Database.Statement;
+let listRecentTokenSavingsStmt: Database.Statement;
 
 let indexFileSymbolsTx:
   | ((filePath: string, symbols: ExtractedSymbol[]) => void)
@@ -655,6 +688,92 @@ function pathHasIgnoredSegments(posixPath: string): boolean {
 function shouldIgnoreDbFilePath(filePath: string | null): boolean {
   if (!filePath) return false;
   return pathHasIgnoredSegments(filePath);
+}
+
+function isProbablyGitRepository(): boolean {
+  try {
+    return fs.existsSync(path.join(projectRoot, ".git"));
+  } catch {
+    return false;
+  }
+}
+
+function normalizeGitStatusPath(raw: string): string {
+  const first = raw.split("\0")[0] ?? "";
+  return first.trim().replace(/\\/g, "/").replace(/^"(.*)"$/, "$1");
+}
+
+function collectGitPendingChanges(limit: number): PendingChangeRow[] {
+  if (limit <= 0 || !isProbablyGitRepository()) return [];
+  const git = spawnSync("git", ["status", "--porcelain=v1", "-z", "--untracked-files=normal"], {
+    cwd: projectRoot,
+    encoding: "utf8",
+    timeout: 5000,
+    windowsHide: true,
+    maxBuffer: 2_000_000,
+  });
+  if (git.error || git.status !== 0 || !git.stdout) return [];
+
+  const parts = git.stdout.split("\0").filter(Boolean);
+  const rows: PendingChangeRow[] = [];
+  for (let i = 0; i < parts.length && rows.length < limit; i++) {
+    const rec = parts[i] ?? "";
+    const status = rec.slice(0, 2);
+    let rawPath = rec.slice(3);
+    if (status.startsWith("R") || status.startsWith("C")) {
+      // Porcelain -z rename/copy records include the destination in the next NUL field.
+      rawPath = parts[i + 1] ?? rawPath;
+      i += 1;
+    }
+    const filePath = normalizeGitStatusPath(rawPath);
+    if (!filePath || filePath === ".vectormind" || filePath.startsWith(".vectormind/")) continue;
+    rows.push({
+      file_path: filePath,
+      last_event: status.includes("D") ? "unlink" : status === "??" ? "add" : "change",
+      updated_at: new Date().toISOString(),
+      source: "git",
+      git_status: status.trim() || "modified",
+      file_state_hash: getFileStateHash(filePath) ?? undefined,
+    });
+  }
+  return rows;
+}
+
+function mergePendingWithGit(
+  pending: PendingChangeRow[],
+  opts: { offset: number; limit: number },
+): { total: number; page: PendingChangeRow[]; truncated: boolean } {
+  const byPath = new Map<string, PendingChangeRow>();
+  for (const p of pending) {
+    if (shouldIgnoreDbFilePath(p.file_path)) continue;
+    byPath.set(p.file_path, { ...p, source: p.source ?? "watcher" });
+  }
+
+  const gitRows = collectGitPendingChanges(Math.max(500, opts.offset + opts.limit * 4));
+  for (const g of gitRows) {
+    const latestSyncedHash = getLatestSyncedFileHash(g.file_path);
+    if (latestSyncedHash && g.file_state_hash && latestSyncedHash === g.file_state_hash) continue;
+    const existing = byPath.get(g.file_path);
+    if (!existing) {
+      byPath.set(g.file_path, g);
+      continue;
+    }
+    byPath.set(g.file_path, {
+      ...existing,
+      source: existing.source === "watcher" ? "watcher" : g.source,
+      git_status: g.git_status,
+      file_state_hash: g.file_state_hash,
+    });
+  }
+
+  const all = Array.from(byPath.values()).sort((a, b) => {
+    const at = Date.parse(a.updated_at) || 0;
+    const bt = Date.parse(b.updated_at) || 0;
+    if (bt !== at) return bt - at;
+    return a.file_path.localeCompare(b.file_path);
+  });
+  const page = all.slice(opts.offset, opts.offset + opts.limit);
+  return { total: all.length, page, truncated: all.length > opts.offset + opts.limit };
 }
 
 function pruneIgnoredPendingChanges(): void {
@@ -1318,6 +1437,12 @@ const ProjectRootArgSchema = z.object({
   project_root: z.string().optional(),
 });
 
+const OutputFormatSchema = z.object({
+  format: z.enum(["compact", "json"]).optional().default("compact"),
+});
+
+type OutputFormat = z.infer<typeof OutputFormatSchema>["format"];
+
 const StartRequirementArgsSchema = ProjectRootArgSchema.merge(
   z.object({
     title: z.string().min(1),
@@ -1334,13 +1459,13 @@ const SyncChangeIntentArgsSchema = ProjectRootArgSchema.merge(
   }),
 );
 
-const QueryCodebaseArgsSchema = ProjectRootArgSchema.merge(
+const QueryCodebaseArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
   z.object({
     query: z.string().min(1),
   }),
 );
 
-const GrepArgsSchema = ProjectRootArgSchema.merge(
+const GrepArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
   z.object({
     // Pattern to search for. Defaults to regex mode for parity with tools like ripgrep.
     query: z.string().min(1),
@@ -1360,7 +1485,7 @@ const GrepArgsSchema = ProjectRootArgSchema.merge(
   }),
 );
 
-const ReadFileLinesArgsSchema = ProjectRootArgSchema.merge(
+const ReadFileLinesArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
   z.object({
     // Relative to project_root, or an absolute path under project_root.
     path: z.string().min(1),
@@ -1374,7 +1499,7 @@ const ReadFileLinesArgsSchema = ProjectRootArgSchema.merge(
   }),
 );
 
-const ReadFileTextArgsSchema = ProjectRootArgSchema.merge(
+const ReadFileTextArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
   z.object({
     // Relative to project_root, or an absolute path under project_root.
     path: z.string().min(1),
@@ -1387,7 +1512,7 @@ const ReadFileTextArgsSchema = ProjectRootArgSchema.merge(
   }),
 );
 
-const ReadCodexTextFileArgsSchema = ProjectRootArgSchema.merge(
+const ReadCodexTextFileArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
   z.object({
     // Absolute path, file:// URI, or a path under CODEX_HOME / AGENTS_HOME allowed roots.
     path: z.string().min(1),
@@ -1397,7 +1522,7 @@ const ReadCodexTextFileArgsSchema = ProjectRootArgSchema.merge(
   }),
 );
 
-const ListProjectFilesArgsSchema = ProjectRootArgSchema.merge(
+const ListProjectFilesArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
   z.object({
     // Relative directory/file path under project_root. "." means the project root.
     path: z.string().optional().default("."),
@@ -1447,7 +1572,29 @@ const UpsertConventionArgsSchema = ProjectRootArgSchema.merge(
   }),
 );
 
-const DEFAULT_PENDING_LIMIT = 50;
+const UpsertDecisionArgsSchema = ProjectRootArgSchema.merge(
+  z.object({
+    key: z.string().min(1),
+    title: z.string().optional().default(""),
+    content: z.string().min(1),
+    tags: z.array(z.string().min(1)).optional(),
+    supersedes_req_ids: z.array(z.number().int().positive()).optional(),
+    supersedes_memory_ids: z.array(z.number().int().positive()).optional(),
+    related_files: z.array(z.string().min(1)).optional(),
+  }),
+);
+
+const SupersedeMemoryArgsSchema = ProjectRootArgSchema.merge(
+  z.object({
+    superseded_req_ids: z.array(z.number().int().positive()).optional(),
+    superseded_memory_ids: z.array(z.number().int().positive()).optional(),
+    replacement_req_id: z.number().int().positive().optional(),
+    replacement_memory_id: z.number().int().positive().optional(),
+    reason: z.string().min(1),
+  }),
+);
+
+const DEFAULT_PENDING_LIMIT = 10;
 const MAX_PENDING_LIMIT = 2000;
 
 const PendingPagingSchema = z.object({
@@ -1455,26 +1602,29 @@ const PendingPagingSchema = z.object({
   pending_limit: z.number().int().min(1).max(MAX_PENDING_LIMIT).optional().default(DEFAULT_PENDING_LIMIT),
 });
 
-const DEFAULT_PREVIEW_CHARS = 200;
+const DEFAULT_PREVIEW_CHARS = 120;
 const PreviewSchema = z.object({
   preview_chars: z.number().int().min(50).max(10_000).optional().default(DEFAULT_PREVIEW_CHARS),
 });
 
-const DEFAULT_CONTENT_MAX_CHARS = 2000;
+const DEFAULT_CONTENT_MAX_CHARS = 1200;
 const ContentMaxSchema = z.object({
   content_max_chars: z.number().int().min(0).max(200_000).optional().default(DEFAULT_CONTENT_MAX_CHARS),
 });
 
-const DEFAULT_RECENT_REQUIREMENTS = 3;
-const DEFAULT_RECENT_CHANGES_PER_REQ = 5;
-const DEFAULT_RECENT_NOTES = 5;
-const DEFAULT_CONVENTIONS_LIMIT = 20;
+const DEFAULT_RECENT_REQUIREMENTS = 2;
+const DEFAULT_RECENT_CHANGES_PER_REQ = 3;
+const DEFAULT_RECENT_NOTES = 3;
+const DEFAULT_CONVENTIONS_LIMIT = 0;
+const DEFAULT_DECISIONS_LIMIT = 5;
+const MAX_DECISIONS_LIMIT = 50;
 
 const BrainDumpLimitsSchema = z.object({
   requirements_limit: z.number().int().min(1).max(20).optional().default(DEFAULT_RECENT_REQUIREMENTS),
   changes_limit: z.number().int().min(1).max(100).optional().default(DEFAULT_RECENT_CHANGES_PER_REQ),
   notes_limit: z.number().int().min(0).max(50).optional().default(DEFAULT_RECENT_NOTES),
   conventions_limit: z.number().int().min(0).max(200).optional().default(DEFAULT_CONVENTIONS_LIMIT),
+  decisions_limit: z.number().int().min(0).max(MAX_DECISIONS_LIMIT).optional().default(DEFAULT_DECISIONS_LIMIT),
 });
 
 const GetPendingChangesArgsSchema = ProjectRootArgSchema.merge(
@@ -1509,6 +1659,7 @@ const GetActivitySummaryArgsSchema = ProjectRootArgSchema.merge(
 const ClearActivityLogArgsSchema = ProjectRootArgSchema;
 
 const GetBrainDumpArgsSchema = ProjectRootArgSchema.merge(PendingPagingSchema)
+  .merge(OutputFormatSchema)
   .merge(PreviewSchema)
   .merge(ContentMaxSchema)
   .merge(BrainDumpLimitsSchema)
@@ -1521,18 +1672,19 @@ const GetBrainDumpArgsSchema = ProjectRootArgSchema.merge(PendingPagingSchema)
 const BootstrapContextArgsSchema = ProjectRootArgSchema.merge(
   z.object({
     query: z.string().optional(),
-    top_k: z.number().int().min(1).max(50).optional().default(5),
+    top_k: z.number().int().min(1).max(50).optional().default(3),
     kinds: z.array(z.string().min(1)).optional(),
     include_content: z.boolean().optional().default(false),
     pending_offset: z.number().int().min(0).optional().default(0),
     pending_limit: z.number().int().min(1).max(MAX_PENDING_LIMIT).optional().default(DEFAULT_PENDING_LIMIT),
   })
+    .merge(OutputFormatSchema)
     .merge(PreviewSchema)
     .merge(ContentMaxSchema)
     .merge(BrainDumpLimitsSchema),
 );
 
-const SemanticSearchArgsSchema = ProjectRootArgSchema.merge(
+const SemanticSearchArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
   z.object({
     query: z.string().min(1),
     top_k: z.number().int().min(1).max(50).optional().default(8),
@@ -1544,6 +1696,28 @@ const SemanticSearchArgsSchema = ProjectRootArgSchema.merge(
 );
 
 const ProjectRootOnlyArgsSchema = ProjectRootArgSchema;
+
+const GetTokenSavingsArgsSchema = ProjectRootArgSchema.merge(
+  z.object({
+    limit: z.number().int().min(1).max(100).optional().default(10),
+    format: z.enum(["compact", "json"]).optional().default("compact"),
+  }),
+);
+
+const DetectRtkArgsSchema = ProjectRootArgSchema;
+
+const InstallRtkArgsSchema = ProjectRootArgSchema.merge(
+  z.object({
+    dry_run: z.boolean().optional().default(true),
+    method: z.enum(["auto", "cargo", "brew", "shell_script"]).optional().default("auto"),
+    init: z
+      .enum(["none", "global_no_patch", "global_auto_patch", "global_hook_only", "local", "codex_global", "codex_local"])
+      .optional()
+      .default("none"),
+    uninstall_wrong_cargo_rtk: z.boolean().optional().default(false),
+    timeout_ms: z.number().int().min(10_000).max(1_800_000).optional().default(600_000),
+  }),
+);
 
 const ReadMemoryItemArgsSchema = ProjectRootArgSchema.merge(
   z.object({
@@ -1561,6 +1735,27 @@ function sha256Hex(input: string): string {
   return crypto.createHash("sha256").update(input).digest("hex");
 }
 
+function getFileStateHash(dbOrAbsPath: string): string | null {
+  try {
+    const abs = path.isAbsolute(dbOrAbsPath) ? dbOrAbsPath : path.join(projectRoot, dbOrAbsPath);
+    const st = fs.statSync(abs);
+    if (!st.isFile()) return sha256Hex(`non-file:${st.mtimeMs}:${st.size}`);
+    if (st.size <= 5_000_000) {
+      return crypto.createHash("sha256").update(fs.readFileSync(abs)).digest("hex");
+    }
+    return sha256Hex(`large:${st.size}:${Math.floor(st.mtimeMs)}`);
+  } catch {
+    return sha256Hex("missing");
+  }
+}
+
+function getLatestSyncedFileHash(dbFilePath: string): string | null {
+  const row = getLatestChangeIntentForFileStmt?.get(dbFilePath) as MemoryItemRow | undefined;
+  if (!row) return null;
+  const meta = parseMetadataJson(row.metadata_json);
+  return typeof meta.file_state_hash === "string" ? meta.file_state_hash : null;
+}
+
 function safeJson(value: unknown): string | null {
   if (value === undefined) return null;
   try {
@@ -1572,6 +1767,639 @@ function safeJson(value: unknown): string | null {
 
 function toolJson(value: unknown): string {
   return JSON.stringify(value, null, prettyJsonOutput ? 2 : undefined);
+}
+
+function estimateTokens(text: string): number {
+  if (!text) return 0;
+  return Math.ceil(text.length / 4);
+}
+
+function recordTokenSavings(tool: string, rawText: string, outputText: string): void {
+  if (!db || !insertTokenSavingsStmt) return;
+  const rawTokens = estimateTokens(rawText);
+  const outputTokens = estimateTokens(outputText);
+  const savedTokens = Math.max(0, rawTokens - outputTokens);
+  const savingsPct = rawTokens > 0 ? (savedTokens / rawTokens) * 100 : 0;
+  try {
+    insertTokenSavingsStmt.run(tool, rawTokens, outputTokens, savedTokens, savingsPct);
+  } catch (err) {
+    console.error("[vectormind] token savings record failed:", err);
+  }
+}
+
+function toolText(tool: string, rawValue: unknown, compactText: string, format: "compact" | "json" = "compact"): string {
+  const rawText = toolJson(rawValue);
+  if (format === "json") return rawText;
+  recordTokenSavings(tool, rawText, compactText);
+  return compactText;
+}
+
+function toolCompactOrJson(tool: string, rawValue: unknown, compactText: string, format: OutputFormat): string {
+  return toolText(tool, rawValue, compactText, format);
+}
+
+function oneLine(input: string | null | undefined, max = 120): string {
+  const text = (input ?? "").replace(/\s+/g, " ").trim();
+  if (text.length <= max) return text;
+  return `${text.slice(0, Math.max(0, max - 3))}...`;
+}
+
+function compactMemoryLabel(item: ReturnType<typeof toMemoryItemPreview>, max = 120): string {
+  const title = item.title ? ` ${oneLine(item.title, 48)}` : "";
+  const loc = item.file_path ? ` ${item.file_path}${item.start_line != null ? `:${item.start_line}` : ""}` : "";
+  const body = item.preview ? ` — ${oneLine(item.preview, max)}` : "";
+  return `#${item.id} ${item.kind}${title}${loc}${body}`;
+}
+
+function compactRequirementLabel(req: ReturnType<typeof toRequirementPreview>): string {
+  const ctx = req.context_preview ? ` — ${oneLine(req.context_preview, 100)}` : "";
+  const mem = req.memory_item_id ? ` mem#${req.memory_item_id}` : "";
+  return `req#${req.id}${mem} [${req.status}] ${oneLine(req.title, 80)}${ctx}`;
+}
+
+function compactChangeLabel(change: ReturnType<typeof toChangeLogPreview>): string {
+  return `change#${change.id} ${change.file_path}: ${oneLine(change.intent_preview, 120)}`;
+}
+
+function compactPendingLabel(p: { file_path: string; last_event: string; updated_at: string }): string {
+  const source = "source" in p && p.source === "git" ? " git" : "";
+  const status = "git_status" in p && p.git_status ? ` ${p.git_status}` : "";
+  return `${p.last_event}${source}${status} ${p.file_path}`;
+}
+
+function compactSemanticSearchText(data: { ok?: boolean } & SemanticSearchResult): string {
+  const lines: string[] = [
+    `semantic ${data.mode} ${data.matches.length}/${data.top_k} q="${oneLine(data.query, 100)}"`,
+  ];
+  for (const m of data.matches.slice(0, data.top_k)) {
+    lines.push(`- score=${m.score.toFixed(3)} ${compactMemoryLabel(m.item, 160)}`);
+  }
+  if (!data.matches.length) lines.push("- no matches");
+  lines.push("hint: use format=json for full metadata; read_memory_item(id) for full content");
+  return lines.join("\n");
+}
+
+function compactGrepText(data: {
+  ok?: boolean;
+  backend: GrepBackend;
+  fallback_reason?: string;
+  ripgrep_error?: string;
+  query: string;
+  mode: "regex" | "literal";
+  matches: GrepMatch[];
+  total_matches?: number;
+  truncated: boolean;
+  candidates?: { total: number; scanned: number };
+}): string {
+  const total = data.total_matches ?? data.matches.length;
+  const fallback = data.fallback_reason ? ` fallback=${data.fallback_reason}` : "";
+  const candidateText = data.candidates ? ` candidates=${data.candidates.scanned}/${data.candidates.total}` : "";
+  const lines = [
+    `grep ${data.backend}${fallback} mode=${data.mode} matches=${data.matches.length}/${total} truncated=${data.truncated}${candidateText} q="${oneLine(data.query, 100)}"`,
+  ];
+  if (data.ripgrep_error) lines.push(`ripgrep_error ${oneLine(data.ripgrep_error, 180)}`);
+  for (const m of data.matches.slice(0, 80)) {
+    lines.push(`${m.file_path}:${m.line}:${m.col}: ${oneLine(m.preview, 220)}`);
+  }
+  if (!data.matches.length) lines.push("- no matches");
+  if (data.truncated) lines.push("hint: refine query/include_paths or raise max_results; use format=json for full match objects");
+  return lines.join("\n");
+}
+
+function compactListProjectFilesText(data: {
+  path: string;
+  path_kind: string;
+  recursive: boolean;
+  max_depth: number;
+  returned: number;
+  scanned: number;
+  truncated: boolean;
+  entries: ProjectFileListEntry[];
+}): string {
+  const lines = [
+    `files path=${data.path} kind=${data.path_kind} returned=${data.returned} scanned=${data.scanned} recursive=${data.recursive} depth=${data.max_depth} truncated=${data.truncated}`,
+  ];
+  for (const e of data.entries.slice(0, 200)) {
+    const stat = e.size != null ? ` ${e.size}B` : "";
+    lines.push(`${e.kind === "dir" ? "d" : "f"} ${e.path}${stat}`);
+  }
+  if (!data.entries.length) lines.push("- empty");
+  if (data.truncated) lines.push("hint: narrow path/filters or raise max_results; use format=json for full entry metadata");
+  return lines.join("\n");
+}
+
+function compactReadTextFileText(data: {
+  file_path: string;
+  offset?: number;
+  returned_chars: number;
+  total_chars: number;
+  truncated: boolean;
+  text: string;
+}): string {
+  const offset = data.offset != null ? ` offset=${data.offset}` : "";
+  const header = `file ${data.file_path}${offset} chars=${data.returned_chars}/${data.total_chars} truncated=${data.truncated}`;
+  const hint = data.truncated ? "\nhint: continue with offset or read_file_lines; use format=json for metadata fields" : "";
+  return `${header}\n${data.text}${hint}`;
+}
+
+function compactReadFileLinesText(data: {
+  file_path: string;
+  from_line: number;
+  to_line: number;
+  returned: number;
+  truncated: boolean;
+  text: string;
+}): string {
+  const header = `lines ${data.file_path}:${data.from_line}-${data.to_line} returned=${data.returned} truncated=${data.truncated}`;
+  const hint = data.truncated ? "\nhint: narrow range or raise max_lines/max_chars; use format=json for metadata fields" : "";
+  return `${header}\n${data.text}${hint}`;
+}
+
+function compactQueryCodebaseText(data: { query: string; matches: SymbolRow[] }): string {
+  const lines = [`query_codebase matches=${data.matches.length} q="${oneLine(data.query, 100)}"`];
+  for (const m of data.matches.slice(0, 50)) {
+    lines.push(`${m.file_path}: ${m.type} ${m.name}${m.signature ? ` — ${oneLine(m.signature, 160)}` : ""}`);
+  }
+  if (!data.matches.length) lines.push("- no matches");
+  return lines.join("\n");
+}
+
+function compactBootstrapText(data: {
+  generated_at: string;
+  project_root: string;
+  root_source: RootSource;
+  watcher_enabled: boolean;
+  watcher_ready: boolean;
+  project_summary: ReturnType<typeof toMemoryItemPreview> | null;
+  decisions: Array<ReturnType<typeof toMemoryItemPreview>>;
+  conventions: Array<ReturnType<typeof toMemoryItemPreview>>;
+  recent_notes: Array<ReturnType<typeof toMemoryItemPreview>>;
+  pending_total: number;
+  pending_offset: number;
+  pending_limit: number;
+  pending_truncated: boolean;
+  pending_changes: PendingChangeRow[];
+  items: Array<{
+    requirement: ReturnType<typeof toRequirementPreview>;
+    recent_changes: Array<ReturnType<typeof toChangeLogPreview>>;
+  }>;
+  semantic?: SemanticSearchResult | null;
+}): string {
+  const lines: string[] = [];
+  lines.push(
+    `ok ctx ${data.root_source} watcher=${data.watcher_enabled ? (data.watcher_ready ? "ready" : "starting") : "off"} root=${data.project_root}`,
+  );
+  if (data.project_summary) lines.push(`summary ${compactMemoryLabel(data.project_summary, 140)}`);
+  if (data.decisions.length) {
+    lines.push("current decisions:");
+    for (const d of data.decisions.slice(0, 5)) lines.push(`- ${compactMemoryLabel(d, 160)}`);
+  }
+  if (data.pending_total) {
+    lines.push(
+      `pending ${data.pending_changes.length}/${data.pending_total}${data.pending_truncated ? " truncated" : ""}: ${data.pending_changes
+        .slice(0, 8)
+        .map(compactPendingLabel)
+        .join("; ")}`,
+    );
+  } else {
+    lines.push("pending 0");
+  }
+  if (data.items.length) {
+    lines.push("requirements:");
+    for (const item of data.items) {
+      lines.push(`- ${compactRequirementLabel(item.requirement)}`);
+      for (const c of item.recent_changes.slice(0, 3)) lines.push(`  - ${compactChangeLabel(c)}`);
+    }
+  } else {
+    lines.push("requirements: none");
+  }
+  if (data.recent_notes.length) {
+    lines.push("notes:");
+    for (const n of data.recent_notes.slice(0, 3)) lines.push(`- ${compactMemoryLabel(n, 120)}`);
+  }
+  if (data.conventions.length) {
+    lines.push(
+      `conventions ${data.conventions.length}: ${data.conventions
+        .slice(0, 5)
+        .map((c) => c.title ?? `#${c.id}`)
+        .join(", ")}`,
+    );
+  }
+  if (data.semantic) {
+    lines.push(`semantic ${data.semantic.mode} ${data.semantic.matches.length}/${data.semantic.top_k} for "${oneLine(data.semantic.query, 80)}":`);
+    for (const m of data.semantic.matches.slice(0, 5)) {
+      lines.push(`- score=${m.score.toFixed(3)} ${compactMemoryLabel(m.item, 120)}`);
+    }
+  }
+  lines.push("hint: use format=json for full structured output; read_memory_item(id) for full content");
+  return lines.join("\n");
+}
+
+function compactBrainDumpText(data: Parameters<typeof compactBootstrapText>[0]): string {
+  return compactBootstrapText(data);
+}
+
+function shellQuoteArg(arg: string): string {
+  if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(arg)) return arg;
+  if (process.platform === "win32") return `"${arg.replace(/"/g, '\\"')}"`;
+  return `'${arg.replace(/'/g, "'\\''")}'`;
+}
+
+function getPackageRtkShimPath(): string | null {
+  try {
+    const currentDir = path.dirname(fileURLToPath(import.meta.url));
+    const candidate = path.join(currentDir, "rtk-shim.js");
+    if (fs.existsSync(candidate)) return candidate;
+  } catch {
+    // import.meta.url may be unavailable only in unexpected runtimes.
+  }
+  return null;
+}
+
+function runRtkProbe(spec: {
+  source: "path" | "package_shim";
+  displayCommand: string;
+  execCommand: string;
+  execArgsPrefix?: string[];
+  execShell?: boolean;
+  path?: string;
+}): RtkDetection | null {
+  const argsPrefix = spec.execArgsPrefix ?? [];
+  const result = spawnSync(spec.execCommand, [...argsPrefix, "--version"], {
+    encoding: "utf8",
+    timeout: 120_000,
+    windowsHide: true,
+    shell: spec.execShell ?? false,
+  });
+  if (result.status === 0) {
+    const gain = spawnSync(spec.execCommand, [...argsPrefix, "gain"], {
+      encoding: "utf8",
+      timeout: 120_000,
+      windowsHide: true,
+      shell: spec.execShell ?? false,
+    });
+    let resolvedPath = spec.path;
+    if (spec.source === "path") {
+      const whereCommand = process.platform === "win32" ? "where.exe" : "which";
+      const whereResult = spawnSync(whereCommand, ["rtk"], {
+        encoding: "utf8",
+        timeout: 2000,
+        windowsHide: true,
+      });
+      resolvedPath = whereResult.status === 0 ? oneLine(whereResult.stdout, 240) : resolvedPath;
+    }
+    const gainText = `${gain.stdout}${gain.stderr}`.trim();
+    return {
+      available: gain.status === 0,
+      command: spec.displayCommand,
+      version: `${result.stdout}${result.stderr}`.trim(),
+      gain_ok: gain.status === 0,
+      gain_preview: oneLine(gainText, 240),
+      path: resolvedPath,
+      source: spec.source,
+      exec_command: spec.execCommand,
+      exec_args_prefix: argsPrefix,
+      exec_shell: spec.execShell ?? false,
+      note:
+        gain.status === 0
+          ? spec.source === "package_shim"
+            ? `Prefer prefixing shell commands with ${spec.displayCommand} for compact outputs. This is VectorMind's bundled RTK shim; first run auto-installs/caches rtk-ai/rtk if needed.`
+            : "Prefer prefixing shell commands with rtk for compact outputs, e.g. rtk git status / rtk npm run build / rtk rg pattern ."
+          : spec.source === "package_shim"
+            ? "VectorMind's bundled RTK shim exists, but `gain` failed. Check network/cache or set VECTORMIND_RTK_REAL to an existing rtk-ai/rtk binary."
+            : "An rtk binary exists, but `rtk gain` failed. This may be the wrong rtk project. Use install_rtk with uninstall_wrong_cargo_rtk=true only after confirming it is safe.",
+    };
+  }
+  return null;
+}
+
+function detectRtk(): RtkDetection {
+  const pathProbe = runRtkProbe({
+    source: "path",
+    displayCommand: "rtk",
+    execCommand: "rtk",
+    execShell: process.platform === "win32",
+  });
+  if (pathProbe?.available) return pathProbe;
+
+  const shimPath = getPackageRtkShimPath();
+  if (shimPath) {
+    const displayCommand = `node ${shellQuoteArg(shimPath)}`;
+    const shimProbe = runRtkProbe({
+      source: "package_shim",
+      displayCommand,
+      execCommand: process.execPath,
+      execArgsPrefix: [shimPath],
+      path: shimPath,
+    });
+    if (shimProbe) return shimProbe;
+  }
+
+  if (pathProbe) return pathProbe;
+
+  return {
+    available: false,
+    command: shimPath ? `node ${shellQuoteArg(shimPath)}` : "rtk",
+    path: shimPath ?? undefined,
+    source: shimPath ? "package_shim" : undefined,
+    note: shimPath
+      ? "rtk was not found on PATH, and VectorMind's bundled RTK shim could not verify rtk gain. VectorMind compact MCP output still works; check network/cache or set VECTORMIND_RTK_REAL."
+      : "rtk was not found on PATH and the package RTK shim is unavailable. VectorMind compact MCP output still works; install rtk to compact shell command output too.",
+  };
+}
+
+function commandExists(command: string): boolean {
+  const probe = process.platform === "win32" ? "where.exe" : "which";
+  const result = spawnSync(probe, [command], { encoding: "utf8", timeout: 2000, windowsHide: true });
+  return result.status === 0;
+}
+
+function runInstallStep(command: string, args: string[], timeoutMs: number): {
+  command: string;
+  status: number | null;
+  ok: boolean;
+  output: string;
+} {
+  const result = spawnSync(command, args, {
+    encoding: "utf8",
+    timeout: timeoutMs,
+    windowsHide: true,
+    shell: false,
+  });
+  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
+  return {
+    command: [command, ...args].join(" "),
+    status: result.status,
+    ok: result.status === 0,
+    output: oneLine(output, 1200),
+  };
+}
+
+function runDetectedRtkStep(detected: RtkDetection, args: string[], timeoutMs: number): {
+  command: string;
+  status: number | null;
+  ok: boolean;
+  output: string;
+} {
+  const execCommand = detected.exec_command ?? "rtk";
+  const argsPrefix = detected.exec_args_prefix ?? [];
+  const result = spawnSync(execCommand, [...argsPrefix, ...args], {
+    encoding: "utf8",
+    timeout: timeoutMs,
+    windowsHide: true,
+    shell: detected.exec_shell ?? (execCommand === "rtk" && process.platform === "win32"),
+  });
+  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
+  return {
+    command: [detected.command, ...args].join(" "),
+    status: result.status,
+    ok: result.status === 0,
+    output: oneLine(output, 1200),
+  };
+}
+
+function appendRtkInitStep(
+  steps: Array<{ command: string; status: number | null; ok: boolean; output: string }>,
+  detected: RtkDetection,
+  init: z.infer<typeof InstallRtkArgsSchema>["init"],
+  timeoutMs: number,
+): void {
+  if (init === "none") return;
+  if (init === "global_no_patch") steps.push(runDetectedRtkStep(detected, ["init", "-g", "--no-patch"], timeoutMs));
+  if (init === "global_auto_patch") steps.push(runDetectedRtkStep(detected, ["init", "-g", "--auto-patch"], timeoutMs));
+  if (init === "global_hook_only") {
+    steps.push(runDetectedRtkStep(detected, ["init", "-g", "--hook-only", "--no-patch"], timeoutMs));
+  }
+  if (init === "local") steps.push(runDetectedRtkStep(detected, ["init"], timeoutMs));
+  if (init === "codex_global") steps.push(runDetectedRtkStep(detected, ["init", "-g", "--codex"], timeoutMs));
+  if (init === "codex_local") steps.push(runDetectedRtkStep(detected, ["init", "--codex"], timeoutMs));
+}
+
+function chooseRtkInstallMethod(method: "auto" | "cargo" | "brew" | "shell_script"): "cargo" | "brew" | "shell_script" {
+  if (method !== "auto") return method;
+  if (process.platform === "darwin" && commandExists("brew")) return "brew";
+  if (commandExists("cargo")) return "cargo";
+  return "shell_script";
+}
+
+function buildRtkInstallPlan(args: z.infer<typeof InstallRtkArgsSchema>): {
+  method: "cargo" | "brew" | "shell_script";
+  commands: string[];
+  notes: string[];
+} {
+  const method = chooseRtkInstallMethod(args.method);
+  const commands: string[] = [];
+  const notes: string[] = [];
+
+  if (args.uninstall_wrong_cargo_rtk) {
+    commands.push("cargo uninstall rtk");
+    notes.push("Only use uninstall_wrong_cargo_rtk after verifying the existing rtk is the wrong Cargo package.");
+  }
+
+  if (method === "brew") {
+    commands.push("brew install rtk");
+  } else if (method === "cargo") {
+    commands.push("cargo install --git https://github.com/rtk-ai/rtk");
+  } else {
+    if (process.platform === "win32") {
+      notes.push("shell_script install is Linux/macOS-oriented; on Windows prefer method=cargo after installing Rust/Cargo.");
+      commands.push("cargo install --git https://github.com/rtk-ai/rtk");
+    } else {
+      commands.push("curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/master/install.sh | sh");
+    }
+  }
+
+  commands.push("rtk --version");
+  commands.push("rtk gain");
+
+  if (args.init === "global_no_patch") commands.push("rtk init -g --no-patch");
+  if (args.init === "global_auto_patch") commands.push("rtk init -g --auto-patch");
+  if (args.init === "global_hook_only") commands.push("rtk init -g --hook-only --no-patch");
+  if (args.init === "local") commands.push("rtk init");
+  if (args.init === "codex_global") commands.push("rtk init -g --codex");
+  if (args.init === "codex_local") commands.push("rtk init --codex");
+
+  if (args.init !== "none") {
+    notes.push("rtk init may modify Claude/RTK configuration. Use init=none for binary-only installation.");
+  }
+
+  return { method, commands, notes };
+}
+
+function installRtk(args: z.infer<typeof InstallRtkArgsSchema>): {
+  ok: boolean;
+  dry_run: boolean;
+  already_available: boolean;
+  method: string;
+  commands: string[];
+  notes: string[];
+  steps: Array<{ command: string; status: number | null; ok: boolean; output: string }>;
+  detected_before: ReturnType<typeof detectRtk>;
+  detected_after?: ReturnType<typeof detectRtk>;
+} {
+  const detectedBefore = detectRtk();
+  const plan = buildRtkInstallPlan(args);
+  const steps: Array<{ command: string; status: number | null; ok: boolean; output: string }> = [];
+  const notes = [...plan.notes];
+
+  if (detectedBefore.available) {
+    notes.push("rtk is already installed and verified with `rtk gain`; installation skipped.");
+    if (!args.dry_run && args.init !== "none") {
+      appendRtkInitStep(steps, detectedBefore, args.init, args.timeout_ms);
+    }
+    return {
+      ok: true,
+      dry_run: args.dry_run,
+      already_available: true,
+      method: plan.method,
+      commands: plan.commands,
+      notes,
+      steps,
+      detected_before: detectedBefore,
+      detected_after: detectedBefore,
+    };
+  }
+
+  if (args.dry_run) {
+    notes.push("dry_run=true: no command was executed. Call install_rtk with dry_run=false to install.");
+    return {
+      ok: true,
+      dry_run: true,
+      already_available: false,
+      method: plan.method,
+      commands: plan.commands,
+      notes,
+      steps,
+      detected_before: detectedBefore,
+    };
+  }
+
+  if (plan.method === "brew") {
+    steps.push(runInstallStep("brew", ["install", "rtk"], args.timeout_ms));
+  } else if (plan.method === "cargo") {
+    if (args.uninstall_wrong_cargo_rtk) {
+      steps.push(runInstallStep("cargo", ["uninstall", "rtk"], args.timeout_ms));
+    }
+    steps.push(runInstallStep("cargo", ["install", "--git", "https://github.com/rtk-ai/rtk"], args.timeout_ms));
+  } else if (process.platform === "win32") {
+    notes.push("Windows fallback uses Cargo because the upstream shell installer targets POSIX shells.");
+    if (args.uninstall_wrong_cargo_rtk) {
+      steps.push(runInstallStep("cargo", ["uninstall", "rtk"], args.timeout_ms));
+    }
+    steps.push(runInstallStep("cargo", ["install", "--git", "https://github.com/rtk-ai/rtk"], args.timeout_ms));
+  } else {
+    const script =
+      "curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/master/install.sh | sh";
+    steps.push(runInstallStep("sh", ["-c", script], args.timeout_ms));
+  }
+
+  const detectedAfterInstall = detectRtk();
+  if (detectedAfterInstall.available && args.init !== "none") {
+    appendRtkInitStep(steps, detectedAfterInstall, args.init, args.timeout_ms);
+  }
+
+  const detectedAfter = detectRtk();
+  return {
+    ok: detectedAfter.available,
+    dry_run: false,
+    already_available: false,
+    method: plan.method,
+    commands: plan.commands,
+    notes,
+    steps,
+    detected_before: detectedBefore,
+    detected_after: detectedAfter,
+  };
+}
+
+function compactInstallRtkText(data: ReturnType<typeof installRtk>): string {
+  const lines: string[] = [];
+  lines.push(
+    `install_rtk ok=${data.ok} dry_run=${data.dry_run} already_available=${data.already_available} method=${data.method}`,
+  );
+  lines.push(
+    `before available=${data.detected_before.available} version=${data.detected_before.version ?? "none"} gain_ok=${data.detected_before.gain_ok ?? false}`,
+  );
+  if (data.detected_after) {
+    lines.push(
+      `after available=${data.detected_after.available} version=${data.detected_after.version ?? "none"} gain_ok=${data.detected_after.gain_ok ?? false}`,
+    );
+  }
+  if (data.commands.length) {
+    lines.push("commands:");
+    for (const command of data.commands) lines.push(`- ${command}`);
+  }
+  if (data.steps.length) {
+    lines.push("steps:");
+    for (const step of data.steps) {
+      lines.push(`- ${step.ok ? "ok" : "fail"} [${step.status ?? "null"}] ${step.command}: ${oneLine(step.output, 240)}`);
+    }
+  }
+  if (data.notes.length) {
+    lines.push("notes:");
+    for (const note of data.notes) lines.push(`- ${note}`);
+  }
+  return lines.join("\n");
+}
+
+function tokenSavingsSummary(limit: number) {
+  const summary = summarizeTokenSavingsStmt.get() as
+    | {
+        calls: number;
+        raw_tokens: number;
+        output_tokens: number;
+        saved_tokens: number;
+        avg_savings_pct: number;
+      }
+    | undefined;
+  const by_tool = summarizeTokenSavingsByToolStmt.all(limit) as Array<{
+    tool: string;
+    calls: number;
+    raw_tokens: number;
+    output_tokens: number;
+    saved_tokens: number;
+    avg_savings_pct: number;
+  }>;
+  const recent = listRecentTokenSavingsStmt.all(limit) as Array<{
+    id: number;
+    tool: string;
+    raw_tokens: number;
+    output_tokens: number;
+    saved_tokens: number;
+    savings_pct: number;
+    created_at: string;
+  }>;
+  return {
+    ok: true,
+    summary: summary ?? { calls: 0, raw_tokens: 0, output_tokens: 0, saved_tokens: 0, avg_savings_pct: 0 },
+    by_tool,
+    recent,
+  };
+}
+
+function compactTokenSavingsText(data: ReturnType<typeof tokenSavingsSummary>): string {
+  const s = data.summary;
+  const pct = Number(s.raw_tokens) > 0 ? (Number(s.saved_tokens) / Number(s.raw_tokens)) * 100 : 0;
+  const lines = [
+    `token_savings calls=${s.calls} raw=${s.raw_tokens} out=${s.output_tokens} saved=${s.saved_tokens} (${pct.toFixed(1)}%)`,
+  ];
+  if (data.by_tool.length) {
+    lines.push("by_tool:");
+    for (const t of data.by_tool.slice(0, 10)) {
+      lines.push(
+        `- ${t.tool}: calls=${t.calls} saved=${t.saved_tokens} raw=${t.raw_tokens} out=${t.output_tokens} avg=${Number(
+          t.avg_savings_pct,
+        ).toFixed(1)}%`,
+      );
+    }
+  }
+  if (data.recent.length) {
+    lines.push("recent:");
+    for (const r of data.recent.slice(0, 10)) {
+      lines.push(`- #${r.id} ${r.tool}: ${r.raw_tokens}->${r.output_tokens} saved=${r.saved_tokens}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 function sliceTextForOutput(
@@ -1780,6 +2608,90 @@ type SemanticSearchOpts = {
   contentMaxChars: number;
 };
 
+function parseMetadataJson(metadata: string | null | undefined): Record<string, unknown> {
+  if (!metadata) return {};
+  try {
+    const parsed = JSON.parse(metadata);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function metadataStatus(row: { metadata_json?: string | null }): string {
+  const meta = parseMetadataJson(row.metadata_json);
+  return typeof meta.status === "string" ? meta.status : "";
+}
+
+function isSupersededMemory(row: { metadata_json?: string | null }): boolean {
+  const meta = parseMetadataJson(row.metadata_json);
+  return meta.superseded === true || meta.status === "superseded";
+}
+
+function semanticRecencyWeight(updatedAt: string | null | undefined): number {
+  if (!updatedAt) return 0;
+  const t = Date.parse(updatedAt.endsWith("Z") ? updatedAt : `${updatedAt}Z`);
+  if (!Number.isFinite(t)) return 0;
+  const ageDays = Math.max(0, (Date.now() - t) / 86_400_000);
+  if (ageDays <= 1) return 0.8;
+  if (ageDays <= 7) return 0.45;
+  if (ageDays <= 30) return 0.2;
+  return 0;
+}
+
+function semanticKindWeight(kind: string): number {
+  switch (kind) {
+    case "decision":
+      return 3.5;
+    case "convention":
+      return 2.6;
+    case "project_summary":
+      return 2.2;
+    case "note":
+      return 1.1;
+    case "requirement":
+      return 0.4;
+    case "change_intent":
+      return 0.2;
+    default:
+      return 0;
+  }
+}
+
+function adjustSemanticScore(row: MemoryItemSearchRow, rawScore: number): number {
+  if (isSupersededMemory(row)) return rawScore - 1000;
+  let score = rawScore + semanticKindWeight(row.kind) + semanticRecencyWeight(row.updated_at);
+  const status = metadataStatus(row);
+  if (status === "active" || status === "current") score += 1.2;
+  if (row.kind === "change_intent" && row.file_path && shouldIgnoreDbFilePath(row.file_path)) {
+    // Human-synced intent for generated/build/runtime files is often the only durable
+    // "why" for that change. Do not let built-in path ignores hide the decision trail.
+    score += 0.4;
+  }
+  return score;
+}
+
+function filterAndRankSemanticRows(
+  rows: MemoryItemSearchRow[],
+  scoreOf: (row: MemoryItemSearchRow) => number,
+  opts: SemanticSearchOpts,
+): SemanticSearchMatch[] {
+  return rows
+    .map((r) => ({ row: r, score: adjustSemanticScore(r, scoreOf(r)) }))
+    .filter(({ row }) => {
+      if (isSupersededMemory(row)) return false;
+      if (shouldIgnoreDbFilePath(row.file_path) && row.kind !== "change_intent") return false;
+      return true;
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, opts.topK)
+    .map(({ row, score }) =>
+      toSemanticMatch(row, score, opts.includeContent, opts.previewChars, opts.contentMaxChars),
+    );
+}
+
 function makePreviewText(content: string, max: number): string {
   if (max <= 0) return "";
   if (content.length <= max) return content;
@@ -1889,6 +2801,19 @@ function getConventionPreviews(
   return [...builtin, ...stored];
 }
 
+function getDecisionPreviews(
+  decisionsLimit: number,
+  previewChars: number,
+  contentMaxChars: number,
+): Array<ReturnType<typeof toMemoryItemPreview>> {
+  if (decisionsLimit <= 0) return [];
+  const rows = listCurrentDecisionsStmt.all(Math.min(MAX_DECISIONS_LIMIT * 4, Math.max(decisionsLimit, decisionsLimit * 4))) as MemoryItemRow[];
+  return rows
+    .filter((d) => !isSupersededMemory(d))
+    .slice(0, decisionsLimit)
+    .map((d) => toMemoryItemPreview(d, false, previewChars, contentMaxChars));
+}
+
 function toRequirementPreview(
   req: RequirementRow,
   includeContent: boolean,
@@ -1964,6 +2889,58 @@ function completeAllActiveRequirementMemoryItems(): void {
   }
 }
 
+function patchMemoryItemMetadata(id: number, patch: Record<string, unknown>): void {
+  const row = getMemoryItemByIdStmt.get(id) as MemoryItemRow | undefined;
+  if (!row) return;
+  const meta = { ...parseMetadataJson(row.metadata_json), ...patch };
+  db.prepare(`UPDATE memory_items SET metadata_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(
+    safeJson(meta),
+    id,
+  );
+}
+
+function supersedeMemoryItemIds(
+  ids: number[],
+  replacement: { req_id?: number; memory_id?: number; decision_id?: number; reason: string },
+): number[] {
+  const updated: number[] = [];
+  for (const id of Array.from(new Set(ids)).filter((n) => Number.isFinite(n) && n > 0)) {
+    const row = getMemoryItemByIdStmt.get(id) as MemoryItemRow | undefined;
+    if (!row) continue;
+    patchMemoryItemMetadata(id, {
+      ...parseMetadataJson(row.metadata_json),
+      status: "superseded",
+      superseded: true,
+      superseded_at: new Date().toISOString(),
+      superseded_reason: replacement.reason,
+      superseded_by_req_id: replacement.req_id ?? null,
+      superseded_by_memory_id: replacement.memory_id ?? null,
+      superseded_by_decision_id: replacement.decision_id ?? null,
+    });
+    updated.push(id);
+  }
+  return updated;
+}
+
+function supersedeRequirementIds(
+  reqIds: number[],
+  replacement: { req_id?: number; memory_id?: number; decision_id?: number; reason: string },
+): number[] {
+  const updatedReqs: number[] = [];
+  for (const reqId of Array.from(new Set(reqIds)).filter((n) => Number.isFinite(n) && n > 0)) {
+    const info = db.prepare(`UPDATE requirements SET status = 'superseded' WHERE id = ?`).run(reqId);
+    if (info.changes > 0) updatedReqs.push(reqId);
+    const rows = db
+      .prepare(`SELECT id FROM memory_items WHERE req_id = ? OR (kind = 'requirement' AND req_id = ?)`)
+      .all(reqId, reqId) as Array<{ id: number }>;
+    supersedeMemoryItemIds(
+      rows.map((r) => r.id),
+      replacement,
+    );
+  }
+  return updatedReqs;
+}
+
 async function semanticSearchInternal(opts: SemanticSearchOpts): Promise<SemanticSearchResult> {
   if (!embeddingsEnabled) {
     throw new Error("Embeddings are disabled");
@@ -2037,7 +3014,32 @@ async function semanticSearchInternal(opts: SemanticSearchOpts): Promise<Semanti
     };
   }>;
 
-  const filtered = matches.filter((m) => !shouldIgnoreDbFilePath(m.item.file_path)).slice(0, opts.topK);
+  const filtered = matches
+    .filter((m) => {
+      if (isSupersededMemory({ metadata_json: m.item.metadata_json })) return false;
+      if (shouldIgnoreDbFilePath(m.item.file_path) && m.item.kind !== "change_intent") return false;
+      return true;
+    })
+    .map((m) => ({
+      ...m,
+      score: adjustSemanticScore(
+        {
+          id: m.item.id,
+          kind: m.item.kind,
+          title: m.item.title,
+          content: m.item.content ?? m.item.preview,
+          file_path: m.item.file_path,
+          start_line: m.item.start_line,
+          end_line: m.item.end_line,
+          req_id: m.item.req_id,
+          metadata_json: m.item.metadata_json,
+          updated_at: m.item.updated_at,
+        },
+        m.score,
+      ),
+    }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, opts.topK);
   return { query: q, top_k: opts.topK, mode: "embeddings", matches: filtered };
 }
 
@@ -2110,10 +3112,7 @@ function ftsSearchInternal(opts: SemanticSearchOpts): SemanticSearchResult {
     return stmt.all(matchQuery, rawLimit) as Array<FtsSearchRow>;
   })();
 
-  const matches = rows
-    .map((r) => toSemanticMatch(r, -Number(r.rank), opts.includeContent, opts.previewChars, opts.contentMaxChars))
-    .filter((m) => !shouldIgnoreDbFilePath(m.item.file_path))
-    .slice(0, opts.topK);
+  const matches = filterAndRankSemanticRows(rows, (r) => -Number((r as FtsSearchRow).rank), opts);
   return { query: q, top_k: opts.topK, mode: "fts", matches };
 }
 
@@ -2185,10 +3184,7 @@ function likeSearchInternal(opts: SemanticSearchOpts): SemanticSearchResult {
     return stmt.all(like, like, like, like, like, rawLimit) as Array<LikeSearchRow>;
   })();
 
-  const matches = rows
-    .map((r) => toSemanticMatch(r, Number(r.score), opts.includeContent, opts.previewChars, opts.contentMaxChars))
-    .filter((m) => !shouldIgnoreDbFilePath(m.item.file_path))
-    .slice(0, opts.topK);
+  const matches = filterAndRankSemanticRows(rows, (r) => Number((r as LikeSearchRow).score), opts);
   return { query: q, top_k: opts.topK, mode: "like", matches };
 }
 
@@ -3109,6 +4105,12 @@ function buildServerInstructions(): string {
     "Built-in architecture and code-organization policy:",
     BUILTIN_ARCHITECTURE_AND_CODE_ORGANIZATION_INSTRUCTIONS,
     "",
+    "Built-in frontend output-purity policy:",
+    BUILTIN_FRONTEND_OUTPUT_PURITY_INSTRUCTIONS,
+    "",
+    "Built-in git commit summary policy:",
+    BUILTIN_GIT_COMMIT_SUMMARY_INSTRUCTIONS,
+    "",
     "Built-in low-overhead execution and heavy-thread policy:",
     BUILTIN_LOW_OVERHEAD_WORKFLOW_INSTRUCTIONS,
     "",
@@ -3119,11 +4121,14 @@ function buildServerInstructions(): string {
     BUILTIN_THREAD_HANDOFF_SWITCH_INSTRUCTIONS,
     "",
     "Required workflow:",
-    "- On every new conversation/session for analysis/design/development work: call bootstrap_context({ query: <current goal> }) first (or at least get_brain_dump()) to restore context and retrieve relevant matches from the local memory store (vector if enabled; otherwise FTS/LIKE).",
+    "- Tool outputs are compact by default. Pass format=json only when you need full structured data.",
+    "- On every new conversation/session for analysis/design/development work: call bootstrap_context({ query: <current goal> }) first (or at least get_brain_dump()) to restore compact context and retrieve relevant matches from the local memory store (vector if enabled; otherwise FTS/LIKE).",
     "  - Output is compact by default. Use include_content=true only when you truly need full text (it increases tokens).",
-    "  - Tune output size with: requirements_limit/changes_limit/notes_limit, preview_chars, pending_limit/pending_offset.",
+    "  - Tune output size with: requirements_limit/changes_limit/notes_limit/decisions_limit, preview_chars, pending_limit/pending_offset.",
     "  - Prefer read_memory_item(id, offset, limit) to fetch full text on demand instead of returning large content in other tool outputs.",
     "- For pure execution-first tasks with explicit targets (for example compile/build/run/launch/package/publish/test rerun), you may skip retrieval and go straight to the minimum necessary shell or host tools unless code/context lookup is actually needed to unblock execution.",
+    "- If rtk is installed or VectorMind's bundled RTK shim is verified (detect_rtk with gain_ok=true), prefix shell commands with the command returned by detect_rtk. Usually this is rtk (rtk git status, rtk npm run build, rtk rg ...); in npx/MCP-only installs it may be a package shim command such as node <...>/rtk-shim.js.",
+    "- If rtk is missing and the user asks to install it, use install_rtk first with dry_run=true to show the exact commands; execute with dry_run=false only after the user clearly approves installation/init choices.",
     "- To read local Codex skill/prompt/rule files (for example SKILL.md under CODEX_HOME or AGENTS_HOME), prefer read_codex_text_file({ path }) instead of assuming a filesystem MCP resource server exists.",
     "- For project file/directory browsing, prefer list_project_files({ path, recursive?, max_depth? }) over shelling out to Get-ChildItem/ls. It respects ignore rules and keeps output bounded.",
     "- For small/medium raw file reads, prefer read_file_text({ path, offset?, max_chars? }) over Get-Content -Raw. Use read_file_lines(...) when you need deterministic line ranges or the file may be large.",
@@ -3137,11 +4142,13 @@ function buildServerInstructions(): string {
     "- BEFORE editing code: call start_requirement(title, background) to set the active requirement.",
     "- AFTER editing + saving: call get_pending_changes() to see unsynced files, then call sync_change_intent(intent, files). (You can omit files to auto-link all pending changes.)",
     "- After major milestones/decisions: call upsert_project_summary(summary) and/or add_note(...) to persist durable context locally.",
+    "- When a requirement or user decision changes/reverses an older behavior, call upsert_decision(key, title, content, supersedes_req_ids?/supersedes_memory_ids?) and/or supersede_memory(...). Current decisions are shown in bootstrap_context/get_brain_dump and superseded memories are hidden from default semantic recall so stale requirements do not override newer facts.",
     "- If the user states a durable project convention (build commands, frameworks, naming rules, output paths): call upsert_convention(key, content, tags) so it is applied in future sessions.",
     "- When you need full text for a specific note/summary/match: call read_memory_item(id, offset, limit) and page through it.",
     "- When asked to locate code (class/function/type): call query_codebase(query) instead of guessing.",
     "- When you need to recall relevant context from history/code/docs: call semantic_search(query, ...) instead of guessing.",
     "- If the current thread is already heavy or the user reports it has become slow, switch to a lighter workflow: avoid redundant retrieval, keep outputs compact, and if the user refuses thread switching, continue in light mode without repeating the switch reminder in that same session.",
+    "- Use get_token_savings({ format: 'compact' }) when you need to verify how many tokens VectorMind compact outputs saved.",
     "",
     "If tool output conflicts with assumptions, trust the tool output.",
   ].join("\n");
@@ -3363,6 +4370,9 @@ function initDatabase(): void {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_items_convention_key
       ON memory_items(kind, title) WHERE kind = 'convention';
 
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_items_decision_key
+      ON memory_items(kind, title) WHERE kind = 'decision';
+
     CREATE INDEX IF NOT EXISTS idx_memory_items_kind_updated_at
       ON memory_items(kind, updated_at DESC);
 
@@ -3393,6 +4403,22 @@ function initDatabase(): void {
 
     CREATE INDEX IF NOT EXISTS idx_pending_changes_updated_at
       ON pending_changes(updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS token_savings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tool TEXT NOT NULL,
+      raw_tokens INTEGER NOT NULL,
+      output_tokens INTEGER NOT NULL,
+      saved_tokens INTEGER NOT NULL,
+      savings_pct REAL NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_token_savings_created_at
+      ON token_savings(created_at DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_token_savings_tool
+      ON token_savings(tool);
   `);
 
   initMemoryItemsFts();
@@ -3476,6 +4502,29 @@ function initDatabase(): void {
      ORDER BY updated_at DESC, id DESC
      LIMIT ?`,
   );
+  upsertDecisionStmt = db.prepare(
+    `INSERT INTO memory_items (kind, title, content, metadata_json, content_hash)
+     VALUES ('decision', ?, ?, ?, ?)
+     ON CONFLICT DO UPDATE SET
+       content = excluded.content,
+       metadata_json = excluded.metadata_json,
+       content_hash = excluded.content_hash,
+       updated_at = CURRENT_TIMESTAMP`,
+  );
+  getDecisionByKeyStmt = db.prepare(
+    `SELECT id, kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at
+     FROM memory_items
+     WHERE kind = 'decision' AND title = ?
+     ORDER BY updated_at DESC, id DESC
+     LIMIT 1`,
+  );
+  listCurrentDecisionsStmt = db.prepare(
+    `SELECT id, kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at
+     FROM memory_items
+     WHERE kind = 'decision'
+     ORDER BY updated_at DESC, id DESC
+     LIMIT ?`,
+  );
   getRequirementMemoryItemIdStmt = db.prepare(
     `SELECT id
      FROM memory_items
@@ -3505,6 +4554,13 @@ function initDatabase(): void {
      WHERE kind = 'note'
      ORDER BY updated_at DESC, id DESC
      LIMIT ?`,
+  );
+  getLatestChangeIntentForFileStmt = db.prepare(
+    `SELECT id, kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at
+     FROM memory_items
+     WHERE kind = 'change_intent' AND file_path = ?
+     ORDER BY updated_at DESC, id DESC
+     LIMIT 1`,
   );
   deleteFileChunkItemsStmt = db.prepare(
     `DELETE FROM memory_items
@@ -3580,6 +4636,39 @@ function initDatabase(): void {
          ELSE 2
        END,
        name
+     LIMIT ?`,
+  );
+
+  insertTokenSavingsStmt = db.prepare(
+    `INSERT INTO token_savings (tool, raw_tokens, output_tokens, saved_tokens, savings_pct)
+     VALUES (?, ?, ?, ?, ?)`,
+  );
+  summarizeTokenSavingsStmt = db.prepare(
+    `SELECT
+       COUNT(*) as calls,
+       COALESCE(SUM(raw_tokens), 0) as raw_tokens,
+       COALESCE(SUM(output_tokens), 0) as output_tokens,
+       COALESCE(SUM(saved_tokens), 0) as saved_tokens,
+       COALESCE(AVG(savings_pct), 0) as avg_savings_pct
+     FROM token_savings`,
+  );
+  summarizeTokenSavingsByToolStmt = db.prepare(
+    `SELECT
+       tool,
+       COUNT(*) as calls,
+       COALESCE(SUM(raw_tokens), 0) as raw_tokens,
+       COALESCE(SUM(output_tokens), 0) as output_tokens,
+       COALESCE(SUM(saved_tokens), 0) as saved_tokens,
+       COALESCE(AVG(savings_pct), 0) as avg_savings_pct
+     FROM token_savings
+     GROUP BY tool
+     ORDER BY saved_tokens DESC, calls DESC
+     LIMIT ?`,
+  );
+  listRecentTokenSavingsStmt = db.prepare(
+    `SELECT id, tool, raw_tokens, output_tokens, saved_tokens, savings_pct, created_at
+     FROM token_savings
+     ORDER BY created_at DESC, id DESC
      LIMIT ?`,
   );
 
@@ -3795,6 +4884,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: toJsonSchemaCompat(ClearActivityLogArgsSchema),
       },
       {
+        name: "detect_rtk",
+        description:
+          "Detect whether rtk is available on PATH or via VectorMind's bundled RTK shim. When available, prefer the returned command as a shell prefix to reduce command-output tokens.",
+        inputSchema: toJsonSchemaCompat(DetectRtkArgsSchema),
+      },
+      {
+        name: "install_rtk",
+        description:
+          "Install the rtk-ai/rtk Rust Token Killer binary when it is missing. Defaults to dry_run=true and never patches hooks unless init is explicitly requested.",
+        inputSchema: toJsonSchemaCompat(InstallRtkArgsSchema),
+      },
+      {
+        name: "get_token_savings",
+        description:
+          "Show VectorMind compact-output token savings recorded by MCP tools. Use this to verify raw-vs-compact output reduction.",
+        inputSchema: toJsonSchemaCompat(GetTokenSavingsArgsSchema),
+      },
+      {
         name: "grep",
         description:
           "Repo text search with precise file/line/col matches, powered by ripgrep against real project files plus built-in noise filters. Falls back to indexed search only when ripgrep is unavailable.",
@@ -3841,6 +4948,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         description:
           "Save a durable project note (decision, constraint, TODO, architecture detail). Use this to persist important context locally instead of relying on chat memory.",
         inputSchema: toJsonSchemaCompat(AddNoteArgsSchema),
+      },
+      {
+        name: "upsert_decision",
+        description:
+          "Save/update the current authoritative project decision for a key. Use it when requirements change, reverse, or supersede older behavior so future sessions prefer the latest decision over old history.",
+        inputSchema: toJsonSchemaCompat(UpsertDecisionArgsSchema),
+      },
+      {
+        name: "supersede_memory",
+        description:
+          "Mark old requirements or memory items as superseded by a newer requirement/decision. Superseded items are hidden from default semantic recall to avoid reverting to stale behavior.",
+        inputSchema: toJsonSchemaCompat(SupersedeMemoryArgsSchema),
       },
       {
         name: "upsert_convention",
@@ -4133,23 +5252,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             last_event: string;
             updated_at: string;
           }>;
-          if (pendingAll.length) {
-            const pending = pendingAll.filter((p) => !shouldIgnoreDbFilePath(p.file_path));
-            if (pending.length) {
-              for (const p of pending) {
-                targets.push({
-                  rawFile: p.file_path,
-                  dbFilePath: p.file_path,
-                  event: p.last_event,
-                  source: "pending",
-                });
-              }
-            } else {
+          const merged = mergePendingWithGit(pendingAll, { offset: 0, limit: MAX_PENDING_LIMIT });
+          if (merged.page.length) {
+            for (const p of merged.page) {
               targets.push({
-                rawFile: "(unspecified)",
-                dbFilePath: "(unspecified)",
-                event: "manual",
-                source: "unspecified",
+                rawFile: p.file_path,
+                dbFilePath: p.file_path,
+                event: p.last_event,
+                source: p.source === "git" ? "pending" : "pending",
               });
             }
             deleteAllPendingChangesStmt.run();
@@ -4176,7 +5286,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             null,
             null,
             active.id,
-            safeJson({ change_log_id, event: t.event, source: t.source }),
+            safeJson({
+              change_log_id,
+              event: t.event,
+              source: t.source,
+              file_state_hash: isUnspecified ? null : getFileStateHash(t.rawFile),
+            }),
             sha256Hex(args.intent),
           );
           const memory_item_id = Number(memoryInfo.lastInsertRowid);
@@ -4235,6 +5350,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const changesLimit = args.changes_limit;
       const notesLimit = args.notes_limit;
       const conventionsLimit = args.conventions_limit;
+      const decisionsLimit = args.decisions_limit;
 
       const recent = listRecentRequirementsStmt.all(requirementsLimit) as RequirementRow[];
       const items = recent.map((req) => {
@@ -4251,19 +5367,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const recent_notes = (listRecentNotesStmt.all(notesLimit) as MemoryItemRow[]).map((n) =>
         toMemoryItemPreview(n, includeContent, previewChars, contentMaxChars),
       );
+      const decisions = getDecisionPreviews(decisionsLimit, previewChars, contentMaxChars);
       const conventions = getConventionPreviews(conventionsLimit, previewChars, contentMaxChars);
-      const pending_total = Number(
-        (countPendingChangesStmt.get() as { total: number } | undefined)?.total ?? 0,
-      );
       const pending_offset = args.pending_offset;
       const pending_limit = args.pending_limit;
-      const pending_truncated = pending_total > pending_offset + pending_limit;
-
-      const pending_changes = (listPendingChangesPageStmt.all(pending_limit, pending_offset) as Array<{
+      const pendingDbRows = listPendingChangesStmt.all() as Array<{
         file_path: string;
         last_event: string;
         updated_at: string;
-      }>).filter((p) => !shouldIgnoreDbFilePath(p.file_path));
+      }>;
+      const mergedPending = mergePendingWithGit(pendingDbRows, { offset: pending_offset, limit: pending_limit });
+      const pending_total = mergedPending.total;
+      const pending_truncated = mergedPending.truncated;
+      const pending_changes = mergedPending.page;
 
       const q = args.query?.trim() ?? "";
       const semantic =
@@ -4289,48 +5405,54 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         pending_total,
         pending_returned: pending_changes.length,
         requirements_returned: items.length,
+        decisions_returned: decisions.length,
         conventions_returned: conventions.length,
         semantic_mode: semantic?.mode ?? null,
         semantic_matches: semantic?.matches?.length ?? 0,
       });
 
+      const outputValue = {
+        ok: true,
+        generated_at: new Date().toISOString(),
+        project_root: projectRoot,
+        root_source: rootSource,
+        db_path: dbPath,
+        watcher_enabled: !!watcher,
+        watcher_ready: watcherReady,
+        embeddings: {
+          enabled: embeddingsEnabled,
+          model: embedModelName,
+          embed_files: embedFilesMode,
+        },
+        output: {
+          format: args.format,
+          include_content: includeContent,
+          preview_chars: previewChars,
+          content_max_chars: contentMaxChars,
+          requirements_limit: requirementsLimit,
+          changes_limit: changesLimit,
+          notes_limit: notesLimit,
+          decisions_limit: decisionsLimit,
+          conventions_limit: conventionsLimit,
+        },
+        project_summary,
+        decisions,
+        conventions,
+        recent_notes,
+        pending_total,
+        pending_offset,
+        pending_limit,
+        pending_truncated,
+        pending_changes,
+        items,
+        semantic,
+      };
+
       return {
         content: [
           {
             type: "text",
-            text: toolJson({
-              ok: true,
-              generated_at: new Date().toISOString(),
-              project_root: projectRoot,
-              root_source: rootSource,
-              db_path: dbPath,
-              watcher_enabled: !!watcher,
-              watcher_ready: watcherReady,
-              embeddings: {
-                enabled: embeddingsEnabled,
-                model: embedModelName,
-                embed_files: embedFilesMode,
-              },
-              output: {
-                include_content: includeContent,
-                preview_chars: previewChars,
-                content_max_chars: contentMaxChars,
-                requirements_limit: requirementsLimit,
-                changes_limit: changesLimit,
-                notes_limit: notesLimit,
-                conventions_limit: conventionsLimit,
-              },
-              project_summary,
-              conventions,
-              recent_notes,
-              pending_total,
-              pending_offset,
-              pending_limit,
-              pending_truncated,
-              pending_changes,
-              items,
-              semantic,
-            }),
+            text: toolText("bootstrap_context", outputValue, compactBootstrapText(outputValue), args.format),
           },
         ],
       };
@@ -4346,6 +5468,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const changesLimit = args.changes_limit;
       const notesLimit = args.notes_limit;
       const conventionsLimit = args.conventions_limit;
+      const decisionsLimit = args.decisions_limit;
 
       const recent = listRecentRequirementsStmt.all(requirementsLimit) as RequirementRow[];
       const items = recent.map((req) => {
@@ -4362,64 +5485,71 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const recent_notes = (listRecentNotesStmt.all(notesLimit) as MemoryItemRow[]).map((n) =>
         toMemoryItemPreview(n, includeContent, previewChars, contentMaxChars),
       );
+      const decisions = getDecisionPreviews(decisionsLimit, previewChars, contentMaxChars);
       const conventions = getConventionPreviews(conventionsLimit, previewChars, contentMaxChars);
-      const pending_total = Number(
-        (countPendingChangesStmt.get() as { total: number } | undefined)?.total ?? 0,
-      );
       const pending_offset = args.pending_offset;
       const pending_limit = args.pending_limit;
-      const pending_truncated = pending_total > pending_offset + pending_limit;
-
-      const pending_changes = (listPendingChangesPageStmt.all(pending_limit, pending_offset) as Array<{
+      const pendingDbRows = listPendingChangesStmt.all() as Array<{
         file_path: string;
         last_event: string;
         updated_at: string;
-      }>).filter((p) => !shouldIgnoreDbFilePath(p.file_path));
+      }>;
+      const mergedPending = mergePendingWithGit(pendingDbRows, { offset: pending_offset, limit: pending_limit });
+      const pending_total = mergedPending.total;
+      const pending_truncated = mergedPending.truncated;
+      const pending_changes = mergedPending.page;
 
       logActivity("get_brain_dump", {
         pending_total,
         pending_returned: pending_changes.length,
         requirements_returned: items.length,
         notes_returned: recent_notes.length,
+        decisions_returned: decisions.length,
         conventions_returned: conventions.length,
       });
+
+      const outputValue = {
+        ok: true,
+        generated_at: new Date().toISOString(),
+        project_root: projectRoot,
+        root_source: rootSource,
+        db_path: dbPath,
+        watcher_enabled: !!watcher,
+        watcher_ready: watcherReady,
+        embeddings: {
+          enabled: embeddingsEnabled,
+          model: embedModelName,
+          embed_files: embedFilesMode,
+        },
+        output: {
+          format: args.format,
+          include_content: includeContent,
+          preview_chars: previewChars,
+          content_max_chars: contentMaxChars,
+          requirements_limit: requirementsLimit,
+          changes_limit: changesLimit,
+          notes_limit: notesLimit,
+          decisions_limit: decisionsLimit,
+          conventions_limit: conventionsLimit,
+        },
+        project_summary,
+        decisions,
+        conventions,
+        recent_notes,
+        pending_total,
+        pending_offset,
+        pending_limit,
+        pending_truncated,
+        pending_changes,
+        items,
+        semantic: null,
+      };
 
       return {
         content: [
           {
             type: "text",
-            text: toolJson({
-              ok: true,
-              generated_at: new Date().toISOString(),
-              project_root: projectRoot,
-              root_source: rootSource,
-              db_path: dbPath,
-              watcher_enabled: !!watcher,
-              watcher_ready: watcherReady,
-              embeddings: {
-                enabled: embeddingsEnabled,
-                model: embedModelName,
-                embed_files: embedFilesMode,
-              },
-              output: {
-                include_content: includeContent,
-                preview_chars: previewChars,
-                content_max_chars: contentMaxChars,
-                requirements_limit: requirementsLimit,
-                changes_limit: changesLimit,
-                notes_limit: notesLimit,
-                conventions_limit: conventionsLimit,
-              },
-              project_summary,
-              conventions,
-              recent_notes,
-              pending_total,
-              pending_offset,
-              pending_limit,
-              pending_truncated,
-              pending_changes,
-              items,
-            }),
+            text: toolText("get_brain_dump", outputValue, compactBrainDumpText(outputValue), args.format),
           },
         ],
       };
@@ -4428,16 +5558,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (toolName === "get_pending_changes") {
       const args = GetPendingChangesArgsSchema.parse(rawArgs);
       flushPendingChangeBuffer();
-      const total = Number((countPendingChangesStmt.get() as { total: number } | undefined)?.total ?? 0);
       const offset = args.offset;
       const limit = args.limit;
-      const truncated = total > offset + limit;
-
-      const pending = (listPendingChangesPageStmt.all(limit, offset) as Array<{
+      const pendingDbRows = listPendingChangesStmt.all() as Array<{
         file_path: string;
         last_event: string;
         updated_at: string;
-      }>).filter((p) => !shouldIgnoreDbFilePath(p.file_path));
+      }>;
+      const mergedPending = mergePendingWithGit(pendingDbRows, { offset, limit });
+      const total = mergedPending.total;
+      const truncated = mergedPending.truncated;
+      const pending = mergedPending.page;
 
       logActivity("get_pending_changes", {
         total,
@@ -4622,6 +5753,34 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: toolJson({ ok: true }) }] };
     }
 
+    if (toolName === "detect_rtk") {
+      DetectRtkArgsSchema.parse(rawArgs);
+      const result = detectRtk();
+      const text = result.available
+        ? `rtk available: ${result.version ?? result.command}\ncommand=${result.command} source=${result.source ?? "unknown"} gain_ok=${result.gain_ok ?? false}${result.path ? ` path=${result.path}` : ""}\n${result.note}`
+        : `rtk unavailable: ${result.command}\nsource=${result.source ?? "none"} gain_ok=${result.gain_ok ?? false}${result.version ? ` version=${result.version}` : ""}${result.path ? ` path=${result.path}` : ""}\n${result.note}`;
+      return { content: [{ type: "text", text }] };
+    }
+
+    if (toolName === "install_rtk") {
+      const args = InstallRtkArgsSchema.parse(rawArgs);
+      const result = installRtk(args);
+      return { content: [{ type: "text", text: compactInstallRtkText(result) }] };
+    }
+
+    if (toolName === "get_token_savings") {
+      const args = GetTokenSavingsArgsSchema.parse(rawArgs);
+      const result = tokenSavingsSummary(args.limit);
+      return {
+        content: [
+          {
+            type: "text",
+            text: args.format === "json" ? toolJson(result) : compactTokenSavingsText(result),
+          },
+        ],
+      };
+    }
+
     if (toolName === "grep") {
       const args = GrepArgsSchema.parse(rawArgs);
       const q = args.query;
@@ -4659,24 +5818,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           truncated: ripgrepResult.truncated,
         });
 
+        const outputValue = {
+          ok: true,
+          backend: ripgrepResult.backend,
+          rg_command: ripgrepResult.rg_command,
+          query: q,
+          mode,
+          case_sensitive: caseSensitive,
+          smart_case: smartCase,
+          include_paths: includePaths ?? [],
+          exclude_paths: excludePaths ?? [],
+          matches: ripgrepResult.matches,
+          total_matches: ripgrepResult.total_matches,
+          truncated: ripgrepResult.truncated,
+        };
+
         return {
           content: [
             {
               type: "text",
-              text: toolJson({
-                ok: true,
-                backend: ripgrepResult.backend,
-                rg_command: ripgrepResult.rg_command,
-                query: q,
-                mode,
-                case_sensitive: caseSensitive,
-                smart_case: smartCase,
-                include_paths: includePaths ?? [],
-                exclude_paths: excludePaths ?? [],
-                matches: ripgrepResult.matches,
-                total_matches: ripgrepResult.total_matches,
-                truncated: ripgrepResult.truncated,
-              }),
+              text: toolCompactOrJson("grep", outputValue, compactGrepText(outputValue), args.format),
             },
           ],
         };
@@ -4756,28 +5917,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         truncated: indexedResult.truncated,
       });
 
+      const outputValue = {
+        ok: true,
+        backend: indexedResult.backend,
+        fallback_reason: "ripgrep_unavailable",
+        ripgrep_error: ripgrepResult.error,
+        ripgrep_attempts: ripgrepResult.attempts,
+        query: q,
+        mode,
+        case_sensitive: caseSensitive,
+        smart_case: smartCase,
+        hint: indexedResult.hint,
+        kinds,
+        include_paths: includePaths ?? [],
+        exclude_paths: excludePaths ?? [],
+        candidates: indexedResult.candidates,
+        matches: indexedResult.matches,
+        truncated: indexedResult.truncated,
+      };
+
       return {
         content: [
           {
             type: "text",
-            text: toolJson({
-              ok: true,
-              backend: indexedResult.backend,
-              fallback_reason: "ripgrep_unavailable",
-              ripgrep_error: ripgrepResult.error,
-              ripgrep_attempts: ripgrepResult.attempts,
-              query: q,
-              mode,
-              case_sensitive: caseSensitive,
-              smart_case: smartCase,
-              hint: indexedResult.hint,
-              kinds,
-              include_paths: includePaths ?? [],
-              exclude_paths: excludePaths ?? [],
-              candidates: indexedResult.candidates,
-              matches: indexedResult.matches,
-              truncated: indexedResult.truncated,
-            }),
+            text: toolCompactOrJson("grep", outputValue, compactGrepText(outputValue), args.format),
           },
         ],
       };
@@ -4833,28 +5996,35 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         path_kind: st.isFile() ? "file" : st.isDirectory() ? "dir" : "other",
       });
 
+      const outputValue = {
+        ok: true,
+        path: resolved.dbFilePath,
+        path_kind: st.isFile() ? "file" : st.isDirectory() ? "dir" : "other",
+        recursive: args.recursive,
+        max_depth: args.recursive ? args.max_depth : 1,
+        include_files: args.include_files,
+        include_dirs: args.include_dirs,
+        include_hidden: args.include_hidden,
+        respect_ignore: args.respect_ignore,
+        include_paths: includePaths ?? [],
+        exclude_paths: excludePaths ?? [],
+        extensions: extensions ?? [],
+        returned: result.returned,
+        scanned: result.scanned,
+        truncated: result.truncated,
+        entries: result.entries,
+      };
+
       return {
         content: [
           {
             type: "text",
-            text: toolJson({
-              ok: true,
-              path: resolved.dbFilePath,
-              path_kind: st.isFile() ? "file" : st.isDirectory() ? "dir" : "other",
-              recursive: args.recursive,
-              max_depth: args.recursive ? args.max_depth : 1,
-              include_files: args.include_files,
-              include_dirs: args.include_dirs,
-              include_hidden: args.include_hidden,
-              respect_ignore: args.respect_ignore,
-              include_paths: includePaths ?? [],
-              exclude_paths: excludePaths ?? [],
-              extensions: extensions ?? [],
-              returned: result.returned,
-              scanned: result.scanned,
-              truncated: result.truncated,
-              entries: result.entries,
-            }),
+            text: toolCompactOrJson(
+              "list_project_files",
+              outputValue,
+              compactListProjectFilesText(outputValue),
+              args.format,
+            ),
           },
         ],
       };
@@ -4897,19 +6067,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         truncated: result.truncated,
       });
 
+      const outputValue = {
+        ok: true,
+        file_path: resolved.dbFilePath,
+        offset: args.offset,
+        returned_chars: result.returnedChars,
+        total_chars: result.totalChars,
+        truncated: result.truncated,
+        text: result.text,
+      };
+
       return {
         content: [
           {
             type: "text",
-            text: toolJson({
-              ok: true,
-              file_path: resolved.dbFilePath,
-              offset: args.offset,
-              returned_chars: result.returnedChars,
-              total_chars: result.totalChars,
-              truncated: result.truncated,
-              text: result.text,
-            }),
+            text: toolCompactOrJson("read_file_text", outputValue, compactReadTextFileText(outputValue), args.format),
           },
         ],
       };
@@ -4959,20 +6131,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         truncated: result.truncated,
       });
 
+      const outputValue = {
+        ok: true,
+        file_path: resolved.displayPath,
+        allowed_root: resolved.allowedRoot,
+        offset: args.offset,
+        returned_chars: result.returnedChars,
+        total_chars: result.totalChars,
+        truncated: result.truncated,
+        text: result.text,
+      };
+
       return {
         content: [
           {
             type: "text",
-            text: toolJson({
-              ok: true,
-              file_path: resolved.displayPath,
-              allowed_root: resolved.allowedRoot,
-              offset: args.offset,
-              returned_chars: result.returnedChars,
-              total_chars: result.totalChars,
-              truncated: result.truncated,
-              text: result.text,
-            }),
+            text: toolCompactOrJson(
+              "read_codex_text_file",
+              outputValue,
+              compactReadTextFileText(outputValue),
+              args.format,
+            ),
           },
         ],
       };
@@ -5040,19 +6219,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         truncated: result.truncated,
       });
 
+      const outputValue = {
+        ok: true,
+        file_path: resolved.dbFilePath,
+        from_line: fromLine,
+        to_line: toLine,
+        returned: result.returned,
+        truncated: result.truncated,
+        text: result.text,
+      };
+
       return {
         content: [
           {
             type: "text",
-            text: toolJson({
-              ok: true,
-              file_path: resolved.dbFilePath,
-              from_line: fromLine,
-              to_line: toLine,
-              returned: result.returned,
-              truncated: result.truncated,
-              text: result.text,
-            }),
+            text: toolCompactOrJson("read_file_lines", outputValue, compactReadFileLinesText(outputValue), args.format),
           },
         ],
       };
@@ -5072,11 +6253,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         sample: filtered.slice(0, 10).map((m) => ({ name: m.name, type: m.type, file_path: m.file_path })),
       });
 
+      const outputValue = { ok: true, query: q, matches: filtered };
+
       return {
         content: [
           {
             type: "text",
-            text: toolJson({ ok: true, query: q, matches: filtered }),
+            text: toolCompactOrJson("query_codebase", outputValue, compactQueryCodebaseText(outputValue), args.format),
           },
         ],
       };
@@ -5127,6 +6310,99 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           {
             type: "text",
             text: toolJson({ ok: true, note: { id } }),
+          },
+        ],
+      };
+    }
+
+    if (toolName === "upsert_decision") {
+      const args = UpsertDecisionArgsSchema.parse(rawArgs);
+      const key = args.key.trim();
+      const title = args.title.trim() || key;
+      const content = args.content.trim();
+      const meta = {
+        status: "current",
+        key,
+        title,
+        tags: args.tags ?? [],
+        supersedes_req_ids: args.supersedes_req_ids ?? [],
+        supersedes_memory_ids: args.supersedes_memory_ids ?? [],
+        related_files: (args.related_files ?? []).map((f) => normalizeToDbPath(f)),
+      };
+      upsertDecisionStmt.run(key, `${title}\n\n${content}`, safeJson(meta), sha256Hex(`${title}\n\n${content}`));
+      const row = getDecisionByKeyStmt.get(key) as MemoryItemRow | undefined;
+      if (row) enqueueEmbedding(row.id);
+
+      const superseded_requirements = supersedeRequirementIds(args.supersedes_req_ids ?? [], {
+        decision_id: row?.id,
+        reason: `Superseded by decision ${key}: ${title}`,
+      });
+      const superseded_memory_items = supersedeMemoryItemIds(args.supersedes_memory_ids ?? [], {
+        decision_id: row?.id,
+        reason: `Superseded by decision ${key}: ${title}`,
+      });
+
+      logActivity("upsert_decision", {
+        key,
+        decision_id: row?.id ?? null,
+        superseded_requirements,
+        superseded_memory_items,
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: toolJson({
+              ok: true,
+              decision: row ? { id: row.id, key, updated_at: row.updated_at } : null,
+              superseded_requirements,
+              superseded_memory_items,
+            }),
+          },
+        ],
+      };
+    }
+
+    if (toolName === "supersede_memory") {
+      const args = SupersedeMemoryArgsSchema.parse(rawArgs);
+      const supersededReqIds = args.superseded_req_ids ?? [];
+      const supersededMemoryIds = args.superseded_memory_ids ?? [];
+      if (!supersededReqIds.length && !supersededMemoryIds.length) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: toolJson({
+                ok: false,
+                error: "Provide superseded_req_ids and/or superseded_memory_ids.",
+              }),
+            },
+          ],
+        };
+      }
+      const superseded_requirements = supersedeRequirementIds(supersededReqIds, {
+        req_id: args.replacement_req_id,
+        memory_id: args.replacement_memory_id,
+        reason: args.reason,
+      });
+      const superseded_memory_items = supersedeMemoryItemIds(supersededMemoryIds, {
+        req_id: args.replacement_req_id,
+        memory_id: args.replacement_memory_id,
+        reason: args.reason,
+      });
+      logActivity("supersede_memory", {
+        superseded_requirements,
+        superseded_memory_items,
+        replacement_req_id: args.replacement_req_id ?? null,
+        replacement_memory_id: args.replacement_memory_id ?? null,
+      });
+      return {
+        content: [
+          {
+            type: "text",
+            text: toolJson({ ok: true, superseded_requirements, superseded_memory_items }),
           },
         ],
       };
@@ -5193,11 +6469,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         })),
       });
 
+      const outputValue = { ok: true, ...result };
+
       return {
         content: [
           {
             type: "text",
-            text: toolJson({ ok: true, ...result }),
+            text: toolCompactOrJson("semantic_search", outputValue, compactSemanticSearchText(outputValue), args.format),
           },
         ],
       };

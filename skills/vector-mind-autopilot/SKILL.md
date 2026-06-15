@@ -81,6 +81,7 @@ If you still cannot determine it confidently, ask the user for the project root 
 - Don’t spam tool outputs. Summarize what matters (active requirement, pending changes, next steps).
 - Show raw JSON only when the user requests debugging/verification.
 - If debugging VectorMind behavior, prefer `get_activity_summary` first (small output), and only use `get_activity_log` with paging (and `verbose=true` only if necessary).
+- When generating or modifying page/UI/frontend code, never leak the current conversation’s prompts, instructions, chain-of-thought, task list, or tool guidance into source code, comments, seeded copy, mock data, or rendered UI. Do not add explanatory/meta text just to describe the AI workflow; final delivery should stay as pure business code plus only genuine business copy required by the product.
 - If the current thread is already heavy, recently compacted multiple times, or the user reports it has become slow, switch to a lighter workflow: reduce retrieval/tool churn, keep outputs shorter, and recommend continuing substantial new analysis in a fresh thread after a short handoff summary.
 - If the current thread has already hit `413 Payload Too Large` / `Request Entity Too Large`, enter payload-guard mode immediately: no unbounded shell dumps, no whole-file raw output unless explicitly requested, and prefer bounded MCP reads plus concise summaries.
 - Thread-switch judgment must not rely on a fixed token threshold; use observable signals plus the weight of the upcoming work.

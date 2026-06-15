@@ -114,6 +114,36 @@ export const BUILTIN_CONVENTIONS: BuiltinConventionSpec[] = [
     tags: ["builtin", "architecture", "reliability", "maintainability"],
   },
   {
+    key: "builtin:frontend_output_purity_scope",
+    content:
+      "以下规则仅在生成、修改、重构页面、组件、模板、前端视图或其他会直接进入用户可见界面的展示代码时生效；不限制模型内部推理，只约束最终交付代码与渲染结果。",
+    tags: ["builtin", "frontend", "ui", "purity", "scope"],
+  },
+  {
+    key: "builtin:frontend_no_prompt_leakage",
+    content:
+      "页面代码、模板内容、静态数据、默认文案、注释与渲染输出中，不得包含本次对话的提示词、系统指令、工具说明、思考内容、任务分解、执行计划或其他元指令回显。",
+    tags: ["builtin", "frontend", "ui", "prompt-leakage", "safety"],
+  },
+  {
+    key: "builtin:frontend_no_meta_copy",
+    content:
+      "不得为了说明 AI 正在做什么、提醒用户如何操作、解释实现过程，或填补未知需求，而额外加入与真实业务无关的提示性文字、说明性文案、占位描述或演示性话术；若页面确实需要展示文案，只允许保留与当前业务目标直接相关且可作为最终产品交付的内容。",
+    tags: ["builtin", "frontend", "ui", "copy", "business-only"],
+  },
+  {
+    key: "builtin:frontend_business_code_only",
+    content:
+      "最终交付应仅包含完成该业务所必需的页面/前端代码与必要配置；除非仓库规范、编译运行、合规许可或用户明确要求，否则不得新增多余注释、说明文本、调试回显或指令复述。若无法确认某段文本是否属于真实业务内容，必须先确认再写入。",
+    tags: ["builtin", "frontend", "ui", "code-only", "delivery"],
+  },
+  {
+    key: "builtin:git_commit_summary_required",
+    content:
+      "以下规则仅在用户要求执行 git 提交、创建 commit、生成提交信息或代为完成版本提交时生效；不限制普通代码修改、分析或未涉及提交的 git 状态检查。每次会话中，只要用户让你提交 git，必须在提交前或提交说明中包含本次更改的内容描述或总结，说明主要改动、影响范围，以及如有必要的验证结果；不得只给空泛提交信息或只执行 git commit 而不说明本次改动内容。",
+    tags: ["builtin", "git", "commit", "summary", "handoff"],
+  },
+  {
     key: "builtin:low_overhead_execution_scope",
     content:
       "以下规则仅在编译、构建、启动、停止、运行、测试重跑、打包、发布、安装、同步产物、进程检查等以执行为主的任务，或当前线程已明显过大、频繁压缩、近期已变慢时生效；不限制模型内部推理，只约束外显工具选择、输出体量与上下文负载。",

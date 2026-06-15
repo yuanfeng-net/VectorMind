@@ -36,6 +36,13 @@ const env = {
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const serverEntry = path.resolve(scriptDir, "..", "dist", "index.js");
+const rtkShimEntry = path.resolve(scriptDir, "..", "dist", "rtk-shim.js");
+
+if (!fs.existsSync(rtkShimEntry)) {
+  console.error(`\n[smoke] expected RTK shim build output at ${rtkShimEntry}`);
+  process.exitCode = 1;
+  process.exit();
+}
 
 const runDir = inPlace
   ? process.cwd()
@@ -100,6 +107,13 @@ async function main() {
     process.exitCode = 1;
     return;
   }
+  for (const toolName of ["detect_rtk", "install_rtk", "get_token_savings"]) {
+    if (!toolList.tools.some((t) => t.name === toolName)) {
+      console.error(`\n[smoke] expected tool list to include ${toolName}`);
+      process.exitCode = 1;
+      return;
+    }
+  }
 
   const bootStart = Date.now();
   const boot = await client.callTool(
@@ -109,18 +123,40 @@ async function main() {
         ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
         query: "smoke test: what is VectorMind?",
         top_k: 5,
-        conventions_limit: 40,
       },
     },
     undefined,
     { timeout: 10_000 },
   );
   const bootElapsedMs = Date.now() - bootStart;
-  console.log("\n--- bootstrap_context ---\n");
+  console.log("\n--- bootstrap_context (compact) ---\n");
   const bootText = readText(boot);
   console.log(bootText);
+  if (!bootText.includes("ok ctx") || !bootText.includes("hint: use format=json")) {
+    console.error("\n[smoke] expected default bootstrap_context output to be compact text");
+    process.exitCode = 1;
+    return;
+  }
+
+  const bootJson = await client.callTool(
+    {
+      name: "bootstrap_context",
+      arguments: {
+        ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+        query: "smoke test: what is VectorMind?",
+        top_k: 5,
+        conventions_limit: 40,
+        format: "json",
+      },
+    },
+    undefined,
+    { timeout: 10_000 },
+  );
+  console.log("\n--- bootstrap_context (json) ---\n");
+  const bootJsonText = readText(bootJson);
+  console.log(bootJsonText);
   try {
-    const parsed = JSON.parse(bootText);
+    const parsed = JSON.parse(bootJsonText);
     const expectedRootSource = useToolProjectRoot ? "tool_arg" : rootsMode === "on" ? "mcp_roots" : "cwd";
     if (parsed?.root_source !== expectedRootSource) {
       throw new Error(`expected root_source=${expectedRootSource}, got ${parsed?.root_source}`);
@@ -159,6 +195,8 @@ async function main() {
       "builtin:plan_lite_trigger_scope",
       "builtin:destructive_operation_scope",
       "builtin:architecture_boundary_first",
+      "builtin:frontend_output_purity_scope",
+      "builtin:git_commit_summary_required",
       "builtin:low_overhead_execution_scope",
       "builtin:payload_guard_trigger_scope",
       "builtin:thread_handoff_trigger_scope",
@@ -191,6 +229,24 @@ async function main() {
     }
     if (!serverInstructions?.includes("模块化单体、清晰分层")) {
       throw new Error("expected server instructions to include the architecture/code-organization policy text");
+    }
+    if (!serverInstructions?.includes("Built-in frontend output-purity policy:")) {
+      throw new Error("expected server instructions to include frontend output-purity section");
+    }
+    if (!serverInstructions?.includes("不得包含本次对话中的提示词")) {
+      throw new Error("expected server instructions to include the frontend prompt-leakage guard text");
+    }
+    if (!serverInstructions?.includes("仅包含完成该业务所必需的代码与必要配置")) {
+      throw new Error("expected server instructions to include the frontend business-code-only text");
+    }
+    if (!serverInstructions?.includes("Built-in git commit summary policy:")) {
+      throw new Error("expected server instructions to include git commit summary section");
+    }
+    if (!serverInstructions?.includes("每次会话中，只要用户让你提交 git")) {
+      throw new Error("expected server instructions to include the git commit summary requirement text");
+    }
+    if (!serverInstructions?.includes("本次更改的内容描述或总结")) {
+      throw new Error("expected server instructions to require a change description or summary for git commits");
     }
     if (!serverInstructions?.includes("Built-in low-overhead execution and heavy-thread policy:")) {
       throw new Error("expected server instructions to include low-overhead/heavy-thread section");
@@ -237,6 +293,21 @@ async function main() {
     if (!serverInstructions?.includes("you may skip retrieval and go straight to the minimum necessary shell or host tools")) {
       throw new Error("expected server instructions to mention direct execution for execution-first tasks");
     }
+    if (!serverInstructions?.includes("prefix shell commands with the command returned by detect_rtk")) {
+      throw new Error("expected server instructions to mention detect_rtk returned command prefixes");
+    }
+    if (!serverInstructions?.includes("VectorMind's bundled RTK shim")) {
+      throw new Error("expected server instructions to mention the bundled RTK shim fallback");
+    }
+    if (!serverInstructions?.includes("install_rtk")) {
+      throw new Error("expected server instructions to mention install_rtk");
+    }
+    if (!serverInstructions?.includes("dry_run=true")) {
+      throw new Error("expected server instructions to mention dry-run rtk installation");
+    }
+    if (!serverInstructions?.includes("get_token_savings")) {
+      throw new Error("expected server instructions to mention get_token_savings");
+    }
     if (!serverInstructions?.includes("switch to payload guard mode")) {
       throw new Error("expected server instructions to mention payload guard mode");
     }
@@ -256,6 +327,32 @@ async function main() {
   });
   console.log("\n--- start_requirement ---\n");
   console.log(readText(req));
+
+  const rtk = await client.callTool({
+    name: "detect_rtk",
+    arguments: useToolProjectRoot ? { project_root: toolProjectRoot } : {},
+  });
+  console.log("\n--- detect_rtk ---\n");
+  const rtkText = readText(rtk);
+  console.log(rtkText);
+  if (!rtkText.includes("rtk ") || !rtkText.includes("command=")) {
+    console.error("\n[smoke] expected detect_rtk to return an rtk status line");
+    process.exitCode = 1;
+    return;
+  }
+
+  const rtkInstallPlan = await client.callTool({
+    name: "install_rtk",
+    arguments: useToolProjectRoot ? { project_root: toolProjectRoot } : {},
+  });
+  console.log("\n--- install_rtk (dry_run) ---\n");
+  const rtkInstallPlanText = readText(rtkInstallPlan);
+  console.log(rtkInstallPlanText);
+  if (!rtkInstallPlanText.includes("install_rtk ok=true dry_run=true") || !rtkInstallPlanText.includes("rtk gain")) {
+    console.error("\n[smoke] expected install_rtk dry-run output to include planned verification commands");
+    process.exitCode = 1;
+    return;
+  }
 
   await new Promise((r) => setTimeout(r, 1000));
 
@@ -329,11 +426,30 @@ async function main() {
       include_content: false,
     },
   });
-  console.log("\n--- semantic_search ---\n");
+  console.log("\n--- semantic_search (compact) ---\n");
   const searchText = readText(search);
   console.log(searchText);
+  if (!searchText.includes("semantic ") || !searchText.includes("hint: use format=json")) {
+    console.error("\n[smoke] expected default semantic_search output to be compact text");
+    process.exitCode = 1;
+    return;
+  }
+
+  const searchJson = await client.callTool({
+    name: "semantic_search",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      query: token,
+      top_k: 5,
+      include_content: false,
+      format: "json",
+    },
+  });
+  console.log("\n--- semantic_search (json) ---\n");
+  const searchJsonText = readText(searchJson);
+  console.log(searchJsonText);
   try {
-    const parsed = JSON.parse(searchText);
+    const parsed = JSON.parse(searchJsonText);
     if (parsed?.ok !== true) throw new Error("expected ok=true from semantic_search");
     const matches = parsed?.matches;
     if (!Array.isArray(matches) || matches.length === 0) {
@@ -365,11 +481,34 @@ async function main() {
       include_paths: ["vm_smoke_test.md"],
     },
   });
-  console.log("\n--- list_project_files ---\n");
+  console.log("\n--- list_project_files (compact) ---\n");
   const listFilesText = readText(listFiles);
   console.log(listFilesText);
+  if (!listFilesText.includes("files path=") || !listFilesText.includes("vm_smoke_test.md")) {
+    console.error("\n[smoke] expected default list_project_files output to be compact text");
+    process.exitCode = 1;
+    return;
+  }
+
+  const listFilesJson = await client.callTool({
+    name: "list_project_files",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      path: ".",
+      recursive: true,
+      max_depth: 2,
+      include_files: true,
+      include_dirs: false,
+      max_results: 50,
+      include_paths: ["vm_smoke_test.md"],
+      format: "json",
+    },
+  });
+  console.log("\n--- list_project_files (json) ---\n");
+  const listFilesJsonText = readText(listFilesJson);
+  console.log(listFilesJsonText);
   try {
-    const parsed = JSON.parse(listFilesText);
+    const parsed = JSON.parse(listFilesJsonText);
     if (parsed?.ok !== true) throw new Error("expected ok=true from list_project_files");
     const entries = parsed?.entries;
     if (!Array.isArray(entries) || entries.length === 0) {
@@ -392,11 +531,29 @@ async function main() {
       max_chars: 1000,
     },
   });
-  console.log("\n--- read_file_text ---\n");
+  console.log("\n--- read_file_text (compact) ---\n");
   const readTextResultText = readText(readTextResult);
   console.log(readTextResultText);
+  if (!readTextResultText.includes("file vm_smoke_test.md") || !readTextResultText.includes(token)) {
+    console.error("\n[smoke] expected default read_file_text output to be compact text");
+    process.exitCode = 1;
+    return;
+  }
+
+  const readTextResultJson = await client.callTool({
+    name: "read_file_text",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      path: "vm_smoke_test.md",
+      max_chars: 1000,
+      format: "json",
+    },
+  });
+  console.log("\n--- read_file_text (json) ---\n");
+  const readTextResultJsonText = readText(readTextResultJson);
+  console.log(readTextResultJsonText);
   try {
-    const parsed = JSON.parse(readTextResultText);
+    const parsed = JSON.parse(readTextResultJsonText);
     if (parsed?.ok !== true) throw new Error("expected ok=true from read_file_text");
     const text = String(parsed?.text ?? "");
     if (!text.includes(token)) throw new Error("expected read_file_text text to contain the token");
@@ -417,11 +574,29 @@ async function main() {
       max_chars: 1000,
     },
   });
-  console.log("\n--- read_codex_text_file ---\n");
+  console.log("\n--- read_codex_text_file (compact) ---\n");
   const readCodexTextResult = readText(readCodexText);
   console.log(readCodexTextResult);
+  if (!readCodexTextResult.includes("file ") || !readCodexTextResult.includes(token)) {
+    console.error("\n[smoke] expected default read_codex_text_file output to be compact text");
+    process.exitCode = 1;
+    return;
+  }
+
+  const readCodexTextJson = await client.callTool({
+    name: "read_codex_text_file",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      path: pathToFileURL(skillPath).toString(),
+      max_chars: 1000,
+      format: "json",
+    },
+  });
+  console.log("\n--- read_codex_text_file (json) ---\n");
+  const readCodexTextJsonResult = readText(readCodexTextJson);
+  console.log(readCodexTextJsonResult);
   try {
-    const parsed = JSON.parse(readCodexTextResult);
+    const parsed = JSON.parse(readCodexTextJsonResult);
     if (parsed?.ok !== true) throw new Error("expected ok=true from read_codex_text_file");
     const text = String(parsed?.text ?? "");
     if (!text.includes(token)) throw new Error("expected read_codex_text_file text to contain the token");
@@ -444,11 +619,31 @@ async function main() {
       include_paths: ["vm_smoke_test.md"],
     },
   });
-  console.log("\n--- grep ---\n");
+  console.log("\n--- grep (compact) ---\n");
   const grepText = readText(grep);
   console.log(grepText);
+  if (!grepText.includes("grep ") || !grepText.includes("vm_smoke_test.md:3:")) {
+    console.error("\n[smoke] expected default grep output to be compact text");
+    process.exitCode = 1;
+    return;
+  }
+
+  const grepJson = await client.callTool({
+    name: "grep",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      query: token,
+      mode: "literal",
+      max_results: 20,
+      include_paths: ["vm_smoke_test.md"],
+      format: "json",
+    },
+  });
+  console.log("\n--- grep (json) ---\n");
+  const grepJsonText = readText(grepJson);
+  console.log(grepJsonText);
   try {
-    const parsed = JSON.parse(grepText);
+    const parsed = JSON.parse(grepJsonText);
     if (parsed?.ok !== true) throw new Error("expected ok=true from grep");
     if (!["ripgrep", "indexed_fallback"].includes(String(parsed?.backend ?? ""))) {
       throw new Error(`expected grep backend to be ripgrep or indexed_fallback, got ${parsed?.backend}`);
@@ -479,16 +674,100 @@ async function main() {
       total_count: 10,
     },
   });
-  console.log("\n--- read_file_lines ---\n");
+  console.log("\n--- read_file_lines (compact) ---\n");
   const readLinesText = readText(readLines);
   console.log(readLinesText);
+  if (!readLinesText.includes("lines vm_smoke_test.md") || !readLinesText.includes(token)) {
+    console.error("\n[smoke] expected default read_file_lines output to be compact text");
+    process.exitCode = 1;
+    return;
+  }
+
+  const readLinesJson = await client.callTool({
+    name: "read_file_lines",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      path: "vm_smoke_test.md",
+      total_count: 10,
+      format: "json",
+    },
+  });
+  console.log("\n--- read_file_lines (json) ---\n");
+  const readLinesJsonText = readText(readLinesJson);
+  console.log(readLinesJsonText);
   try {
-    const parsed = JSON.parse(readLinesText);
+    const parsed = JSON.parse(readLinesJsonText);
     if (parsed?.ok !== true) throw new Error("expected ok=true from read_file_lines");
     const text = String(parsed?.text ?? "");
     if (!text.includes(token)) throw new Error("expected read_file_lines text to contain the token");
   } catch (err) {
     console.error("\n[smoke] read_file_lines check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const queryCodebase = await client.callTool({
+    name: "query_codebase",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      query: "main",
+    },
+  });
+  console.log("\n--- query_codebase (compact) ---\n");
+  const queryCodebaseText = readText(queryCodebase);
+  console.log(queryCodebaseText);
+  if (!queryCodebaseText.includes("query_codebase matches=")) {
+    console.error("\n[smoke] expected default query_codebase output to be compact text");
+    process.exitCode = 1;
+    return;
+  }
+
+  const queryCodebaseJson = await client.callTool({
+    name: "query_codebase",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      query: "main",
+      format: "json",
+    },
+  });
+  try {
+    const parsed = JSON.parse(readText(queryCodebaseJson));
+    if (parsed?.ok !== true) throw new Error("expected ok=true from query_codebase json");
+    if (!Array.isArray(parsed?.matches)) throw new Error("expected query_codebase json matches array");
+  } catch (err) {
+    console.error("\n[smoke] query_codebase json check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const savings = await client.callTool({
+    name: "get_token_savings",
+    arguments: useToolProjectRoot ? { project_root: toolProjectRoot } : {},
+  });
+  console.log("\n--- get_token_savings ---\n");
+  const savingsText = readText(savings);
+  console.log(savingsText);
+  if (!savingsText.includes("token_savings") || !savingsText.includes("bootstrap_context")) {
+    console.error("\n[smoke] expected get_token_savings compact output to include bootstrap_context savings");
+    process.exitCode = 1;
+    return;
+  }
+
+  const savingsJson = await client.callTool({
+    name: "get_token_savings",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      format: "json",
+    },
+  });
+  try {
+    const parsed = JSON.parse(readText(savingsJson));
+    if (parsed?.ok !== true) throw new Error("expected ok=true from get_token_savings json");
+    if (!parsed?.summary || Number(parsed.summary.calls ?? 0) < 1) {
+      throw new Error("expected token savings summary to have at least one call");
+    }
+  } catch (err) {
+    console.error("\n[smoke] get_token_savings json check failed:", err);
     process.exitCode = 1;
     return;
   }
