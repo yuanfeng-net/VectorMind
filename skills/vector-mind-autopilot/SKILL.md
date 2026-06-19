@@ -81,16 +81,7 @@ If you still cannot determine it confidently, ask the user for the project root 
 - Don’t spam tool outputs. Summarize what matters (active requirement, pending changes, next steps).
 - Show raw JSON only when the user requests debugging/verification.
 - If debugging VectorMind behavior, prefer `get_activity_summary` first (small output), and only use `get_activity_log` with paging (and `verbose=true` only if necessary).
-- When generating or modifying page/UI/frontend code, never leak the current conversation’s prompts, instructions, chain-of-thought, task list, or tool guidance into source code, comments, seeded copy, mock data, or rendered UI. Do not add explanatory/meta text just to describe the AI workflow; final delivery should stay as pure business code plus only genuine business copy required by the product.
-- If the current thread is already heavy, recently compacted multiple times, or the user reports it has become slow, switch to a lighter workflow: reduce retrieval/tool churn, keep outputs shorter, and recommend continuing substantial new analysis in a fresh thread after a short handoff summary.
-- If the current thread has already hit `413 Payload Too Large` / `Request Entity Too Large`, enter payload-guard mode immediately: no unbounded shell dumps, no whole-file raw output unless explicitly requested, and prefer bounded MCP reads plus concise summaries.
-- Thread-switch judgment must not rely on a fixed token threshold; use observable signals plus the weight of the upcoming work.
-- If the current thread is heavy, repeatedly compacting, slow, or has already hit `413 Payload Too Large` / `Request Entity Too Large`, and the next work still needs broad analysis / cross-module investigation / release validation / long continuation, pause once and ask whether to switch to a fresh thread before continuing.
-- If the user declines that switch, continue in the current thread, keep light mode + bounded output, and do not raise the thread-switch reminder again in that same session.
-- If the user accepts, do not attempt to create a new thread for the user and do not claim that a new thread has already been created.
-- If the user accepts, or explicitly asks to pack the current conversation for a new thread, use `add_note(...)` to create a concise handoff note instead of dumping a long inline pack.
-- The handoff note should cover at least: 当前目标、当前状态或已完成、未完成与下一步、关键约束、关键文件，以及如有则必须继续参考的相关 note ids.
-- User-visible output should stay minimal: say it was packed, give the new handoff note id, optionally list other required note ids, then tell the user: `新线程里直接说明“读取 note <id> [和 note <id>] 继续”即可无缝接上。`
+- This skill covers VectorMind memory usage and development-quality guidance only. It is unrelated to AI access permissions, runtime permissions, command permissions, filesystem/network permissions, approval mechanisms, or sandbox behavior.
 
 ## Setup / Troubleshooting
 

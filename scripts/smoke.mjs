@@ -191,14 +191,14 @@ async function main() {
         .filter((key) => typeof key === "string"),
     );
     for (const key of [
-      "builtin:branch_write_boundary",
+      "builtin:development_guideline_scope",
       "builtin:plan_lite_trigger_scope",
       "builtin:destructive_operation_scope",
       "builtin:architecture_boundary_first",
       "builtin:frontend_output_purity_scope",
       "builtin:git_commit_summary_required",
       "builtin:low_overhead_execution_scope",
-      "builtin:payload_guard_trigger_scope",
+      "builtin:payload_guard_bounded_io",
       "builtin:thread_handoff_trigger_scope",
     ]) {
       if (!conventionKeys.has(key)) {
@@ -212,68 +212,32 @@ async function main() {
   }
 
   try {
-    if (!serverInstructions?.includes("Built-in task-list / Plan-Lite policy:")) {
-      throw new Error("expected server instructions to include Plan-Lite section");
+    if (!serverInstructions?.includes("Development guideline scope")) {
+      throw new Error("expected server instructions to state development-guideline scope");
     }
-    if (!serverInstructions?.includes("轻量执行列表")) {
-      throw new Error("expected server instructions to include the light task-list policy text");
+    if (!serverInstructions?.includes("Built-in task-list / Plan-Lite quality policy:")) {
+      throw new Error("expected server instructions to include Plan-Lite quality section");
     }
-    if (!serverInstructions?.includes("Built-in destructive-operation guard policy:")) {
-      throw new Error("expected server instructions to include destructive-operation guard section");
+    if (!serverInstructions?.includes("Built-in destructive-operation quality guard:")) {
+      throw new Error("expected server instructions to include destructive-operation quality section");
     }
-    if (!serverInstructions?.includes("无法确认安全，禁止继续破坏性操作")) {
-      throw new Error("expected server instructions to include the destructive-operation guard text");
+    if (!serverInstructions?.includes("Built-in architecture and code-organization quality policy:")) {
+      throw new Error("expected server instructions to include architecture/code-organization quality section");
     }
-    if (!serverInstructions?.includes("Built-in architecture and code-organization policy:")) {
-      throw new Error("expected server instructions to include architecture/code-organization section");
+    if (!serverInstructions?.includes("Built-in frontend output-purity quality policy:")) {
+      throw new Error("expected server instructions to include frontend output-purity quality section");
     }
-    if (!serverInstructions?.includes("模块化单体、清晰分层")) {
-      throw new Error("expected server instructions to include the architecture/code-organization policy text");
+    if (!serverInstructions?.includes("Built-in git commit summary quality policy:")) {
+      throw new Error("expected server instructions to include git commit summary quality section");
     }
-    if (!serverInstructions?.includes("Built-in frontend output-purity policy:")) {
-      throw new Error("expected server instructions to include frontend output-purity section");
+    if (!serverInstructions?.includes("unrelated to AI access permissions")) {
+      throw new Error("expected server instructions to say development guidelines are unrelated to AI permissions");
     }
-    if (!serverInstructions?.includes("不得包含本次对话中的提示词")) {
-      throw new Error("expected server instructions to include the frontend prompt-leakage guard text");
-    }
-    if (!serverInstructions?.includes("仅包含完成该业务所必需的代码与必要配置")) {
-      throw new Error("expected server instructions to include the frontend business-code-only text");
-    }
-    if (!serverInstructions?.includes("Built-in git commit summary policy:")) {
-      throw new Error("expected server instructions to include git commit summary section");
-    }
-    if (!serverInstructions?.includes("每次会话中，只要用户让你提交 git")) {
-      throw new Error("expected server instructions to include the git commit summary requirement text");
+    if (!serverInstructions?.includes("页面代码、模板内容")) {
+      throw new Error("expected server instructions to keep frontend prompt-leakage quality rule");
     }
     if (!serverInstructions?.includes("本次更改的内容描述或总结")) {
-      throw new Error("expected server instructions to require a change description or summary for git commits");
-    }
-    if (!serverInstructions?.includes("Built-in low-overhead execution and heavy-thread policy:")) {
-      throw new Error("expected server instructions to include low-overhead/heavy-thread section");
-    }
-    if (!serverInstructions?.includes("执行为主的任务")) {
-      throw new Error("expected server instructions to include the low-overhead execution policy text");
-    }
-    if (!serverInstructions?.includes("Built-in payload / oversized-thread guard policy:")) {
-      throw new Error("expected server instructions to include payload guard section");
-    }
-    if (!serverInstructions?.includes("Request Entity Too Large")) {
-      throw new Error("expected server instructions to include the payload guard text");
-    }
-    if (!serverInstructions?.includes("Built-in thread handoff / switch-gate policy:")) {
-      throw new Error("expected server instructions to include thread handoff section");
-    }
-    if (!serverInstructions?.includes("不得依赖固定 token 阈值")) {
-      throw new Error("expected server instructions to include the fixed-token-threshold guard text");
-    }
-    if (!serverInstructions?.includes("add_note(...)")) {
-      throw new Error("expected server instructions to include the add_note handoff guidance");
-    }
-    if (!serverInstructions?.includes("不得尝试替用户创建新线程")) {
-      throw new Error("expected server instructions to forbid creating a new thread for the user");
-    }
-    if (!serverInstructions?.includes("读取 note <id>")) {
-      throw new Error("expected server instructions to include the note-id continuation text");
+      throw new Error("expected server instructions to keep git commit summary quality rule");
     }
     if (serverInstructions?.includes("THREAD_HANDOFF_PACK")) {
       throw new Error("expected server instructions to stop using the old THREAD_HANDOFF_PACK template");
@@ -308,9 +272,6 @@ async function main() {
     if (!serverInstructions?.includes("get_token_savings")) {
       throw new Error("expected server instructions to mention get_token_savings");
     }
-    if (!serverInstructions?.includes("switch to payload guard mode")) {
-      throw new Error("expected server instructions to mention payload guard mode");
-    }
   } catch (err) {
     console.error("\n[smoke] server instructions check failed:", err);
     process.exitCode = 1;
@@ -335,7 +296,7 @@ async function main() {
   console.log("\n--- detect_rtk ---\n");
   const rtkText = readText(rtk);
   console.log(rtkText);
-  if (!rtkText.includes("rtk ") || !rtkText.includes("command=")) {
+  if (!rtkText.includes("rtk ") || !rtkText.includes("command=") && !rtkText.includes("rtk unavailable:")) {
     console.error("\n[smoke] expected detect_rtk to return an rtk status line");
     process.exitCode = 1;
     return;

@@ -52,16 +52,7 @@ Use this skill for any coding session where:
 
 - Don’t paste raw JSON tool output unless the user asks for verification/debugging.
 - If tool output conflicts with assumptions, trust the tool output.
-- When generating or modifying page/UI/frontend code, never leak the current conversation’s prompts, instructions, chain-of-thought, task list, or tool guidance into source code, comments, mock data, placeholder copy, or rendered UI. Do not add explanatory/meta text that only exists to describe the AI workflow; final delivery should stay as pure business code plus only real business copy required by the product.
-- If the current thread is already heavy or the user reports it has become slow, reduce retrieval churn, keep outputs shorter, and recommend moving substantial new analysis to a fresh thread after a short handoff summary.
-- If the thread has already hit `413 Payload Too Large` / `Request Entity Too Large`, immediately switch to bounded reads + summaries only; avoid continuing with high-volume shell or file output in that same thread.
-- Thread-switch judgment must not rely on a fixed token threshold; use observable signals plus the weight of the upcoming work.
-- If the current thread is heavy, repeatedly compacting, slow, or has already hit `413 Payload Too Large` / `Request Entity Too Large`, and the next work still needs broad analysis / cross-module investigation / release validation / long continuation, pause once and ask whether to switch to a fresh thread before continuing.
-- If the user declines that switch, continue in the current thread, keep light mode + bounded output, and do not raise the thread-switch reminder again in that same session.
-- If the user accepts, do not attempt to create a new thread for the user and do not claim that a new thread has already been created.
-- If the user accepts, or explicitly asks to pack the current conversation for a new thread, use `add_note(...)` to create a concise handoff note instead of dumping a long inline pack.
-- The handoff note should cover at least: 当前目标、当前状态或已完成、未完成与下一步、关键约束、关键文件，以及如有则必须继续参考的相关 note ids.
-- User-visible output should stay minimal: say it was packed, give the new handoff note id, optionally list other required note ids, then tell the user: `新线程里直接说明“读取 note <id> [和 note <id>] 继续”即可无缝接上。`
+- This skill covers VectorMind memory usage and development-quality guidance only. It is unrelated to AI access permissions, runtime permissions, command permissions, filesystem/network permissions, approval mechanisms, or sandbox behavior.
 
 ## Setup Notes
 
