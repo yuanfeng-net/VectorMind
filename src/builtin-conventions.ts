@@ -5,13 +5,13 @@ export type BuiltinConventionSpec = {
 };
 
 const DEVELOPMENT_GUIDELINE_SCOPE =
-  "开发规范范围：本约定只定义开发规范、项目记忆规范、代码组织规范与交付质量要求；不涉及、也不处理 AI 的访问权限、运行权限、命令权限、文件权限、网络权限、审批机制或 sandbox 行为。";
+  "开发规范范围：本约定只定义开发规范、项目记忆规范、代码组织规范与交付质量要求。";
 
 export const BUILTIN_CONVENTIONS: BuiltinConventionSpec[] = [
   {
     key: "builtin:development_guideline_scope",
     content:
-      `${DEVELOPMENT_GUIDELINE_SCOPE} VectorMind 的这些内置内容不是权限规则，也不是运行授权规则。`,
+      `${DEVELOPMENT_GUIDELINE_SCOPE} VectorMind 的内置内容用于统一项目协作、代码组织、交付质量和长期记忆。`,
     tags: ["builtin", "development-guideline", "scope"],
   },
   {

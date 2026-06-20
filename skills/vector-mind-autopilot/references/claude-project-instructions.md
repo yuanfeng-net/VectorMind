@@ -9,8 +9,8 @@ When the VectorMind MCP tools are available in this chat, use them by default to
 ### Required workflow
 
 1) **At the start of every new chat/session** (or when the user says “继续/恢复/接着做”):
-   - Call: `bootstrap_context({ project_root: "<项目根目录>", query: "<用户当前目标/问题>", top_k: 5, pending_limit: 50, requirements_limit: 3, changes_limit: 5, notes_limit: 5, preview_chars: 200 })`
-   - Use returned `project_summary`, `recent_notes`, `pending_changes`, and semantic `items` to ground your plan.
+   - Call: `bootstrap_context({ project_root: "<项目根目录>", query: "<用户当前目标/问题>", top_k: 5, pending_limit: 50, requirements_limit: 3, changes_limit: 5, notes_limit: 5, current_context_limit: 8, preview_chars: 200 })`
+   - Use returned `project_summary`, `decisions`, `current_context`, `recent_notes`, `pending_changes`, and semantic `items` to ground your plan.
    - Avoid `include_content: true` unless you truly need full text (it increases tokens).
 
 2) **Before editing any code/files** for a new task/feature:
@@ -26,10 +26,12 @@ When the VectorMind MCP tools are available in this chat, use them by default to
 5) **When recalling history / notes / code / docs**:
    - Call: `semantic_search({ project_root: "<项目根目录>", query: "<问题>", top_k: 8, preview_chars: 200 })` instead of guessing.
    - If you need full text for a specific result, call: `read_memory_item({ project_root: "<项目根目录>", id: <memory_item_id>, offset: 0, limit: 2000 })` and page as needed.
+   - If a large/long-lived project feels slow, call: `maintain_memory({ project_root: "<项目根目录>", dry_run: true })` first, then apply with `dry_run: false` only when the plan looks safe.
 
 6) **After major milestones**:
    - Call: `upsert_project_summary({ project_root: "<项目根目录>", summary: "<当前进度 + 已完成 + 未解决问题 + 下一步>" })`
    - Optionally call: `add_note({ project_root: "<项目根目录>", title?, content, tags? })` for durable decisions/constraints/TODOs.
+   - If a newer user decision overrides older behavior, call: `upsert_decision({ project_root: "<项目根目录>", key, title, content, ... })`.
    - If the requirement is finished, call: `complete_requirement({ project_root: "<项目根目录>" })`
    - If the user states a durable project convention (框架选型/build 命令/产物路径/命名规则), call: `upsert_convention({ project_root: "<项目根目录>", key: "<短 key>", content: "<约定内容>", tags?: [...] })`
 

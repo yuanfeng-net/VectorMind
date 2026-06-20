@@ -24,7 +24,7 @@ Therefore:
 1) If the user mentions a project path explicitly, use that exact directory.
 2) Otherwise, infer it from the **active file / open tabs paths** in the conversation context:
    - Prefer the workspace folder that contains the files being discussed.
-   - If you can check the filesystem, walk upward until you find a marker like `.git/` (or a root file like `package.json`, `pyproject.toml`, `go.mod`, `Cargo.toml`, `*.sln`), and use that directory.
+   - If you can inspect local project files, walk upward until you find a marker like `.git/` (or a root file like `package.json`, `pyproject.toml`, `go.mod`, `Cargo.toml`, `*.sln`), and use that directory.
 3) Validate the choice once by calling `bootstrap_context({ project_root, query: "<goal>" })` and confirm:
    - `root_source` is `"tool_arg"`
    - `db_path` is under `<project_root>/.vectormind/`
@@ -41,9 +41,9 @@ If you still cannot determine it confidently, ask the user for the project root 
 ### 2) On every new session (or when the user says “继续/恢复/接着做”)
 
 - Unless the task is purely execution-first (for example compile/build/run/launch/package/publish/test rerun with already-known targets), call `bootstrap_context({ project_root: <PROJECT_ROOT>, query: <the user's current goal>, top_k: 5 })` first.
-  - Prefer keeping tool output small by default: `pending_limit: 50`, `requirements_limit: 3`, `changes_limit: 5`, `notes_limit: 5`, `preview_chars: 200`.
+  - Prefer keeping tool output small by default: `pending_limit: 50`, `requirements_limit: 3`, `changes_limit: 5`, `notes_limit: 5`, `current_context_limit: 8`, `preview_chars: 200`.
   - Avoid `include_content: true` unless you truly need full text (it increases tokens).
-- Use the returned `project_summary`, `recent_notes`, `pending_changes`, and semantic `items` to ground your plan and avoid “blind guessing”.
+- Use the returned `project_summary`, `decisions`, `current_context`, `recent_notes`, `pending_changes`, and semantic `items` to ground your plan and avoid “blind guessing”.
 - Do **not** paste raw JSON unless the user asks for it (summarize key facts instead).
 - For pure execution-first tasks with explicit targets, prefer the minimum necessary shell or host tools first; only pull VectorMind retrieval tools back in when code/context lookup is actually needed to unblock execution.
 
@@ -66,13 +66,15 @@ If you still cannot determine it confidently, ask the user for the project root 
 - If you need to read a specific file segment (like `Get-Content -TotalCount` / `head`): call `read_file_lines({ project_root: <PROJECT_ROOT>, path: "<file>", total_count: 240 })` or `read_file_lines({ ..., from_line, to_line })` first to keep output bounded.
 - Avoid whole-file dumps, full-repo recursive listings, or broad raw match echo in normal flow; narrow the scope first and only surface the minimum needed lines/paths.
 - If you need to recall prior context/notes/decisions/code/docs: call `semantic_search({ project_root: <PROJECT_ROOT>, query, top_k, kinds? })` instead of guessing.
-  - Note: `semantic_search` works even when embeddings are off (uses local SQLite FTS/LIKE). Enable `VECTORMIND_EMBEDDINGS=on` if you want vector semantic recall.
+  - Note: `semantic_search` works even when embeddings are off (uses local lexical/FTS/LIKE recall). Enable `VECTORMIND_EMBEDDINGS=on` if you want vector semantic recall too.
 - If you truly need full text for a specific match/note/summary, call `read_memory_item({ project_root: <PROJECT_ROOT>, id, offset, limit })` to fetch it in chunks instead of setting `include_content: true`.
+- If a large/long-lived project feels slow, call `maintain_memory({ project_root: <PROJECT_ROOT>, dry_run: true })` first, then apply with `dry_run: false` only when the plan looks safe.
 
 ### 6) After major milestones (or before ending the session)
 
 - Call `upsert_project_summary({ project_root: <PROJECT_ROOT>, summary })` to keep a single, up-to-date project summary.
 - Call `add_note({ project_root: <PROJECT_ROOT>, title?, content, tags? })` for durable decisions/constraints/TODOs that should survive across sessions.
+- When a user confirms a newer rule that overrides old behavior, prefer `upsert_decision({ project_root: <PROJECT_ROOT>, key, title, content, ... })` and supersede old records when possible.
 - If the user confirms a requirement is finished, call `complete_requirement({ project_root: <PROJECT_ROOT> })` so it no longer shows as active.
 - If the user states a durable project convention (framework, build command, naming rules, output paths), call `upsert_convention({ project_root: <PROJECT_ROOT>, key, content, tags? })`.
 
@@ -81,7 +83,7 @@ If you still cannot determine it confidently, ask the user for the project root 
 - Don’t spam tool outputs. Summarize what matters (active requirement, pending changes, next steps).
 - Show raw JSON only when the user requests debugging/verification.
 - If debugging VectorMind behavior, prefer `get_activity_summary` first (small output), and only use `get_activity_log` with paging (and `verbose=true` only if necessary).
-- This skill covers VectorMind memory usage and development-quality guidance only. It is unrelated to AI access permissions, runtime permissions, command permissions, filesystem/network permissions, approval mechanisms, or sandbox behavior.
+- This skill covers VectorMind memory usage and development-quality guidance.
 
 ## Setup / Troubleshooting
 

@@ -99,7 +99,7 @@ type RtkDetection = {
 };
 
 const SERVER_NAME = "vector-mind";
-const SERVER_VERSION = "1.0.42";
+const SERVER_VERSION = "1.0.44";
 
 type RootSource = "tool_arg" | "env" | "mcp_roots" | "cwd" | "fallback";
 
@@ -214,6 +214,44 @@ const INDEX_AUTO_PRUNE_IGNORED = (() => {
   return ["1", "true", "on", "yes"].includes(raw);
 })();
 
+const MAINTENANCE_AUTO_ENABLED = (() => {
+  const raw = (process.env.VECTORMIND_MAINTENANCE_AUTO ?? "").trim().toLowerCase();
+  if (!raw) return true;
+  return ["1", "true", "on", "yes"].includes(raw);
+})();
+
+const MAINTENANCE_INTERVAL_HOURS = (() => {
+  const raw = process.env.VECTORMIND_MAINTENANCE_INTERVAL_HOURS?.trim();
+  if (!raw) return 24;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return 24;
+  return Math.min(24 * 30, n);
+})();
+
+const MAINTENANCE_COMPACT_AFTER_DAYS = (() => {
+  const raw = process.env.VECTORMIND_COMPACT_AFTER_DAYS?.trim();
+  if (!raw) return 45;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return 45;
+  return Math.min(3650, n);
+})();
+
+const MAINTENANCE_MAX_MEMORY_ITEMS = (() => {
+  const raw = process.env.VECTORMIND_MAINTENANCE_MAX_MEMORY_ITEMS?.trim();
+  if (!raw) return 250;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return 250;
+  return Math.min(5000, n);
+})();
+
+const MAINTENANCE_MAX_INDEX_FILES = (() => {
+  const raw = process.env.VECTORMIND_MAINTENANCE_MAX_INDEX_FILES?.trim();
+  if (!raw) return 1500;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return 1500;
+  return Math.min(50_000, n);
+})();
+
 const ROOTS_LIST_TIMEOUT_MS = (() => {
   const raw = process.env.VECTORMIND_ROOTS_TIMEOUT_MS?.trim();
   if (!raw) return 750;
@@ -230,6 +268,14 @@ const BOOTSTRAP_SEMANTIC_TIMEOUT_MS = (() => {
   return n;
 })();
 
+const SEMANTIC_EMBEDDINGS_TIMEOUT_MS = (() => {
+  const raw = process.env.VECTORMIND_EMBEDDINGS_TIMEOUT_MS?.trim();
+  if (!raw) return 1500;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) return 1500;
+  return n;
+})();
+
 let initialized = false;
 let rootSource: RootSource = "cwd";
 let projectRoot = "";
@@ -242,6 +288,7 @@ let initializationPromise: Promise<void> | null = null;
 
 let insertRequirementStmt: Database.Statement;
 let getActiveRequirementStmt: Database.Statement;
+let listActiveRequirementsStmt: Database.Statement;
 let listRecentRequirementsStmt: Database.Statement;
 let completeAllActiveRequirementsStmt: Database.Statement;
 let completeRequirementByIdStmt: Database.Statement;
@@ -262,6 +309,7 @@ let listCurrentDecisionsStmt: Database.Statement;
 let upsertProjectSummaryStmt: Database.Statement;
 let getProjectSummaryStmt: Database.Statement;
 let listRecentNotesStmt: Database.Statement;
+let listRecentContextItemsStmt: Database.Statement;
 let getLatestChangeIntentForFileStmt: Database.Statement;
 let deleteFileChunkItemsStmt: Database.Statement;
 let getEmbeddingMetaStmt: Database.Statement;
@@ -281,6 +329,8 @@ let insertTokenSavingsStmt: Database.Statement;
 let summarizeTokenSavingsStmt: Database.Statement;
 let summarizeTokenSavingsByToolStmt: Database.Statement;
 let listRecentTokenSavingsStmt: Database.Statement;
+let getKvStmt: Database.Statement;
+let setKvStmt: Database.Statement;
 
 let indexFileSymbolsTx:
   | ((filePath: string, symbols: ExtractedSymbol[]) => void)
@@ -405,6 +455,10 @@ function summarizeActivityEvent(e: ActivityEvent): string {
       return `sync_change_intent #${String(d.req_id ?? "")} files=${String(d.files_total ?? "")}`;
     case "complete_requirement":
       return `complete_requirement ${String(d.all_active ? "all_active" : d.req_id ?? "")}`;
+    case "memory_maintenance":
+      return `memory_maintenance trigger=${String(d.trigger ?? "")} compacted=${String(
+        d.compacted ?? "",
+      )} stale=${String(d.stale_files ?? "")} chunks_deleted=${String(d.chunks_deleted ?? "")}`;
     default:
       return e.type;
   }
@@ -863,10 +917,10 @@ function pruneFilenameNoiseIndexes(): { chunks_deleted: number; symbols_deleted:
 
   try {
     const suffixWhere = NOISE_FILE_SUFFIXES.map(() => "LOWER(file_path) LIKE ?").join(" OR ");
-    const baseWhere = NOISE_FILE_BASENAMES.map(() => "LOWER(file_path) LIKE ?").join(" OR ");
+    const baseWhere = NOISE_FILE_BASENAMES.map(() => "(LOWER(file_path) = ? OR LOWER(file_path) LIKE ?)").join(" OR ");
 
     const suffixArgs = NOISE_FILE_SUFFIXES.map((s) => `%${s}`);
-    const baseArgs = NOISE_FILE_BASENAMES.map((n) => `%/${n}`);
+    const baseArgs = NOISE_FILE_BASENAMES.flatMap((n) => [n, `%/${n}`]);
 
     const whereParts: string[] = [];
     const args: string[] = [];
@@ -910,6 +964,581 @@ function pruneFilenameNoiseIndexes(): { chunks_deleted: number; symbols_deleted:
   } catch (err) {
     console.error("[vectormind] prune filename noise failed:", err);
     return { chunks_deleted: 0, symbols_deleted: 0 };
+  }
+}
+
+type MaintenanceIndexPruneResult = {
+  ignored_paths: { chunks_deleted: number; symbols_deleted: number };
+  filename_noise: { chunks_deleted: number; symbols_deleted: number };
+  stale_files: {
+    files_checked: number;
+    files_matched: number;
+    chunks_deleted: number;
+    symbols_deleted: number;
+    samples: string[];
+  };
+  hidden_embeddings: { embeddings_deleted: number };
+};
+
+type MaintenanceCompactionResult = {
+  cutoff: string;
+  candidates: number;
+  compacted: number;
+  summary_memory_id: number | null;
+  archived: number;
+  samples: Array<{ id: number; kind: string; title: string | null; file_path: string | null; updated_at: string }>;
+};
+
+type MaintenanceResult = {
+  ok: true;
+  dry_run: boolean;
+  trigger: "manual" | "auto";
+  generated_at: string;
+  project_root: string;
+  db_path: string;
+  config: {
+    compact_after_days: number;
+    max_memory_items: number;
+    max_index_files: number;
+    compact_notes: boolean;
+  };
+  compacted_memory: MaintenanceCompactionResult;
+  pruned: MaintenanceIndexPruneResult;
+  vacuumed: boolean;
+};
+
+function kvGet(key: string): string | null {
+  try {
+    const row = getKvStmt?.get(key) as { value: string } | undefined;
+    return row?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function kvSet(key: string, value: string): void {
+  try {
+    setKvStmt?.run(key, value);
+  } catch (err) {
+    console.error("[vectormind] kv set failed:", err);
+  }
+}
+
+function distinctChunkAndSymbolFilePaths(limit: number): string[] {
+  const rows = db
+    .prepare(
+      `SELECT file_path
+       FROM (
+         SELECT file_path, MAX(updated_at) AS updated_at
+         FROM memory_items
+         WHERE file_path IS NOT NULL
+           AND (kind = 'code_chunk' OR kind = 'doc_chunk')
+         GROUP BY file_path
+         UNION
+         SELECT file_path, CURRENT_TIMESTAMP AS updated_at
+         FROM symbols
+         WHERE file_path IS NOT NULL
+         GROUP BY file_path
+       )
+       WHERE file_path IS NOT NULL
+       ORDER BY updated_at ASC
+       LIMIT ?`,
+    )
+    .all(limit) as Array<{ file_path: string }>;
+  return Array.from(new Set(rows.map((r) => r.file_path).filter(Boolean)));
+}
+
+function classifyStaleIndexFile(filePath: string): string | null {
+  if (!filePath) return "empty_path";
+  if (shouldIgnoreDbFilePath(filePath)) return "ignored_path";
+  if (shouldIgnoreContentFile(filePath)) return "filename_noise";
+
+  const absPath = path.isAbsolute(filePath) ? filePath : path.join(projectRoot, filePath);
+  const rel = path.relative(projectRoot, absPath);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) return "outside_project";
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(absPath);
+  } catch {
+    return "missing_file";
+  }
+  if (!stat.isFile()) return "not_file";
+  if (!isContentIndexableFile(absPath) && !isSymbolIndexableFile(absPath)) return "not_indexable";
+  return null;
+}
+
+function pruneStaleFileIndexes(opts: {
+  dryRun: boolean;
+  maxIndexFiles: number;
+}): MaintenanceIndexPruneResult["stale_files"] {
+  const filePaths = distinctChunkAndSymbolFilePaths(Math.min(50_000, opts.maxIndexFiles * 3));
+  const matched: Array<{ file_path: string; reason: string }> = [];
+  for (const fp of filePaths) {
+    if (matched.length >= opts.maxIndexFiles) break;
+    const reason = classifyStaleIndexFile(fp);
+    if (reason) matched.push({ file_path: fp, reason });
+  }
+
+  let chunksDeleted = 0;
+  let symbolsDeleted = 0;
+  const samples = matched.slice(0, 20).map((m) => `${m.file_path} (${m.reason})`);
+
+  if (!opts.dryRun && matched.length) {
+    const tx = db.transaction(() => {
+      for (const m of matched) {
+        chunksDeleted += deleteFileChunkItemsStmt.run(m.file_path).changes;
+        symbolsDeleted += deleteSymbolsForFileStmt.run(m.file_path).changes;
+      }
+    });
+    try {
+      tx();
+    } catch (err) {
+      console.error("[vectormind] prune stale indexes failed:", err);
+    }
+  } else if (opts.dryRun && matched.length) {
+    const countChunksStmt = db.prepare(
+      `SELECT COUNT(1) AS c
+       FROM memory_items
+       WHERE file_path = ?
+         AND (kind = 'code_chunk' OR kind = 'doc_chunk')`,
+    );
+    const countSymbolsStmt = db.prepare(`SELECT COUNT(1) AS c FROM symbols WHERE file_path = ?`);
+    for (const m of matched) {
+      chunksDeleted += Number((countChunksStmt.get(m.file_path) as { c: number } | undefined)?.c ?? 0);
+      symbolsDeleted += Number((countSymbolsStmt.get(m.file_path) as { c: number } | undefined)?.c ?? 0);
+    }
+  }
+
+  if (!opts.dryRun && (chunksDeleted || symbolsDeleted)) {
+    logActivity("index_prune", {
+      reason: "stale_files",
+      files_matched: matched.length,
+      chunks_deleted: chunksDeleted,
+      symbols_deleted: symbolsDeleted,
+      samples,
+    });
+  }
+
+  return {
+    files_checked: filePaths.length,
+    files_matched: matched.length,
+    chunks_deleted: chunksDeleted,
+    symbols_deleted: symbolsDeleted,
+    samples,
+  };
+}
+
+function countIgnoredIndexDeletes(): { chunks_deleted: number; symbols_deleted: number } {
+  if (!IGNORED_LIKE_PATTERNS.length) return { chunks_deleted: 0, symbols_deleted: 0 };
+  const where = IGNORED_LIKE_PATTERNS
+    .map(() => "LOWER(REPLACE(file_path, '\\\\', '/')) LIKE ?")
+    .join(" OR ");
+  const chunksDeleted = Number(
+    (
+      db
+        .prepare(
+          `SELECT COUNT(1) AS c
+           FROM memory_items
+           WHERE file_path IS NOT NULL
+             AND (kind = 'code_chunk' OR kind = 'doc_chunk')
+             AND (${where})`,
+        )
+        .get(...IGNORED_LIKE_PATTERNS) as { c: number } | undefined
+    )?.c ?? 0,
+  );
+  const symbolsDeleted = Number(
+    (
+      db
+        .prepare(
+          `SELECT COUNT(1) AS c
+           FROM symbols
+           WHERE file_path IS NOT NULL
+             AND (${where})`,
+        )
+        .get(...IGNORED_LIKE_PATTERNS) as { c: number } | undefined
+    )?.c ?? 0,
+  );
+  return { chunks_deleted: chunksDeleted, symbols_deleted: symbolsDeleted };
+}
+
+function countFilenameNoiseIndexDeletes(): { chunks_deleted: number; symbols_deleted: number } {
+  const suffixWhere = NOISE_FILE_SUFFIXES.map(() => "LOWER(file_path) LIKE ?").join(" OR ");
+  const baseWhere = NOISE_FILE_BASENAMES.map(() => "(LOWER(file_path) = ? OR LOWER(file_path) LIKE ?)").join(" OR ");
+  const suffixArgs = NOISE_FILE_SUFFIXES.map((s) => `%${s}`);
+  const baseArgs = NOISE_FILE_BASENAMES.flatMap((n) => [n, `%/${n}`]);
+  const whereParts: string[] = [];
+  const args: string[] = [];
+  if (suffixWhere) {
+    whereParts.push(`(${suffixWhere})`);
+    args.push(...suffixArgs);
+  }
+  if (baseWhere) {
+    whereParts.push(`(${baseWhere})`);
+    args.push(...baseArgs);
+  }
+  if (!whereParts.length) return { chunks_deleted: 0, symbols_deleted: 0 };
+  const where = whereParts.join(" OR ");
+  const chunksDeleted = Number(
+    (
+      db
+        .prepare(
+          `SELECT COUNT(1) AS c
+           FROM memory_items
+           WHERE file_path IS NOT NULL
+             AND (kind = 'code_chunk' OR kind = 'doc_chunk')
+             AND (${where})`,
+        )
+        .get(...args) as { c: number } | undefined
+    )?.c ?? 0,
+  );
+  const symbolsDeleted = Number(
+    (
+      db
+        .prepare(
+          `SELECT COUNT(1) AS c
+           FROM symbols
+           WHERE file_path IS NOT NULL
+             AND (${where})`,
+        )
+        .get(...args) as { c: number } | undefined
+    )?.c ?? 0,
+  );
+  return { chunks_deleted: chunksDeleted, symbols_deleted: symbolsDeleted };
+}
+
+function hiddenEmbeddingIds(limit = 10_000): number[] {
+  const rows = db
+    .prepare(
+      `SELECT e.memory_id AS memory_id, m.metadata_json AS metadata_json
+       FROM embeddings e
+       JOIN memory_items m ON m.id = e.memory_id
+       WHERE m.metadata_json LIKE '%compacted%'
+          OR m.metadata_json LIKE '%superseded%'
+       LIMIT ?`,
+    )
+    .all(limit) as Array<{ memory_id: number; metadata_json: string | null }>;
+  return rows
+    .filter((r) => isHiddenFromDefaultRecall({ metadata_json: r.metadata_json }))
+    .map((r) => r.memory_id);
+}
+
+function pruneHiddenEmbeddings(dryRun: boolean): MaintenanceIndexPruneResult["hidden_embeddings"] {
+  const ids = hiddenEmbeddingIds();
+  if (!ids.length) return { embeddings_deleted: 0 };
+  if (!dryRun) {
+    const deleteStmt = db.prepare(`DELETE FROM embeddings WHERE memory_id = ?`);
+    const tx = db.transaction(() => {
+      for (const id of ids) deleteStmt.run(id);
+    });
+    try {
+      tx();
+    } catch (err) {
+      console.error("[vectormind] prune hidden embeddings failed:", err);
+    }
+  }
+  return { embeddings_deleted: ids.length };
+}
+
+function selectCompactionCandidates(opts: {
+  compactAfterDays: number;
+  maxMemoryItems: number;
+  compactNotes: boolean;
+}): Array<MemoryItemRow & { req_status?: string | null }> {
+  const kinds = opts.compactNotes
+    ? ["requirement", "change_intent", "note"]
+    : ["requirement", "change_intent"];
+  const placeholders = kinds.map(() => "?").join(", ");
+  const rows = db
+    .prepare(
+      `SELECT
+         m.id, m.kind, m.title, m.content, m.file_path, m.start_line, m.end_line,
+         m.req_id, m.metadata_json, m.content_hash, m.created_at, m.updated_at,
+         r.status AS req_status
+       FROM memory_items m
+       LEFT JOIN requirements r ON r.id = m.req_id
+       WHERE m.kind IN (${placeholders})
+         AND m.updated_at < datetime('now', ?)
+       ORDER BY m.updated_at ASC, m.id ASC
+       LIMIT ?`,
+    )
+    .all(...kinds, `-${opts.compactAfterDays} days`, Math.min(20_000, opts.maxMemoryItems * 5)) as Array<
+    MemoryItemRow & { req_status?: string | null }
+  >;
+
+  return rows
+    .filter((row) => !isHiddenFromDefaultRecall(row))
+    .filter((row) => metadataStatus(row) !== "current" && metadataStatus(row) !== "active")
+    .filter((row) => row.req_status !== "active")
+    .filter((row) => row.kind !== "note" || opts.compactNotes)
+    .slice(0, opts.maxMemoryItems);
+}
+
+function compactionLine(row: MemoryItemRow): string {
+  const date = oneLine(row.updated_at || row.created_at, 19);
+  const title = row.title ? ` ${oneLine(row.title, 80)}` : "";
+  const file = row.file_path ? ` file=${row.file_path}${row.start_line != null ? `:${row.start_line}` : ""}` : "";
+  const req = row.req_id != null ? ` req#${row.req_id}` : "";
+  return `- ${date} #${row.id} ${row.kind}${req}${file}${title}: ${oneLine(row.content, 220)}`;
+}
+
+function compactOldMemoryItems(opts: {
+  dryRun: boolean;
+  compactAfterDays: number;
+  maxMemoryItems: number;
+  compactNotes: boolean;
+}): MaintenanceCompactionResult {
+  const candidates = selectCompactionCandidates(opts);
+  const cutoff = new Date(Date.now() - opts.compactAfterDays * 86_400_000).toISOString();
+  const samples = candidates.slice(0, 20).map((row) => ({
+    id: row.id,
+    kind: row.kind,
+    title: row.title,
+    file_path: row.file_path,
+    updated_at: row.updated_at,
+  }));
+
+  if (opts.dryRun || !candidates.length) {
+    return {
+      cutoff,
+      candidates: candidates.length,
+      compacted: 0,
+      summary_memory_id: null,
+      archived: 0,
+      samples,
+    };
+  }
+
+  const now = new Date().toISOString();
+  const lines = [
+    `Auto-compacted ${candidates.length} old VectorMind memory items.`,
+    `Cutoff: items updated before ${cutoff} (${opts.compactAfterDays} days).`,
+    "",
+    "This compact summary keeps old history searchable while detailed stale items are hidden from default recall.",
+    "Durable decisions, conventions, and project summaries are never compacted by this automatic pass.",
+    "",
+    ...candidates.map(compactionLine),
+  ];
+  const content = lines.join("\n");
+  const title = `Memory compaction ${now.slice(0, 10)}`;
+  const metadata = {
+    source: "maintenance",
+    status: "current",
+    compacted_item_ids: candidates.map((c) => c.id),
+    compact_after_days: opts.compactAfterDays,
+    compact_notes: opts.compactNotes,
+    generated_at: now,
+  };
+
+  let summaryMemoryId = 0;
+  let archived = 0;
+  const archiveStmt = db.prepare(
+    `INSERT OR IGNORE INTO memory_item_archive
+       (memory_id, original_kind, original_title, original_content, original_file_path,
+        original_start_line, original_end_line, original_req_id, original_metadata_json,
+        original_content_hash, original_created_at, original_updated_at, archive_reason, compacted_into_id)
+     VALUES
+       (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const updateMemoryStmt = db.prepare(
+    `UPDATE memory_items
+     SET content = ?, metadata_json = ?, content_hash = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+  );
+  const deleteEmbeddingStmt = db.prepare(`DELETE FROM embeddings WHERE memory_id = ?`);
+
+  const tx = db.transaction(() => {
+    const info = insertMemoryItemStmt.run(
+      "memory_compaction",
+      title,
+      content,
+      null,
+      null,
+      null,
+      null,
+      safeJson(metadata),
+      sha256Hex(content),
+    );
+    summaryMemoryId = Number(info.lastInsertRowid);
+
+    for (const row of candidates) {
+      const archiveInfo = archiveStmt.run(
+        row.id,
+        row.kind,
+        row.title,
+        row.content,
+        row.file_path,
+        row.start_line,
+        row.end_line,
+        row.req_id,
+        row.metadata_json,
+        row.content_hash,
+        row.created_at,
+        row.updated_at,
+        "auto_compaction",
+        summaryMemoryId,
+      );
+      if (archiveInfo.changes > 0) archived += 1;
+
+      const patchedMeta = {
+        ...parseMetadataJson(row.metadata_json),
+        status: "compacted",
+        compacted: true,
+        compacted_at: now,
+        compacted_into_memory_id: summaryMemoryId,
+      };
+      const stub = [
+        `[compacted into memory item #${summaryMemoryId}]`,
+        `Original ${row.kind} #${row.id} was older than ${opts.compactAfterDays} days and is excluded from default recall.`,
+        `Summary: ${oneLine(row.title || row.content, 260)}`,
+      ].join("\n");
+      updateMemoryStmt.run(stub, safeJson(patchedMeta), sha256Hex(stub), row.id);
+      deleteEmbeddingStmt.run(row.id);
+    }
+  });
+
+  try {
+    tx();
+    if (summaryMemoryId) enqueueEmbedding(summaryMemoryId);
+  } catch (err) {
+    console.error("[vectormind] compact old memory failed:", err);
+    summaryMemoryId = 0;
+  }
+
+  if (summaryMemoryId) {
+    logActivity("memory_maintenance", {
+      reason: "compact_old_memories",
+      compacted: candidates.length,
+      summary_memory_id: summaryMemoryId,
+      archived,
+    });
+  }
+
+  return {
+    cutoff,
+    candidates: candidates.length,
+    compacted: summaryMemoryId ? candidates.length : 0,
+    summary_memory_id: summaryMemoryId || null,
+    archived,
+    samples,
+  };
+}
+
+function runMemoryMaintenance(
+  args: z.infer<typeof MaintainMemoryArgsSchema>,
+  trigger: "manual" | "auto" = "manual",
+): MaintenanceResult {
+  const compactedMemory = args.compact_old_memories
+    ? compactOldMemoryItems({
+        dryRun: args.dry_run,
+        compactAfterDays: args.compact_after_days,
+        maxMemoryItems: args.max_memory_items,
+        compactNotes: args.compact_notes,
+      })
+    : {
+        cutoff: new Date(Date.now() - args.compact_after_days * 86_400_000).toISOString(),
+        candidates: 0,
+        compacted: 0,
+        summary_memory_id: null,
+        archived: 0,
+        samples: [],
+      };
+
+  const ignoredPaths = args.prune_ignored_paths
+    ? args.dry_run
+      ? countIgnoredIndexDeletes()
+      : pruneIgnoredIndexesByPathPatterns()
+    : { chunks_deleted: 0, symbols_deleted: 0 };
+
+  const filenameNoise = args.prune_filename_noise
+    ? args.dry_run
+      ? countFilenameNoiseIndexDeletes()
+      : pruneFilenameNoiseIndexes()
+    : { chunks_deleted: 0, symbols_deleted: 0 };
+
+  const staleFiles = args.prune_stale_indexes
+    ? pruneStaleFileIndexes({ dryRun: args.dry_run, maxIndexFiles: args.max_index_files })
+    : { files_checked: 0, files_matched: 0, chunks_deleted: 0, symbols_deleted: 0, samples: [] };
+
+  const hiddenEmbeddings = args.prune_hidden_embeddings
+    ? pruneHiddenEmbeddings(args.dry_run)
+    : { embeddings_deleted: 0 };
+
+  let vacuumed = false;
+  if (!args.dry_run && args.vacuum) {
+    try {
+      db.exec("VACUUM");
+      vacuumed = true;
+    } catch (err) {
+      console.error("[vectormind] maintenance vacuum failed:", err);
+    }
+  }
+
+  const result: MaintenanceResult = {
+    ok: true,
+    dry_run: args.dry_run,
+    trigger,
+    generated_at: new Date().toISOString(),
+    project_root: projectRoot,
+    db_path: dbPath,
+    config: {
+      compact_after_days: args.compact_after_days,
+      max_memory_items: args.max_memory_items,
+      max_index_files: args.max_index_files,
+      compact_notes: args.compact_notes,
+    },
+    compacted_memory: compactedMemory,
+    pruned: {
+      ignored_paths: ignoredPaths,
+      filename_noise: filenameNoise,
+      stale_files: staleFiles,
+      hidden_embeddings: hiddenEmbeddings,
+    },
+    vacuumed,
+  };
+
+  logActivity("memory_maintenance", {
+    trigger,
+    dry_run: args.dry_run,
+    compacted: result.compacted_memory.compacted,
+    stale_files: result.pruned.stale_files.files_matched,
+    chunks_deleted:
+      result.pruned.ignored_paths.chunks_deleted +
+      result.pruned.filename_noise.chunks_deleted +
+      result.pruned.stale_files.chunks_deleted,
+  });
+
+  return result;
+}
+
+function runAutoMaintenanceIfDue(): void {
+  if (!MAINTENANCE_AUTO_ENABLED || !db) return;
+  const lastRaw = kvGet("maintenance.last_auto_at");
+  const last = lastRaw ? Date.parse(lastRaw) : 0;
+  const dueMs = MAINTENANCE_INTERVAL_HOURS * 3_600_000;
+  if (Number.isFinite(last) && last > 0 && Date.now() - last < dueMs) return;
+
+  try {
+    runMemoryMaintenance(
+      {
+        project_root: projectRoot,
+        dry_run: false,
+        format: "compact",
+        compact_old_memories: true,
+        compact_notes: false,
+        prune_stale_indexes: true,
+        prune_ignored_paths: true,
+        prune_filename_noise: true,
+        prune_hidden_embeddings: true,
+        compact_after_days: MAINTENANCE_COMPACT_AFTER_DAYS,
+        max_memory_items: MAINTENANCE_MAX_MEMORY_ITEMS,
+        max_index_files: MAINTENANCE_MAX_INDEX_FILES,
+        vacuum: false,
+      },
+      "auto",
+    );
+    kvSet("maintenance.last_auto_at", new Date().toISOString());
+  } catch (err) {
+    console.error("[vectormind] auto maintenance failed:", err);
   }
 }
 
@@ -1594,6 +2223,22 @@ const SupersedeMemoryArgsSchema = ProjectRootArgSchema.merge(
   }),
 );
 
+const MaintainMemoryArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
+  z.object({
+    dry_run: z.boolean().optional().default(true),
+    compact_old_memories: z.boolean().optional().default(true),
+    compact_notes: z.boolean().optional().default(false),
+    prune_stale_indexes: z.boolean().optional().default(true),
+    prune_ignored_paths: z.boolean().optional().default(true),
+    prune_filename_noise: z.boolean().optional().default(true),
+    prune_hidden_embeddings: z.boolean().optional().default(true),
+    compact_after_days: z.number().int().min(1).max(3650).optional().default(MAINTENANCE_COMPACT_AFTER_DAYS),
+    max_memory_items: z.number().int().min(1).max(5000).optional().default(MAINTENANCE_MAX_MEMORY_ITEMS),
+    max_index_files: z.number().int().min(1).max(50_000).optional().default(MAINTENANCE_MAX_INDEX_FILES),
+    vacuum: z.boolean().optional().default(false),
+  }),
+);
+
 const DEFAULT_PENDING_LIMIT = 10;
 const MAX_PENDING_LIMIT = 2000;
 
@@ -1617,7 +2262,9 @@ const DEFAULT_RECENT_CHANGES_PER_REQ = 3;
 const DEFAULT_RECENT_NOTES = 3;
 const DEFAULT_CONVENTIONS_LIMIT = 0;
 const DEFAULT_DECISIONS_LIMIT = 5;
+const DEFAULT_CURRENT_CONTEXT_LIMIT = 8;
 const MAX_DECISIONS_LIMIT = 50;
+const MAX_CURRENT_CONTEXT_LIMIT = 50;
 
 const BrainDumpLimitsSchema = z.object({
   requirements_limit: z.number().int().min(1).max(20).optional().default(DEFAULT_RECENT_REQUIREMENTS),
@@ -1625,6 +2272,13 @@ const BrainDumpLimitsSchema = z.object({
   notes_limit: z.number().int().min(0).max(50).optional().default(DEFAULT_RECENT_NOTES),
   conventions_limit: z.number().int().min(0).max(200).optional().default(DEFAULT_CONVENTIONS_LIMIT),
   decisions_limit: z.number().int().min(0).max(MAX_DECISIONS_LIMIT).optional().default(DEFAULT_DECISIONS_LIMIT),
+  current_context_limit: z
+    .number()
+    .int()
+    .min(0)
+    .max(MAX_CURRENT_CONTEXT_LIMIT)
+    .optional()
+    .default(DEFAULT_CURRENT_CONTEXT_LIMIT),
 });
 
 const GetPendingChangesArgsSchema = ProjectRootArgSchema.merge(
@@ -1924,6 +2578,35 @@ function compactQueryCodebaseText(data: { query: string; matches: SymbolRow[] })
   return lines.join("\n");
 }
 
+function compactMaintenanceText(data: MaintenanceResult): string {
+  const prunedChunks =
+    data.pruned.ignored_paths.chunks_deleted +
+    data.pruned.filename_noise.chunks_deleted +
+    data.pruned.stale_files.chunks_deleted;
+  const prunedSymbols =
+    data.pruned.ignored_paths.symbols_deleted +
+    data.pruned.filename_noise.symbols_deleted +
+    data.pruned.stale_files.symbols_deleted;
+  const lines = [
+    `maintain_memory ok dry_run=${data.dry_run} trigger=${data.trigger} compacted=${data.compacted_memory.compacted}/${data.compacted_memory.candidates} archived=${data.compacted_memory.archived} pruned_chunks=${prunedChunks} pruned_symbols=${prunedSymbols} hidden_embeddings=${data.pruned.hidden_embeddings.embeddings_deleted}`,
+  ];
+  if (data.compacted_memory.summary_memory_id) {
+    lines.push(`summary memory_compaction #${data.compacted_memory.summary_memory_id}`);
+  }
+  if (data.compacted_memory.samples.length) {
+    lines.push("memory candidates:");
+    for (const s of data.compacted_memory.samples.slice(0, 8)) {
+      lines.push(`- #${s.id} ${s.kind} ${s.file_path ?? ""} ${oneLine(s.title ?? "", 80)} ${s.updated_at}`);
+    }
+  }
+  if (data.pruned.stale_files.samples.length) {
+    lines.push("stale index samples:");
+    for (const s of data.pruned.stale_files.samples.slice(0, 8)) lines.push(`- ${s}`);
+  }
+  lines.push("hint: dry_run=false applies changes; vacuum=true reclaims sqlite file space after pruning");
+  return lines.join("\n");
+}
+
 function compactBootstrapText(data: {
   generated_at: string;
   project_root: string;
@@ -1933,6 +2616,7 @@ function compactBootstrapText(data: {
   project_summary: ReturnType<typeof toMemoryItemPreview> | null;
   decisions: Array<ReturnType<typeof toMemoryItemPreview>>;
   conventions: Array<ReturnType<typeof toMemoryItemPreview>>;
+  current_context: Array<ReturnType<typeof toMemoryItemPreview>>;
   recent_notes: Array<ReturnType<typeof toMemoryItemPreview>>;
   pending_total: number;
   pending_offset: number;
@@ -1953,6 +2637,10 @@ function compactBootstrapText(data: {
   if (data.decisions.length) {
     lines.push("current decisions:");
     for (const d of data.decisions.slice(0, 5)) lines.push(`- ${compactMemoryLabel(d, 160)}`);
+  }
+  if (data.current_context.length) {
+    lines.push("current context:");
+    for (const c of data.current_context.slice(0, 8)) lines.push(`- ${compactMemoryLabel(c, 160)}`);
   }
   if (data.pending_total) {
     lines.push(
@@ -2066,8 +2754,8 @@ function runRtkProbe(spec: {
             ? `Prefer prefixing shell commands with ${spec.displayCommand} for compact outputs. This is VectorMind's bundled RTK shim; first run auto-installs/caches rtk-ai/rtk if needed.`
             : "Prefer prefixing shell commands with rtk for compact outputs, e.g. rtk git status / rtk npm run build / rtk rg pattern ."
           : spec.source === "package_shim"
-            ? "VectorMind's bundled RTK shim exists, but `gain` failed. Check network/cache or set VECTORMIND_RTK_REAL to an existing rtk-ai/rtk binary."
-            : "An rtk binary exists, but `rtk gain` failed. This may be the wrong rtk project. Use install_rtk with uninstall_wrong_cargo_rtk=true only after confirming it is safe.",
+            ? "VectorMind's bundled RTK shim exists, but `gain` failed. Check npm/cache or set VECTORMIND_RTK_REAL to an existing rtk-ai/rtk binary."
+            : "An rtk binary exists, but `rtk gain` failed. This may be the wrong rtk project. Use install_rtk with uninstall_wrong_cargo_rtk=true only when you intentionally want to replace it.",
     };
   }
   return null;
@@ -2103,7 +2791,7 @@ function detectRtk(): RtkDetection {
     path: shimPath ?? undefined,
     source: shimPath ? "package_shim" : undefined,
     note: shimPath
-      ? "rtk was not found on PATH, and VectorMind's bundled RTK shim could not verify rtk gain. VectorMind compact MCP output still works; check network/cache or set VECTORMIND_RTK_REAL."
+      ? "rtk was not found on PATH, and VectorMind's bundled RTK shim could not verify rtk gain. VectorMind compact MCP output still works; check npm/cache or set VECTORMIND_RTK_REAL."
       : "rtk was not found on PATH and the package RTK shim is unavailable. VectorMind compact MCP output still works; install rtk to compact shell command output too.",
   };
 }
@@ -2558,7 +3246,7 @@ function dotProduct(a: Float32Array, b: Float32Array): number {
   return s;
 }
 
-type SemanticSearchMode = "embeddings" | "fts" | "like";
+type SemanticSearchMode = "embeddings" | "fts" | "like" | "token" | "hybrid";
 
 type MemoryItemSearchRow = Pick<
   MemoryItemRow,
@@ -2608,6 +3296,84 @@ type SemanticSearchOpts = {
   contentMaxChars: number;
 };
 
+const SEMANTIC_TOKEN_STOPWORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "as",
+  "at",
+  "be",
+  "by",
+  "for",
+  "from",
+  "has",
+  "have",
+  "if",
+  "in",
+  "into",
+  "is",
+  "it",
+  "its",
+  "of",
+  "on",
+  "or",
+  "that",
+  "the",
+  "this",
+  "to",
+  "with",
+]);
+
+const BOOTSTRAP_DEFAULT_CONTEXT_KINDS = [
+  "decision",
+  "convention",
+  "project_summary",
+  "memory_compaction",
+  "note",
+  "requirement",
+  "change_intent",
+];
+
+const TOKEN_SEARCH_DEFAULT_KINDS = [
+  "decision",
+  "convention",
+  "project_summary",
+  "memory_compaction",
+  "note",
+  "requirement",
+  "change_intent",
+  "code_chunk",
+  "doc_chunk",
+];
+
+const DECISION_CANDIDATE_KEYWORDS = [
+  "用户确认",
+  "用户要求",
+  "明确",
+  "架构决策",
+  "最终",
+  "默认",
+  "只保留",
+  "统一",
+  "不需要",
+  "无需",
+  "不再",
+  "改成",
+  "改为",
+  "直接通过",
+  "不用审核",
+  "decision",
+  "decided",
+  "confirmed",
+  "must",
+  "default",
+  "only",
+  "single",
+  "no longer",
+  "instead",
+];
+
 function parseMetadataJson(metadata: string | null | undefined): Record<string, unknown> {
   if (!metadata) return {};
   try {
@@ -2630,6 +3396,15 @@ function isSupersededMemory(row: { metadata_json?: string | null }): boolean {
   return meta.superseded === true || meta.status === "superseded";
 }
 
+function isCompactedMemory(row: { metadata_json?: string | null }): boolean {
+  const meta = parseMetadataJson(row.metadata_json);
+  return meta.compacted === true || meta.status === "compacted";
+}
+
+function isHiddenFromDefaultRecall(row: { metadata_json?: string | null }): boolean {
+  return isSupersededMemory(row) || isCompactedMemory(row);
+}
+
 function semanticRecencyWeight(updatedAt: string | null | undefined): number {
   if (!updatedAt) return 0;
   const t = Date.parse(updatedAt.endsWith("Z") ? updatedAt : `${updatedAt}Z`);
@@ -2644,7 +3419,7 @@ function semanticRecencyWeight(updatedAt: string | null | undefined): number {
 function semanticKindWeight(kind: string): number {
   switch (kind) {
     case "decision":
-      return 3.5;
+      return 16;
     case "convention":
       return 2.6;
     case "project_summary":
@@ -2655,22 +3430,123 @@ function semanticKindWeight(kind: string): number {
       return 0.4;
     case "change_intent":
       return 0.2;
+    case "memory_compaction":
+      return 0.7;
     default:
       return 0;
   }
 }
 
 function adjustSemanticScore(row: MemoryItemSearchRow, rawScore: number): number {
-  if (isSupersededMemory(row)) return rawScore - 1000;
+  if (isHiddenFromDefaultRecall(row)) return rawScore - 1000;
   let score = rawScore + semanticKindWeight(row.kind) + semanticRecencyWeight(row.updated_at);
   const status = metadataStatus(row);
-  if (status === "active" || status === "current") score += 1.2;
+  if (status === "current") score += row.kind === "decision" ? 24 : 1.2;
+  if (status === "active") score += 1.2;
   if (row.kind === "change_intent" && row.file_path && shouldIgnoreDbFilePath(row.file_path)) {
     // Human-synced intent for generated/build/runtime files is often the only durable
     // "why" for that change. Do not let built-in path ignores hide the decision trail.
     score += 0.4;
   }
   return score;
+}
+
+function normalizeSearchText(input: string | null | undefined): string {
+  return (input ?? "").normalize("NFKC").toLowerCase();
+}
+
+function extractSearchTokens(raw: string): string[] {
+  const text = normalizeSearchText(raw);
+  const tokens = new Set<string>();
+
+  for (const token of text.match(/[a-z0-9_./:@#-]{2,}/g) ?? []) {
+    if (!SEMANTIC_TOKEN_STOPWORDS.has(token)) tokens.add(token);
+    for (const part of token.split(/[^a-z0-9]+/).filter((p) => p.length >= 2)) {
+      if (!SEMANTIC_TOKEN_STOPWORDS.has(part)) tokens.add(part);
+    }
+  }
+
+  for (const seq of text.match(/\p{Script=Han}+/gu) ?? []) {
+    if (seq.length >= 2 && seq.length <= 18) tokens.add(seq);
+    for (const n of [2, 3, 4]) {
+      if (seq.length < n) continue;
+      for (let i = 0; i <= seq.length - n; i++) {
+        tokens.add(seq.slice(i, i + n));
+      }
+    }
+  }
+
+  return Array.from(tokens)
+    .filter((token) => token.length >= 2 && !SEMANTIC_TOKEN_STOPWORDS.has(token))
+    .sort((a, b) => b.length - a.length)
+    .slice(0, 48);
+}
+
+function countNeedleOccurrences(haystack: string, needle: string): number {
+  if (!haystack || !needle) return 0;
+  let count = 0;
+  let idx = 0;
+  while ((idx = haystack.indexOf(needle, idx)) >= 0) {
+    count++;
+    idx += Math.max(1, needle.length);
+    if (count >= 8) break;
+  }
+  return count;
+}
+
+function tokenLexicalScore(row: MemoryItemSearchRow, query: string, tokens: string[]): number {
+  if (!tokens.length) return 0;
+  const title = normalizeSearchText(row.title);
+  const content = normalizeSearchText(row.content);
+  const filePath = normalizeSearchText(row.file_path);
+  const metadata = normalizeSearchText(row.metadata_json);
+  const exact = normalizeSearchText(query).trim();
+
+  let score = 0;
+  if (exact.length >= 4) {
+    if (title.includes(exact)) score += 8;
+    if (content.includes(exact)) score += 6;
+    if (filePath.includes(exact)) score += 4;
+  }
+
+  let matched = 0;
+  for (const token of tokens) {
+    let tokenScore = 0;
+    if (title.includes(token)) tokenScore += 3.2;
+    if (filePath.includes(token)) tokenScore += 2.4;
+    const contentHits = countNeedleOccurrences(content, token);
+    if (contentHits) tokenScore += Math.min(3.2, 0.75 + contentHits * 0.45);
+    if (metadata.includes(token)) tokenScore += 0.8;
+    if (tokenScore > 0) {
+      matched++;
+      score += tokenScore * Math.min(2.4, Math.max(1, token.length / 4));
+    }
+  }
+
+  if (matched >= Math.min(3, tokens.length)) score += 2;
+  score += matched / Math.max(1, tokens.length);
+  return score;
+}
+
+function looksLikeDecisionContent(content: string): boolean {
+  const text = normalizeSearchText(content);
+  return DECISION_CANDIDATE_KEYWORDS.some((kw) => text.includes(normalizeSearchText(kw)));
+}
+
+function mergeSemanticMatches(
+  sets: Array<SemanticSearchMatch[]>,
+  opts: SemanticSearchOpts,
+): SemanticSearchMatch[] {
+  const best = new Map<number, SemanticSearchMatch>();
+  for (const matches of sets) {
+    for (const match of matches) {
+      const prev = best.get(match.item.id);
+      if (!prev || match.score > prev.score) best.set(match.item.id, match);
+    }
+  }
+  return Array.from(best.values())
+    .sort((a, b) => b.score - a.score || b.item.id - a.item.id)
+    .slice(0, opts.topK);
 }
 
 function filterAndRankSemanticRows(
@@ -2681,7 +3557,7 @@ function filterAndRankSemanticRows(
   return rows
     .map((r) => ({ row: r, score: adjustSemanticScore(r, scoreOf(r)) }))
     .filter(({ row }) => {
-      if (isSupersededMemory(row)) return false;
+      if (isHiddenFromDefaultRecall(row)) return false;
       if (shouldIgnoreDbFilePath(row.file_path) && row.kind !== "change_intent") return false;
       return true;
     })
@@ -2809,9 +3685,44 @@ function getDecisionPreviews(
   if (decisionsLimit <= 0) return [];
   const rows = listCurrentDecisionsStmt.all(Math.min(MAX_DECISIONS_LIMIT * 4, Math.max(decisionsLimit, decisionsLimit * 4))) as MemoryItemRow[];
   return rows
-    .filter((d) => !isSupersededMemory(d))
+    .filter((d) => !isHiddenFromDefaultRecall(d))
     .slice(0, decisionsLimit)
     .map((d) => toMemoryItemPreview(d, false, previewChars, contentMaxChars));
+}
+
+function getCurrentContextPreviews(
+  currentContextLimit: number,
+  previewChars: number,
+  contentMaxChars: number,
+): Array<ReturnType<typeof toMemoryItemPreview>> {
+  if (currentContextLimit <= 0) return [];
+
+  const picked = new Map<number, ReturnType<typeof toMemoryItemPreview>>();
+  const addRow = (row: MemoryItemRow | undefined): void => {
+    if (!row) return;
+    if (isHiddenFromDefaultRecall(row)) return;
+    if (shouldIgnoreDbFilePath(row.file_path) && row.kind !== "change_intent") return;
+    if (!picked.has(row.id)) {
+      picked.set(row.id, toMemoryItemPreview(row, false, previewChars, contentMaxChars));
+    }
+  };
+
+  const activeReqs = listActiveRequirementsStmt.all(Math.max(currentContextLimit, 10)) as RequirementRow[];
+  for (const req of activeReqs) {
+    const memId = (getRequirementMemoryItemIdStmt.get(req.id) as { id: number } | undefined)?.id;
+    if (memId != null) addRow(getMemoryItemByIdStmt.get(memId) as MemoryItemRow | undefined);
+  }
+
+  const recentRows = listRecentContextItemsStmt.all(Math.max(currentContextLimit * 8, 40)) as MemoryItemRow[];
+  for (const row of recentRows) {
+    if (picked.size >= currentContextLimit) break;
+    if (row.kind === "requirement" || row.kind === "change_intent") {
+      if (!looksLikeDecisionContent(`${row.title ?? ""}\n${row.content}`)) continue;
+    }
+    addRow(row);
+  }
+
+  return Array.from(picked.values()).slice(0, currentContextLimit);
 }
 
 function toRequirementPreview(
@@ -3016,7 +3927,7 @@ async function semanticSearchInternal(opts: SemanticSearchOpts): Promise<Semanti
 
   const filtered = matches
     .filter((m) => {
-      if (isSupersededMemory({ metadata_json: m.item.metadata_json })) return false;
+      if (isHiddenFromDefaultRecall({ metadata_json: m.item.metadata_json })) return false;
       if (shouldIgnoreDbFilePath(m.item.file_path) && m.item.kind !== "change_intent") return false;
       return true;
     })
@@ -3188,24 +4099,220 @@ function likeSearchInternal(opts: SemanticSearchOpts): SemanticSearchResult {
   return { query: q, top_k: opts.topK, mode: "like", matches };
 }
 
-async function semanticSearchHybridInternal(opts: SemanticSearchOpts): Promise<SemanticSearchResult> {
-  if (embeddingsEnabled) {
-    try {
-      return await semanticSearchInternal(opts);
-    } catch (err) {
-      console.error("[vectormind] embeddings semantic_search failed; falling back:", err);
-    }
+function tokenSearchInternal(opts: SemanticSearchOpts): SemanticSearchResult {
+  const q = opts.query.trim();
+  if (!q) return { query: "", top_k: opts.topK, mode: "token", matches: [] };
+
+  const tokens = extractSearchTokens(q);
+  if (!tokens.length) return { query: q, top_k: opts.topK, mode: "token", matches: [] };
+
+  const rawLimit = Math.min(160, Math.max(opts.topK * 12, 80));
+  const searchTokens = tokens.slice(0, 8);
+  const effectiveKinds = opts.kinds?.length ? opts.kinds : TOKEN_SEARCH_DEFAULT_KINDS;
+  const kindClause = effectiveKinds.length
+    ? `AND kind IN (${effectiveKinds.map(() => "?").join(", ")})`
+    : "";
+  const recencyBoost = `
+      + CASE
+          WHEN updated_at >= datetime('now', '-2 days') THEN 4
+          WHEN updated_at >= datetime('now', '-14 days') THEN 2
+          WHEN updated_at >= datetime('now', '-60 days') THEN 1
+          ELSE 0
+        END`;
+  const candidateScore = `
+      (
+        CASE kind
+          WHEN 'decision' THEN 9
+          WHEN 'convention' THEN 7
+          WHEN 'project_summary' THEN 6
+          WHEN 'note' THEN 5
+          WHEN 'requirement' THEN 4
+          WHEN 'change_intent' THEN 3
+          ELSE 0
+        END
+        ${recencyBoost}
+      )`;
+
+  const includesIndexedChunks = effectiveKinds.some((k) => k === "code_chunk" || k === "doc_chunk");
+  if (!includesIndexedChunks) {
+    const candidateLimit = Math.min(1600, Math.max(rawLimit * 5, 800));
+    const stmt = db.prepare(`
+      SELECT
+        id,
+        kind,
+        title,
+        content,
+        file_path,
+        start_line,
+        end_line,
+        req_id,
+        metadata_json,
+        updated_at
+      FROM memory_items
+      WHERE 1=1
+        ${kindClause}
+      ORDER BY
+        ${candidateScore} DESC,
+        updated_at DESC,
+        id DESC
+      LIMIT ?
+    `);
+    const candidates = stmt.all(...effectiveKinds, candidateLimit) as MemoryItemSearchRow[];
+    const scoreMap = new Map<number, number>();
+    const rows = candidates.filter((row) => {
+      const score = tokenLexicalScore(row, q, tokens);
+      if (score <= 0) return false;
+      scoreMap.set(row.id, score);
+      return true;
+    });
+    const matches = filterAndRankSemanticRows(rows, (r) => scoreMap.get(r.id) ?? 0, opts);
+    return { query: q, top_k: opts.topK, mode: "token", matches };
   }
 
+  const memoryFirstKinds = effectiveKinds.filter((k) => k !== "code_chunk" && k !== "doc_chunk");
+  const memoryFirstLimit = Math.min(1200, Math.max(rawLimit * 4, 300));
+  let memoryFirstRows: MemoryItemSearchRow[] = [];
+  const memoryFirstScores = new Map<number, number>();
+  if (memoryFirstKinds.length) {
+    const memoryKindClause = `AND kind IN (${memoryFirstKinds.map(() => "?").join(", ")})`;
+    const memoryStmt = db.prepare(`
+      SELECT
+        id,
+        kind,
+        title,
+        content,
+        file_path,
+        start_line,
+        end_line,
+        req_id,
+        metadata_json,
+        updated_at
+      FROM memory_items
+      WHERE 1=1
+        ${memoryKindClause}
+      ORDER BY
+        ${candidateScore} DESC,
+        updated_at DESC,
+        id DESC
+      LIMIT ?
+    `);
+    const candidates = memoryStmt.all(...memoryFirstKinds, memoryFirstLimit) as MemoryItemSearchRow[];
+    memoryFirstRows = candidates.filter((row) => {
+      const score = tokenLexicalScore(row, q, tokens);
+      if (score <= 0) return false;
+      memoryFirstScores.set(row.id, score);
+      return true;
+    });
+  }
+
+  const conditions: string[] = [];
+  const values: string[] = [];
+  for (const token of searchTokens) {
+    const like = `%${escapeLike(token)}%`;
+    conditions.push(`content LIKE ? ESCAPE '\\'`);
+    values.push(like);
+    conditions.push(`title LIKE ? ESCAPE '\\'`);
+    values.push(like);
+    conditions.push(`file_path LIKE ? ESCAPE '\\'`);
+    values.push(like);
+  }
+  if (!conditions.length) return { query: q, top_k: opts.topK, mode: "token", matches: [] };
+
+  const stmt = db.prepare(`
+    SELECT
+      id,
+      kind,
+      title,
+      content,
+      file_path,
+      start_line,
+      end_line,
+      req_id,
+      metadata_json,
+      updated_at
+    FROM memory_items
+    WHERE (${conditions.join(" OR ")})
+      ${kindClause}
+    ORDER BY
+      ${candidateScore} DESC,
+      updated_at DESC,
+      id DESC
+    LIMIT ?
+  `);
+
+  const rows = stmt.all(
+    ...values,
+    ...effectiveKinds,
+    rawLimit,
+  ) as MemoryItemSearchRow[];
+  const scoreMap = new Map<number, number>(memoryFirstScores);
+  for (const row of rows) {
+    if (!scoreMap.has(row.id)) scoreMap.set(row.id, tokenLexicalScore(row, q, tokens));
+  }
+  const rowMap = new Map<number, MemoryItemSearchRow>();
+  for (const row of memoryFirstRows) rowMap.set(row.id, row);
+  for (const row of rows) rowMap.set(row.id, row);
+  const matches = filterAndRankSemanticRows(Array.from(rowMap.values()), (r) => scoreMap.get(r.id) ?? 0, opts);
+  return { query: q, top_k: opts.topK, mode: "token", matches };
+}
+
+function chooseLexicalResult(
+  opts: SemanticSearchOpts,
+): { result: SemanticSearchResult; mode: "fts" | "like" | "token" | "hybrid" } {
+  const tokenResult = tokenSearchInternal(opts);
+  const tokenTopScore = tokenResult.matches[0]?.score ?? 0;
+  const tokenEnough = tokenResult.matches.length >= Math.min(opts.topK, 3) && tokenTopScore >= 8;
+  if (tokenEnough || tokenResult.matches.length >= opts.topK) {
+    return { result: tokenResult, mode: "token" };
+  }
+
+  let textResult: SemanticSearchResult | null = null;
   if (ftsAvailable) {
     try {
-      return ftsSearchInternal(opts);
+      textResult = ftsSearchInternal(opts);
     } catch (err) {
       console.error("[vectormind] fts semantic_search failed; falling back:", err);
     }
   }
+  if (!textResult) {
+    textResult = likeSearchInternal(opts);
+  }
 
-  return likeSearchInternal(opts);
+  const merged = mergeSemanticMatches([textResult.matches, tokenResult.matches], opts);
+  const tokenIds = new Set(tokenResult.matches.map((m) => m.item.id));
+  const ftsKept = textResult.matches.some((m) => !tokenIds.has(m.item.id));
+  if (tokenResult.matches.length && ftsKept) {
+    return {
+      result: { query: opts.query.trim(), top_k: opts.topK, mode: "hybrid", matches: merged },
+      mode: "hybrid",
+    };
+  }
+  if (tokenResult.matches.length) {
+    return { result: { query: opts.query.trim(), top_k: opts.topK, mode: "token", matches: merged }, mode: "token" };
+  }
+  return { result: textResult, mode: textResult.mode === "fts" ? "fts" : "like" };
+}
+
+async function semanticSearchHybridInternal(opts: SemanticSearchOpts): Promise<SemanticSearchResult> {
+  const lexical = chooseLexicalResult(opts).result;
+  if (!embeddingsEnabled) return lexical;
+
+  const embeddingsResult = await Promise.race([
+    semanticSearchInternal(opts),
+    new Promise<null>((resolve) => setTimeout(resolve, SEMANTIC_EMBEDDINGS_TIMEOUT_MS, null)),
+  ]).catch((err) => {
+    console.error("[vectormind] embeddings semantic_search failed; falling back:", err);
+    return null;
+  });
+
+  if (!embeddingsResult) return lexical;
+  const merged = mergeSemanticMatches([lexical.matches, embeddingsResult.matches], opts);
+  return {
+    query: opts.query.trim(),
+    top_k: opts.topK,
+    mode: merged.length ? "hybrid" : embeddingsResult.mode,
+    matches: merged,
+  };
 }
 
 function escapeRegExp(literal: string): string {
@@ -4088,7 +5195,7 @@ function listProjectFilesInternal(opts: {
 function buildServerInstructions(): string {
   return [
     "VectorMind MCP is available in this session. Use it to avoid guessing project context.",
-    "Development guideline scope: VectorMind instructions define development conventions, project-memory conventions, code-organization conventions, and delivery-quality expectations only. They are unrelated to AI access permissions, runtime permissions, command permissions, filesystem/network permissions, approval mechanisms, or sandbox behavior.",
+    "Development guideline scope: VectorMind instructions define development conventions, project-memory conventions, code-organization conventions, and delivery-quality expectations.",
     "Project root resolution order: tool argument project_root (recommended for clients without roots/list), then VECTORMIND_ROOT (avoid hardcoding in global config), then MCP roots/list (best-effort; falls back quickly if unsupported), then process.cwd() (so start your MCP client in the project directory for per-project isolation).",
     "If root_source is fallback, file watching/indexing is disabled (pass project_root to enable per-project tracking).",
     "",
@@ -4123,12 +5230,12 @@ function buildServerInstructions(): string {
     "- Tool outputs are compact by default. Pass format=json only when you need full structured data.",
     "- On every new conversation/session for analysis/design/development work: call bootstrap_context({ query: <current goal> }) first (or at least get_brain_dump()) to restore compact context and retrieve relevant matches from the local memory store (vector if enabled; otherwise FTS/LIKE).",
     "  - Output is compact by default. Use include_content=true only when you truly need full text (it increases tokens).",
-    "  - Tune output size with: requirements_limit/changes_limit/notes_limit/decisions_limit, preview_chars, pending_limit/pending_offset.",
+    "  - bootstrap_context/get_brain_dump always include a small recency anchor named current_context (latest active requirements, recent notes, and recent change intents) in addition to query matches; tune output size with: requirements_limit/changes_limit/notes_limit/decisions_limit/current_context_limit, preview_chars, pending_limit/pending_offset.",
     "  - Prefer read_memory_item(id, offset, limit) to fetch full text on demand instead of returning large content in other tool outputs.",
     "- For pure execution-first tasks with explicit targets (for example compile/build/run/launch/package/publish/test rerun), you may skip retrieval and go straight to the minimum necessary shell or host tools unless code/context lookup is actually needed to unblock execution.",
     "- If rtk is installed or VectorMind's bundled RTK shim is verified (detect_rtk with gain_ok=true), prefix shell commands with the command returned by detect_rtk. Usually this is rtk (rtk git status, rtk npm run build, rtk rg ...); in npx/MCP-only installs it may be a package shim command such as node <...>/rtk-shim.js.",
-    "- If rtk is missing and the user asks to install it, use install_rtk first with dry_run=true to show the exact commands; execute with dry_run=false only after the user clearly approves installation/init choices.",
-    "- To read local Codex skill/prompt/rule files (for example SKILL.md under CODEX_HOME or AGENTS_HOME), prefer read_codex_text_file({ path }) instead of assuming a filesystem MCP resource server exists.",
+    "- If rtk is missing and the user asks to install it, use install_rtk first with dry_run=true to show the exact commands; execute with dry_run=false only when the user explicitly asks to install/init.",
+    "- To read local Codex skill/prompt/rule files (for example SKILL.md under CODEX_HOME or AGENTS_HOME), prefer read_codex_text_file({ path }) instead of assuming another local-file MCP resource server exists.",
     "- For project file/directory browsing, prefer list_project_files({ path, recursive?, max_depth? }) over shelling out to Get-ChildItem/ls. It respects ignore rules and keeps output bounded.",
     "- For small/medium raw file reads, prefer read_file_text({ path, offset?, max_chars? }) over Get-Content -Raw. Use read_file_lines(...) when you need deterministic line ranges or the file may be large.",
     "- For raw repo text search with exact file+line+col matches, prefer grep({ query: <pattern> }). It uses ripgrep against real project files when available, applies built-in noise filters, and only falls back to indexed search if ripgrep is unavailable.",
@@ -4140,7 +5247,8 @@ function buildServerInstructions(): string {
     "- If the user states a durable project convention (build commands, frameworks, naming rules, output paths): call upsert_convention(key, content, tags) so it is applied in future sessions.",
     "- When you need full text for a specific note/summary/match: call read_memory_item(id, offset, limit) and page through it.",
     "- When asked to locate code (class/function/type): call query_codebase(query) instead of guessing.",
-    "- When you need to recall relevant context from history/code/docs: call semantic_search(query, ...) instead of guessing.",
+    "- When you need to recall relevant context from history/code/docs: call semantic_search(query, ...) instead of guessing. It blends lexical/FTS recall with embeddings when enabled, so recent explicit wording and durable decisions are not hidden by older semantically similar matches.",
+    "- VectorMind automatically runs small, throttled memory maintenance to compact old completed history and prune stale indexes in long-lived projects. For large repos that feel slow, call maintain_memory({ dry_run: true }) first, then maintain_memory({ dry_run: false }) if the plan looks correct.",
     "- Use get_token_savings({ format: 'compact' }) when you need to verify how many tokens VectorMind compact outputs saved.",
     "",
     "If tool output conflicts with assumptions, trust the tool output.",
@@ -4264,6 +5372,15 @@ function initMemoryItemsFts(): void {
   }
 }
 
+function columnExists(table: string, column: string): boolean {
+  try {
+    const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    return rows.some((row) => row.name === column);
+  } catch {
+    return false;
+  }
+}
+
 function initDatabase(): void {
   const vmDir = path.join(projectRoot, ".vectormind");
   try {
@@ -4313,7 +5430,8 @@ function initDatabase(): void {
       title TEXT NOT NULL,
       status TEXT DEFAULT 'active',
       context_data TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS change_logs (
@@ -4412,6 +5530,50 @@ function initDatabase(): void {
 
     CREATE INDEX IF NOT EXISTS idx_token_savings_tool
       ON token_savings(tool);
+
+    CREATE TABLE IF NOT EXISTS memory_item_archive (
+      memory_id INTEGER PRIMARY KEY,
+      original_kind TEXT NOT NULL,
+      original_title TEXT,
+      original_content TEXT NOT NULL,
+      original_file_path TEXT,
+      original_start_line INTEGER,
+      original_end_line INTEGER,
+      original_req_id INTEGER,
+      original_metadata_json TEXT,
+      original_content_hash TEXT,
+      original_created_at DATETIME,
+      original_updated_at DATETIME,
+      archive_reason TEXT NOT NULL,
+      compacted_into_id INTEGER,
+      archived_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_memory_item_archive_compacted_into
+      ON memory_item_archive(compacted_into_id);
+
+    CREATE TABLE IF NOT EXISTS meta_kv (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  if (!columnExists("requirements", "updated_at")) {
+    db.exec(`ALTER TABLE requirements ADD COLUMN updated_at DATETIME`);
+    db.exec(`UPDATE requirements SET updated_at = COALESCE(created_at, CURRENT_TIMESTAMP) WHERE updated_at IS NULL`);
+  }
+  db.exec(`
+    UPDATE requirements SET updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP) WHERE updated_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_requirements_status_updated_at
+      ON requirements(status, updated_at DESC, id DESC);
+    CREATE TRIGGER IF NOT EXISTS vectormind_requirements_touch_updated_at
+    AFTER UPDATE ON requirements
+    FOR EACH ROW
+    WHEN NEW.updated_at = OLD.updated_at
+    BEGIN
+      UPDATE requirements SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+    END;
   `);
 
   initMemoryItemsFts();
@@ -4429,13 +5591,20 @@ function initDatabase(): void {
     `SELECT id, title, status, context_data, created_at
      FROM requirements
      WHERE status = 'active'
-     ORDER BY created_at DESC, id DESC
+     ORDER BY updated_at DESC, created_at DESC, id DESC
      LIMIT 1`,
+  );
+  listActiveRequirementsStmt = db.prepare(
+    `SELECT id, title, status, context_data, created_at
+     FROM requirements
+     WHERE status = 'active'
+     ORDER BY updated_at DESC, created_at DESC, id DESC
+     LIMIT ?`,
   );
   listRecentRequirementsStmt = db.prepare(
     `SELECT id, title, status, context_data, created_at
      FROM requirements
-     ORDER BY created_at DESC, id DESC
+     ORDER BY updated_at DESC, created_at DESC, id DESC
      LIMIT ?`,
   );
   completeAllActiveRequirementMemoryItemsStmt = db.prepare(
@@ -4545,6 +5714,13 @@ function initDatabase(): void {
     `SELECT id, kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at
      FROM memory_items
      WHERE kind = 'note'
+     ORDER BY updated_at DESC, id DESC
+     LIMIT ?`,
+  );
+  listRecentContextItemsStmt = db.prepare(
+    `SELECT id, kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at
+     FROM memory_items
+     WHERE kind IN ('note', 'requirement', 'change_intent')
      ORDER BY updated_at DESC, id DESC
      LIMIT ?`,
   );
@@ -4664,6 +5840,12 @@ function initDatabase(): void {
      ORDER BY created_at DESC, id DESC
      LIMIT ?`,
   );
+  getKvStmt = db.prepare(`SELECT value FROM meta_kv WHERE key = ?`);
+  setKvStmt = db.prepare(
+    `INSERT INTO meta_kv (key, value)
+     VALUES (?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP`,
+  );
 
   indexFileSymbolsTx = db.transaction((filePath: string, symbols: ExtractedSymbol[]) => {
     deleteSymbolsForFileStmt.run(filePath);
@@ -4683,6 +5865,10 @@ function initDatabase(): void {
   // Clean up common "file name noise" recorded by older versions.
   // (These files are ignored by current index rules; keep the DB consistent automatically.)
   pruneFilenameNoiseIndexes();
+
+  // Bounded, throttled maintenance keeps long-lived project memory fast without
+  // deleting durable decisions/conventions/project summaries.
+  runAutoMaintenanceIfDue();
 }
 
 function initWatcher(): void {
@@ -4909,7 +6095,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "read_codex_text_file",
         description:
-          "Read bounded text from local Codex/agents files such as SKILL.md, prompt files, and rules under CODEX_HOME/AGENTS_HOME. Prefer this over assuming a filesystem MCP resource server exists.",
+          "Read bounded text from local Codex/agents files such as SKILL.md, prompt files, and rules under CODEX_HOME/AGENTS_HOME. Prefer this over assuming another local-file MCP resource server exists.",
         inputSchema: toJsonSchemaCompat(ReadCodexTextFileArgsSchema),
       },
       {
@@ -4965,6 +6151,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         description:
           "Semantic search across the local memory store (requirements, change intents, notes, project summary, and indexed code/doc chunks). Use this to retrieve relevant context instead of guessing.",
         inputSchema: toJsonSchemaCompat(SemanticSearchArgsSchema),
+      },
+      {
+        name: "maintain_memory",
+        description:
+          "Compact old completed memory and prune stale/noisy indexes to keep long-lived large projects fast. Defaults to dry_run=true; automatic safe maintenance also runs periodically.",
+        inputSchema: toJsonSchemaCompat(MaintainMemoryArgsSchema),
       },
       {
         name: "prune_index",
@@ -5188,6 +6380,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
 
+    if (toolName === "maintain_memory") {
+      const args = MaintainMemoryArgsSchema.parse(rawArgs);
+      flushPendingChangeBuffer();
+      const result = runMemoryMaintenance(args, "manual");
+      return {
+        content: [
+          {
+            type: "text",
+            text: toolCompactOrJson("maintain_memory", result, compactMaintenanceText(result), args.format),
+          },
+        ],
+      };
+    }
+
     if (toolName === "sync_change_intent") {
       const args = SyncChangeIntentArgsSchema.parse(rawArgs);
       flushPendingChangeBuffer();
@@ -5344,6 +6550,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const notesLimit = args.notes_limit;
       const conventionsLimit = args.conventions_limit;
       const decisionsLimit = args.decisions_limit;
+      const currentContextLimit = args.current_context_limit;
 
       const recent = listRecentRequirementsStmt.all(requirementsLimit) as RequirementRow[];
       const items = recent.map((req) => {
@@ -5362,6 +6569,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       );
       const decisions = getDecisionPreviews(decisionsLimit, previewChars, contentMaxChars);
       const conventions = getConventionPreviews(conventionsLimit, previewChars, contentMaxChars);
+      const current_context = getCurrentContextPreviews(currentContextLimit, previewChars, contentMaxChars);
       const pending_offset = args.pending_offset;
       const pending_limit = args.pending_limit;
       const pendingDbRows = listPendingChangesStmt.all() as Array<{
@@ -5375,13 +6583,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const pending_changes = mergedPending.page;
 
       const q = args.query?.trim() ?? "";
+      const semanticKinds = args.kinds?.length ? args.kinds : BOOTSTRAP_DEFAULT_CONTEXT_KINDS;
       const semantic =
         q
           ? await Promise.race([
               semanticSearchHybridInternal({
                 query: q,
                 topK: args.top_k,
-                kinds: args.kinds?.length ? args.kinds : null,
+                kinds: semanticKinds,
                 includeContent,
                 previewChars,
                 contentMaxChars,
@@ -5399,6 +6608,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         pending_returned: pending_changes.length,
         requirements_returned: items.length,
         decisions_returned: decisions.length,
+        current_context_returned: current_context.length,
         conventions_returned: conventions.length,
         semantic_mode: semantic?.mode ?? null,
         semantic_matches: semantic?.matches?.length ?? 0,
@@ -5426,11 +6636,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           changes_limit: changesLimit,
           notes_limit: notesLimit,
           decisions_limit: decisionsLimit,
+          current_context_limit: currentContextLimit,
           conventions_limit: conventionsLimit,
         },
         project_summary,
         decisions,
         conventions,
+        current_context,
         recent_notes,
         pending_total,
         pending_offset,
@@ -5462,6 +6674,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const notesLimit = args.notes_limit;
       const conventionsLimit = args.conventions_limit;
       const decisionsLimit = args.decisions_limit;
+      const currentContextLimit = args.current_context_limit;
 
       const recent = listRecentRequirementsStmt.all(requirementsLimit) as RequirementRow[];
       const items = recent.map((req) => {
@@ -5480,6 +6693,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       );
       const decisions = getDecisionPreviews(decisionsLimit, previewChars, contentMaxChars);
       const conventions = getConventionPreviews(conventionsLimit, previewChars, contentMaxChars);
+      const current_context = getCurrentContextPreviews(currentContextLimit, previewChars, contentMaxChars);
       const pending_offset = args.pending_offset;
       const pending_limit = args.pending_limit;
       const pendingDbRows = listPendingChangesStmt.all() as Array<{
@@ -5498,6 +6712,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         requirements_returned: items.length,
         notes_returned: recent_notes.length,
         decisions_returned: decisions.length,
+        current_context_returned: current_context.length,
         conventions_returned: conventions.length,
       });
 
@@ -5523,11 +6738,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           changes_limit: changesLimit,
           notes_limit: notesLimit,
           decisions_limit: decisionsLimit,
+          current_context_limit: currentContextLimit,
           conventions_limit: conventionsLimit,
         },
         project_summary,
         decisions,
         conventions,
+        current_context,
         recent_notes,
         pending_total,
         pending_offset,

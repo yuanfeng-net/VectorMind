@@ -1,6 +1,6 @@
 {
   "name": "@coreyuan/vector-mind",
-  "version": "1.0.42",
+  "version": "1.0.44",
   "description": "VectorMind MCP: requirement-driven context memory linking file changes to developer intent.",
   "type": "module",
   "bin": {

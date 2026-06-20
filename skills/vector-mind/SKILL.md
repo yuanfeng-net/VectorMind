@@ -23,7 +23,7 @@ Use this skill for any coding session where:
 ### 1) At the start of every new session (or resume)
 
 - Unless the task is purely execution-first (for example compile/build/run/launch/package/publish/test rerun with already-known targets), call `bootstrap_context({ query: "<current goal>", top_k: 5 })` first.
-- Use the returned summary/notes/pending changes/semantic matches to ground your plan.
+- Use the returned summary/decisions/current_context/notes/pending changes/semantic matches to ground your plan.
 - For pure execution-first tasks with explicit targets, prefer the minimum necessary shell or host tools first; only call retrieval/search tools when code or context lookup is actually needed to unblock execution.
 
 ### 2) Before editing code/files for a new task
@@ -42,17 +42,19 @@ Use this skill for any coding session where:
 - Need to read a file segment (like `Get-Content -TotalCount` / `head`)? Call `read_file_lines({ path: "<file>", total_count: 240 })` or `read_file_lines({ from_line, to_line })`.
 - Avoid whole-file dumps, full-repo recursive listings, or broad raw match echo unless the user explicitly wants the raw output.
 - Need to recall context/notes/code/docs? Call `semantic_search({ query: "<question>", top_k: 8 })`.
+- If a large or long-lived project feels slow, call `maintain_memory({ dry_run: true })` first, then apply with `dry_run: false` only when the plan looks safe.
 
 ### 5) Persist durable state before ending
 
 - Call `upsert_project_summary({ summary: "<current state + next steps>" })`.
 - Call `add_note({ title?, content, tags? })` for decisions/constraints/TODOs.
+- When a newer user decision overrides older behavior, call `upsert_decision({ key, title, content, ... })` and supersede stale records when possible.
 
 ## Output Policy
 
 - Don’t paste raw JSON tool output unless the user asks for verification/debugging.
 - If tool output conflicts with assumptions, trust the tool output.
-- This skill covers VectorMind memory usage and development-quality guidance only. It is unrelated to AI access permissions, runtime permissions, command permissions, filesystem/network permissions, approval mechanisms, or sandbox behavior.
+- This skill covers VectorMind memory usage and development-quality guidance.
 
 ## Setup Notes
 

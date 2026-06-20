@@ -14,8 +14,8 @@ Hard rule:
 Follow this workflow:
 
 1) At the start of a new session (or when the user says resume/continue), call:
-   - `bootstrap_context({ project_root: "<current project dir>", query: "<what the user wants to do now>", top_k: 5, pending_limit: 50, requirements_limit: 3, changes_limit: 5, notes_limit: 5, preview_chars: 200 })`
-   Use the result (project summary, notes, pending changes, semantic matches) to ground your plan.
+   - `bootstrap_context({ project_root: "<current project dir>", query: "<what the user wants to do now>", top_k: 5, pending_limit: 50, requirements_limit: 3, changes_limit: 5, notes_limit: 5, current_context_limit: 8, preview_chars: 200 })`
+   Use the result (project summary, decisions, current_context, notes, pending changes, semantic matches) to ground your plan.
    - Avoid `include_content: true` unless you truly need full text (it increases tokens).
 
 2) Before editing code/files for a new task, call:
@@ -27,12 +27,14 @@ Follow this workflow:
 
 4) For code navigation and recall:
    - `query_codebase({ project_root: "<current project dir>", query: "<symbol name>" })` before guessing file paths
-   - `semantic_search({ project_root: "<current project dir>", query: "<question>", top_k: 8, preview_chars: 200 })` when recalling history/notes/code/docs (works with embeddings off via local FTS/LIKE; enable `VECTORMIND_EMBEDDINGS=on` for vector semantic recall)
+   - `semantic_search({ project_root: "<current project dir>", query: "<question>", top_k: 8, preview_chars: 200 })` when recalling history/notes/code/docs (works with embeddings off via local lexical/FTS/LIKE recall; enable `VECTORMIND_EMBEDDINGS=on` for vector semantic recall too)
    - If you need full text for a specific result, use `read_memory_item({ project_root: "<current project dir>", id: <memory_item_id>, offset: 0, limit: 2000 })` and page as needed (do not dump full text by default).
+   - If a large/long-lived project feels slow, call `maintain_memory({ project_root: "<current project dir>", dry_run: true })` first, then apply with `dry_run: false` only when the plan looks safe.
 
 5) After major milestones (or before ending), persist state:
    - `upsert_project_summary({ project_root: "<current project dir>", summary: "<current state + next steps>" })`
    - `add_note({ project_root: "<current project dir>", title?, content, tags? })` for durable decisions/constraints/TODOs
+   - `upsert_decision({ project_root: "<current project dir>", key, title, content, ... })` when a newer user decision overrides older behavior
 
 If the user states a durable project convention (framework choice, build command, output paths, naming rules), call:
 - `upsert_convention({ project_root: "<current project dir>", key: "<short key>", content: "<the convention text>", tags?: [...] })`

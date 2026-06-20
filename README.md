@@ -15,7 +15,7 @@ VectorMind 是一个给 AI 编程助手使用的本地项目记忆 MCP。
 当前版本：
 
 ```text
-1.0.42
+1.0.44
 ```
 
 ---
@@ -28,6 +28,7 @@ VectorMind 是一个给 AI 编程助手使用的本地项目记忆 MCP。
 
 - 当前项目总结
 - 最新决策
+- 当前近期上下文
 - 最近需求
 - 最近改动原因
 - 待同步文件变化
@@ -135,7 +136,7 @@ VectorMind 可以从本地记忆中搜索相关内容，包括：
 - 代码片段
 - 文档片段
 
-默认即可本地检索；如果需要，也可以开启 embeddings 增强语义召回。
+默认即可本地检索，并会优先保留明确文字匹配和最新决策；如果需要，也可以开启 embeddings 增强语义召回。
 
 ---
 
@@ -153,7 +154,20 @@ VectorMind 会记录“文件已经变化，但还没有同步改动意图”的
 
 ---
 
-### 10. 低 token 输出
+### 10. 自动维护记忆和索引
+
+VectorMind 会定期做轻量维护：
+
+- 把很久以前、已经完成的需求和改动记录压缩成摘要
+- 保留最新决策、项目约定和项目总结
+- 清理已经不存在、已忽略或明显无用的旧索引
+- 降低大项目长期使用后的检索压力
+
+如果感觉项目越用越慢，可以让 AI 先检查维护计划，再执行清理。
+
+---
+
+### 11. 低 token 输出
 
 VectorMind 的常用工具默认返回 compact 输出，而不是大段 JSON。
 
@@ -168,7 +182,7 @@ VectorMind 的常用工具默认返回 compact 输出，而不是大段 JSON。
 
 ---
 
-### 11. RTK 集成
+### 12. RTK 集成
 
 VectorMind 包里带了一个 `rtk` 命令入口。
 
@@ -184,7 +198,7 @@ rtk rg "keyword" src
 
 ---
 
-### 12. 内置开发规范
+### 13. 内置开发规范
 
 VectorMind MCP 会提供一些有用的开发规范，例如：
 
@@ -195,7 +209,7 @@ VectorMind MCP 会提供一些有用的开发规范，例如：
 - 长线程和大输出要尽量克制
 - 破坏性操作要有风险意识
 
-这些内容只是开发规范和交付质量要求，和 AI 访问权限、运行权限、命令权限、文件权限、网络权限、审批机制或 sandbox 行为没有关系。
+这些内容只用于统一项目协作、代码组织、交付质量和长期记忆。
 
 ---
 
@@ -296,11 +310,12 @@ args = ["-y", "@coreyuan/vector-mind"]
 | 保存最新决策 | `upsert_decision`, `supersede_memory` |
 | 保存长期信息 | `upsert_project_summary`, `add_note`, `upsert_convention` |
 | 搜历史上下文 | `semantic_search`, `read_memory_item` |
+| 自动维护记忆和索引 | `maintain_memory`, `prune_index` |
 | 找代码位置 | `query_codebase`, `grep` |
 | 读项目文件 | `list_project_files`, `read_file_lines`, `read_file_text` |
 | 读 Codex 配置/技能文件 | `read_codex_text_file` |
 | 减少命令输出 token | `detect_rtk`, `install_rtk`, `get_token_savings` |
-| 调试和清理 | `get_activity_summary`, `get_activity_log`, `clear_activity_log`, `prune_index` |
+| 调试 | `get_activity_summary`, `get_activity_log`, `clear_activity_log` |
 
 ---
 
