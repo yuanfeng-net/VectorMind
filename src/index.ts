@@ -100,7 +100,7 @@ type RtkDetection = {
 };
 
 const SERVER_NAME = "vector-mind";
-const SERVER_VERSION = "1.0.46";
+const SERVER_VERSION = "1.0.47";
 
 type RootSource = "tool_arg" | "env" | "mcp_roots" | "cwd" | "fallback";
 
@@ -1706,7 +1706,8 @@ type DevelopmentWarning = {
     | "large_file_read"
     | "cross_project_path"
     | "multiple_active_requirements"
-    | "broad_requirement_scope";
+    | "broad_requirement_scope"
+    | "scope_drift";
   severity: "info" | "warning" | "blocker";
   message: string;
   files?: string[];
@@ -1725,6 +1726,14 @@ type PathScopeCheck = {
   abs_path: string;
   in_project: boolean;
   project_root: string;
+};
+
+type RequirementScopeContract = {
+  allow_terms: string[];
+  deny_terms: string[];
+  allowed_paths: string[];
+  denied_paths: string[];
+  inferred_from: string[];
 };
 
 function isLikelySourceImplementationFile(filePath: string): boolean {
@@ -1911,6 +1920,184 @@ function buildRequirementStartWarnings(args: {
       message:
         "The requirement wording looks broad. Treat the current user request as the only boundary; do not add extra workflows, fields, pages, interfaces, or touch completed related features unless explicitly required.",
       details: { matched_terms: matched.slice(0, 10), text_length: text.length },
+    });
+  }
+
+  return warnings;
+}
+
+function normalizeScopeTerms(values: string[] | undefined): string[] {
+  return Array.from(new Set((values ?? []).map((v) => v.trim()).filter(Boolean)));
+}
+
+function textHasAny(text: string, terms: string[]): boolean {
+  const lower = text.toLowerCase();
+  return terms.some((term) => lower.includes(term.toLowerCase()));
+}
+
+const CLAIM_DOMAIN_TERMS = [
+  "申领",
+  "领取",
+  "释放",
+  "分配",
+  "claim",
+  "claimed",
+  "claimed_by",
+  "canrelease",
+  "release",
+  "reserved",
+  "reserved_for",
+  "assign",
+  "assignment",
+  "allocation",
+  "teamtaskclaim",
+];
+
+const EXTERNAL_SCAN_LOGIN_TERMS = [
+  "外部扫码",
+  "扫码登录",
+  "二维码",
+  "qr",
+  "scan",
+  "external login",
+  "web-login",
+  "web login",
+  "login report",
+  "登录上报",
+  "登录服务",
+];
+
+function buildRequirementScopeContract(args: {
+  title: string;
+  background: string;
+  scope_allow?: string[];
+  scope_deny?: string[];
+  allowed_paths?: string[];
+  denied_paths?: string[];
+}): RequirementScopeContract {
+  const text = `${args.title}\n${args.background}`;
+  const allowTerms = normalizeScopeTerms(args.scope_allow);
+  const denyTerms = normalizeScopeTerms(args.scope_deny);
+  const allowedPaths = normalizeScopeTerms(args.allowed_paths).map(normalizeToDbPath);
+  const deniedPaths = normalizeScopeTerms(args.denied_paths).map((p) => p.replace(/\\/g, "/"));
+  const inferredFrom: string[] = [];
+
+  if (textHasAny(text, EXTERNAL_SCAN_LOGIN_TERMS)) {
+    for (const term of CLAIM_DOMAIN_TERMS) {
+      if (!denyTerms.some((t) => t.toLowerCase() === term.toLowerCase())) denyTerms.push(term);
+    }
+    deniedPaths.push("*claim*", "*Claim*", "*申领*", "*release*", "*Release*");
+    inferredFrom.push("external_scan_login_claim_guard");
+  }
+
+  return {
+    allow_terms: allowTerms,
+    deny_terms: Array.from(new Set(denyTerms)),
+    allowed_paths: Array.from(new Set(allowedPaths)),
+    denied_paths: Array.from(new Set(deniedPaths)),
+    inferred_from: inferredFrom,
+  };
+}
+
+function getRequirementScopeContract(reqId: number): RequirementScopeContract | null {
+  const memId = (getRequirementMemoryItemIdStmt.get(reqId) as { id: number } | undefined)?.id;
+  if (memId == null) return null;
+  const row = getMemoryItemByIdStmt.get(memId) as MemoryItemRow | undefined;
+  const meta = parseMetadataJson(row?.metadata_json);
+  const raw = meta.scope_contract;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const obj = raw as Record<string, unknown>;
+  return {
+    allow_terms: Array.isArray(obj.allow_terms) ? obj.allow_terms.filter((v): v is string => typeof v === "string") : [],
+    deny_terms: Array.isArray(obj.deny_terms) ? obj.deny_terms.filter((v): v is string => typeof v === "string") : [],
+    allowed_paths: Array.isArray(obj.allowed_paths) ? obj.allowed_paths.filter((v): v is string => typeof v === "string") : [],
+    denied_paths: Array.isArray(obj.denied_paths) ? obj.denied_paths.filter((v): v is string => typeof v === "string") : [],
+    inferred_from: Array.isArray(obj.inferred_from) ? obj.inferred_from.filter((v): v is string => typeof v === "string") : [],
+  };
+}
+
+function wildcardToRegex(pattern: string): RegExp {
+  const source = escapeRegExp(pattern).replace(/\\\*/g, ".*");
+  return new RegExp(source, "i");
+}
+
+function pathMatchesAnyPattern(filePath: string, patterns: string[]): string[] {
+  const normalized = filePath.replace(/\\/g, "/");
+  return patterns.filter((p) => wildcardToRegex(p.replace(/\\/g, "/")).test(normalized));
+}
+
+function fileContentHasDeniedTerms(filePath: string, terms: string[]): string[] {
+  if (!terms.length || filePath === "(unspecified)") return [];
+  const abs = path.isAbsolute(filePath) ? path.resolve(filePath) : path.join(projectRoot, filePath);
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(abs);
+  } catch {
+    return [];
+  }
+  if (!st.isFile() || st.size > 2_000_000) return [];
+  let content = "";
+  try {
+    content = fs.readFileSync(abs, "utf8");
+  } catch {
+    return [];
+  }
+  const lower = `${filePath}\n${content.slice(0, 250_000)}`.toLowerCase();
+  return terms.filter((term) => lower.includes(term.toLowerCase()));
+}
+
+function buildScopeDriftWarnings(args: {
+  requirement: RequirementRow;
+  intent?: string;
+  files: Array<{ file_path: string }>;
+}): DevelopmentWarning[] {
+  const contract = getRequirementScopeContract(args.requirement.id);
+  if (!contract) return [];
+
+  const warnings: DevelopmentWarning[] = [];
+  const allowTerms = contract.allow_terms;
+  const denyTerms = contract.deny_terms;
+  const allowedPaths = contract.allowed_paths;
+  const deniedPaths = contract.denied_paths;
+  const intentText = args.intent ?? "";
+  const intentDenied = denyTerms.filter((term) => intentText.toLowerCase().includes(term.toLowerCase()));
+
+  const suspicious: Array<{ file_path: string; matched_terms: string[]; matched_paths: string[] }> = [];
+  for (const f of args.files) {
+    const fp = normalizeToDbPath(f.file_path);
+    if (fp === "(unspecified)") continue;
+    const matchedDeniedPaths = pathMatchesAnyPattern(fp, deniedPaths);
+    const matchedDeniedTerms = [
+      ...denyTerms.filter((term) => fp.toLowerCase().includes(term.toLowerCase())),
+      ...fileContentHasDeniedTerms(fp, denyTerms),
+    ];
+    const isExplicitlyAllowed =
+      pathMatchesAnyPattern(fp, allowedPaths).length > 0 ||
+      allowTerms.some((term) => fp.toLowerCase().includes(term.toLowerCase()));
+    if ((matchedDeniedPaths.length || matchedDeniedTerms.length || intentDenied.length) && !isExplicitlyAllowed) {
+      suspicious.push({
+        file_path: fp,
+        matched_terms: Array.from(new Set([...matchedDeniedTerms, ...intentDenied])).slice(0, 12),
+        matched_paths: matchedDeniedPaths.slice(0, 12),
+      });
+    }
+  }
+
+  if (suspicious.length) {
+    warnings.push({
+      code: "scope_drift",
+      severity: "blocker",
+      message:
+        "The current requirement appears to be touching a denied or out-of-scope domain. Stop and narrow the change unless the user explicitly expanded this requirement.",
+      files: suspicious.slice(0, 12).map((s) => s.file_path),
+      details: {
+        requirement_id: args.requirement.id,
+        requirement_title: args.requirement.title,
+        inferred_from: contract.inferred_from,
+        deny_terms: denyTerms.slice(0, 30),
+        denied_paths: deniedPaths.slice(0, 30),
+        suspicious: suspicious.slice(0, 12),
+      },
     });
   }
 
@@ -2429,6 +2616,10 @@ const StartRequirementArgsSchema = ProjectRootArgSchema.merge(
     title: z.string().min(1),
     background: z.string().optional().default(""),
     close_previous: z.boolean().optional().default(true),
+    scope_allow: z.array(z.string().min(1)).optional(),
+    scope_deny: z.array(z.string().min(1)).optional(),
+    allowed_paths: z.array(z.string().min(1)).optional(),
+    denied_paths: z.array(z.string().min(1)).optional(),
   }),
 );
 
@@ -5609,6 +5800,7 @@ function buildServerInstructions(): string {
     "- For raw repo text search with exact file+line+col matches, prefer grep({ query: <pattern> }). It uses ripgrep against real project files when available, applies built-in noise filters, and only falls back to indexed search if ripgrep is unavailable.",
     "- To read a bounded segment of a file, prefer read_file_lines({ path: <file>, from_line/to_line or total_count }) over unbounded file reads.",
     "- BEFORE editing code: call start_requirement(title, background) to set the active requirement.",
+    "  - When the user names a narrow feature/domain, pass scope_allow/allowed_paths and scope_deny/denied_paths when useful. Example: external scan-login work should deny claim/release/assignment domains unless the user explicitly asks for claim changes.",
     "- Treat the active requirement as the only change boundary. Do not add extra business behavior, new flows, new fields, new interfaces, or touch completed/related features unless the user explicitly asked or the change is strictly necessary.",
     "- Do not keep piling new feature code into a large single file. Prefer small modules/services/components; if an implementation file is already large, split it before adding more responsibilities.",
     "- AFTER editing + saving: call get_pending_changes() to see unsynced files, then call sync_change_intent(intent, files). (You can omit files to auto-link all pending changes.)",
@@ -6376,7 +6568,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "start_requirement",
         description:
-          "MUST call BEFORE editing code. Starts/activates the concrete user requirement so subsequent changes stay inside that requirement boundary and do not accumulate unrelated work.",
+          "MUST call BEFORE editing code. Starts/activates the concrete user requirement so subsequent changes stay inside that requirement boundary and do not accumulate unrelated work. Supports scope_allow/scope_deny and allowed_paths/denied_paths to prevent unrelated domain drift.",
         inputSchema: toJsonSchemaCompat(StartRequirementArgsSchema),
       },
       {
@@ -6549,6 +6741,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (toolName === "start_requirement") {
       const args = StartRequirementArgsSchema.parse(rawArgs);
       flushPendingChangeBuffer();
+      const scope_contract = buildRequirementScopeContract({
+        title: args.title,
+        background: args.background,
+        scope_allow: args.scope_allow,
+        scope_deny: args.scope_deny,
+        allowed_paths: args.allowed_paths,
+        denied_paths: args.denied_paths,
+      });
       const development_warnings = buildRequirementStartWarnings({
         title: args.title,
         background: args.background,
@@ -6577,7 +6777,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         null,
         null,
         id,
-        safeJson({ status: "active" }),
+        safeJson({ status: "active", scope_contract }),
         sha256Hex(content),
       );
       const memory_id = Number(memoryInfo.lastInsertRowid);
@@ -6587,6 +6787,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         req_id: id,
         title: args.title,
         closed_previous: args.close_previous,
+        scope_contract,
         development_warnings: development_warnings.length,
       });
 
@@ -6599,6 +6800,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               requirement: { id, title: args.title },
               memory_item: { id: memory_id },
               closed_previous: args.close_previous,
+              scope_contract,
               development_warnings,
             }),
           },
@@ -6892,9 +7094,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       });
       insertTx();
-      const development_warnings = buildDevelopmentWarnings(synced_files, {
-        includeUnspecified: synced_files.some((f) => f.file_path === "(unspecified)"),
-      });
+      const development_warnings = [
+        ...buildDevelopmentWarnings(synced_files, {
+          includeUnspecified: synced_files.some((f) => f.file_path === "(unspecified)"),
+        }),
+        ...buildScopeDriftWarnings({
+          requirement: active,
+          intent: args.intent,
+          files: synced_files,
+        }),
+      ];
 
       logActivity("sync_change_intent", {
         req_id: active.id,
@@ -6964,7 +7173,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const pending_total = mergedPending.total;
       const pending_truncated = mergedPending.truncated;
       const pending_changes = mergedPending.page;
-      const development_warnings = buildDevelopmentWarnings(pending_changes);
+      const activeForScope = getActiveRequirementStmt.get() as RequirementRow | undefined;
+      const development_warnings = [
+        ...buildDevelopmentWarnings(pending_changes),
+        ...(activeForScope
+          ? buildScopeDriftWarnings({ requirement: activeForScope, files: pending_changes })
+          : []),
+      ];
 
       const q = args.query?.trim() ?? "";
       const semanticKinds = args.kinds?.length ? args.kinds : BOOTSTRAP_DEFAULT_CONTEXT_KINDS;
@@ -7090,7 +7305,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const pending_total = mergedPending.total;
       const pending_truncated = mergedPending.truncated;
       const pending_changes = mergedPending.page;
-      const development_warnings = buildDevelopmentWarnings(pending_changes);
+      const activeForScope = getActiveRequirementStmt.get() as RequirementRow | undefined;
+      const development_warnings = [
+        ...buildDevelopmentWarnings(pending_changes),
+        ...(activeForScope
+          ? buildScopeDriftWarnings({ requirement: activeForScope, files: pending_changes })
+          : []),
+      ];
 
       logActivity("get_brain_dump", {
         pending_total,
@@ -7166,7 +7387,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const total = mergedPending.total;
       const truncated = mergedPending.truncated;
       const pending = mergedPending.page;
-      const development_warnings = buildDevelopmentWarnings(pending);
+      const activeForScope = getActiveRequirementStmt.get() as RequirementRow | undefined;
+      const development_warnings = [
+        ...buildDevelopmentWarnings(pending),
+        ...(activeForScope ? buildScopeDriftWarnings({ requirement: activeForScope, files: pending }) : []),
+      ];
 
       logActivity("get_pending_changes", {
         total,

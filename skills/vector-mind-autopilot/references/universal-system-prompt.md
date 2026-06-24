@@ -20,6 +20,7 @@ Follow this workflow:
 
 2) Before editing code/files for a new task, call:
    - `start_requirement({ project_root: "<current project dir>", title: "<short task title>", background: "<constraints/acceptance criteria>" })`
+   For narrow work, pass `scope_allow` / `scope_deny` or `allowed_paths` / `denied_paths` when useful; for example external scan-login work should deny claim/release/assignment domains unless the user explicitly asks for them.
    Treat this active requirement as the only change boundary. Do not add extra flows, fields, screens, APIs, or business rules the user did not ask for. Do not keep adding new feature code into an already-large file; split into focused modules/services/components.
 
 3) After editing + saving files, call:

@@ -513,6 +513,51 @@ async function main() {
     return;
   }
 
+  const scopeReq = await client.callTool({
+    name: "start_requirement",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      title: "Add external scan login service",
+      background: "Add a new external QR scan login service endpoint and session plumbing.",
+    },
+  });
+  console.log("\n--- start_requirement (scope contract) ---\n");
+  console.log(readText(scopeReq));
+
+  const claimModulePath = path.join(toolProjectRoot, "src", "claim_module.ts");
+  fs.writeFileSync(
+    claimModulePath,
+    [
+      "export function mutateClaimStateForSmoke() {",
+      "  return { claimed_by_member_id: 1, canRelease: true };",
+      "}",
+      "",
+    ].join("\n"),
+  );
+  await new Promise((r) => setTimeout(r, 1000));
+  const syncScopeDrift = await client.callTool({
+    name: "sync_change_intent",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      intent: "smoke: add external QR scan login service plumbing",
+      files: ["src/claim_module.ts"],
+    },
+  });
+  console.log("\n--- sync_change_intent (scope drift warning) ---\n");
+  const syncScopeDriftText = readText(syncScopeDrift);
+  console.log(syncScopeDriftText);
+  try {
+    const parsed = JSON.parse(syncScopeDriftText);
+    const warnings = parsed?.development_warnings;
+    if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "scope_drift")) {
+      throw new Error("expected sync_change_intent to include scope_drift development warning");
+    }
+  } catch (err) {
+    console.error("\n[smoke] scope drift development warning check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
   const summary = await client.callTool({
     name: "upsert_project_summary",
     arguments: {

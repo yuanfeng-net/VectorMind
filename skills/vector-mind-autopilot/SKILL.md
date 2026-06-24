@@ -50,7 +50,7 @@ If you still cannot determine it confidently, ask the user for the project root 
 ### 3) Before editing code or files
 
 - If this is a new task/feature, call `start_requirement({ project_root: <PROJECT_ROOT>, title, background })` before changing anything.
-- Prefer short, specific titles (e.g., “Add avatar upload”) and put constraints in `background` (formats, edge cases, acceptance criteria).
+- Prefer short, specific titles (e.g., “Add avatar upload”) and put constraints in `background` (formats, edge cases, acceptance criteria). For narrow work, pass `scope_allow` / `scope_deny` or `allowed_paths` / `denied_paths` when useful; for example external scan-login work should deny claim/release/assignment domains unless the user explicitly asks for them.
 - Treat the active requirement as the only change boundary. Do not add extra flows, fields, screens, APIs, or business rules the user did not ask for.
 - Do not keep adding new feature code into an already-large file. Split into focused modules/services/components when a file is taking multiple responsibilities.
 

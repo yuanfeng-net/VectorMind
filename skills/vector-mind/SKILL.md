@@ -29,6 +29,7 @@ Use this skill for any coding session where:
 ### 2) Before editing code/files for a new task
 
 - Call `start_requirement({ title: "<short title>", background: "<constraints/acceptance criteria>" })`.
+- For narrow work, pass `scope_allow` / `scope_deny` or `allowed_paths` / `denied_paths` when useful; for example external scan-login work should deny claim/release/assignment domains unless the user explicitly asks for them.
 - Treat this active requirement as the only change boundary. Do not add extra flows, fields, screens, APIs, or business rules the user did not ask for.
 - Do not keep adding new feature code into an already-large file. Split into focused modules/services/components when a file is taking multiple responsibilities.
 

@@ -15,6 +15,7 @@ When the VectorMind MCP tools are available in this chat, use them by default to
 
 2) **Before editing any code/files** for a new task/feature:
    - Call: `start_requirement({ project_root: "<项目根目录>", title: "<简短需求标题>", background: "<约束/验收标准/风险点>" })`
+   - For narrow work, pass `scope_allow` / `scope_deny` or `allowed_paths` / `denied_paths` when useful; for example external scan-login work should deny claim/release/assignment domains unless the user explicitly asks for them.
    - Treat this active requirement as the only change boundary. Do not add extra flows, fields, screens, APIs, or business rules the user did not ask for. Do not keep adding new feature code into an already-large file; split into focused modules/services/components.
 
 3) **After editing + saving files**:
