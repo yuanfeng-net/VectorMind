@@ -1,6 +1,6 @@
 {
   "name": "@coreyuan/vector-mind",
-  "version": "1.0.47",
+  "version": "1.0.48",
   "description": "VectorMind MCP: requirement-driven context memory linking file changes to developer intent.",
   "type": "module",
   "bin": {
@@ -11,7 +11,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc && node --input-type=module -e \"import { chmodSync } from 'node:fs'; for (const f of ['dist/index.js','dist/rtk-shim.js']) try { chmodSync(f, 0o755); } catch {}\"",
+    "build": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\" && tsc && node --input-type=module -e \"import { chmodSync } from 'node:fs'; for (const f of ['dist/index.js','dist/rtk-shim.js']) try { chmodSync(f, 0o755); } catch {}\"",
     "smoke": "node scripts/smoke.mjs",
     "prepublishOnly": "npm run build"
   },

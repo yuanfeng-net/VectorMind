@@ -29,7 +29,8 @@ Use this skill for any coding session where:
 ### 2) Before editing code/files for a new task
 
 - Call `start_requirement({ title: "<short title>", background: "<constraints/acceptance criteria>" })`.
-- For narrow work, pass `scope_allow` / `scope_deny` or `allowed_paths` / `denied_paths` when useful; for example external scan-login work should deny claim/release/assignment domains unless the user explicitly asks for them.
+- For narrow work, pass `scope_allow` / `scope_deny` or `allowed_paths` / `denied_paths` when useful; these are project-specific boundaries, not hardcoded business rules.
+- Once you know the files/modules you intend to edit, call `preflight_change_scope({ intent, files })` before editing. If useful, pass extra `scope_allow` / `scope_deny` or `allowed_paths` / `denied_paths` for this planned change. Do not edit until it returns `safe_to_edit=true`; if it returns `safe_to_edit=false`, narrow the files/scope first.
 - Treat this active requirement as the only change boundary. Do not add extra flows, fields, screens, APIs, or business rules the user did not ask for.
 - Do not keep adding new feature code into an already-large file. Split into focused modules/services/components when a file is taking multiple responsibilities.
 
@@ -37,7 +38,7 @@ Use this skill for any coding session where:
 
 - Call `get_pending_changes()`
 - Then call `sync_change_intent({ intent: "<what changed + why + next steps>", files?: <omit to auto-link pending> })`.
-- If `read_file_lines`, `grep`, `query_codebase`, `get_pending_changes`, or `sync_change_intent` returns `development_warnings`, address them before continuing or explain why the current requirement truly needs that scope.
+- If `preflight_change_scope` returns `safe_to_edit=false`, stop before editing and narrow the plan/scope. If `preflight_change_scope`, `read_file_lines`, `grep`, `query_codebase`, `get_pending_changes`, or `sync_change_intent` returns `development_warnings`, address them before continuing or explain why the current requirement truly needs that scope.
 
 ### 4) Don’t guess paths or history
 

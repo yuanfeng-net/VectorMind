@@ -50,7 +50,8 @@ If you still cannot determine it confidently, ask the user for the project root 
 ### 3) Before editing code or files
 
 - If this is a new task/feature, call `start_requirement({ project_root: <PROJECT_ROOT>, title, background })` before changing anything.
-- Prefer short, specific titles (e.g., “Add avatar upload”) and put constraints in `background` (formats, edge cases, acceptance criteria). For narrow work, pass `scope_allow` / `scope_deny` or `allowed_paths` / `denied_paths` when useful; for example external scan-login work should deny claim/release/assignment domains unless the user explicitly asks for them.
+- Prefer short, specific titles (e.g., “Add avatar upload”) and put constraints in `background` (formats, edge cases, acceptance criteria). For narrow work, pass `scope_allow` / `scope_deny` or `allowed_paths` / `denied_paths` when useful; these are project-specific boundaries, not hardcoded business rules.
+- Once you know the files/modules you intend to edit, call `preflight_change_scope({ project_root: <PROJECT_ROOT>, intent, files })` before editing. If useful, pass extra `scope_allow` / `scope_deny` or `allowed_paths` / `denied_paths` for this planned change. Do not edit until it returns `safe_to_edit=true`; if it returns `safe_to_edit=false`, narrow the files/scope first.
 - Treat the active requirement as the only change boundary. Do not add extra flows, fields, screens, APIs, or business rules the user did not ask for.
 - Do not keep adding new feature code into an already-large file. Split into focused modules/services/components when a file is taking multiple responsibilities.
 
@@ -60,7 +61,7 @@ If you still cannot determine it confidently, ask the user for the project root 
 - Call `sync_change_intent({ project_root: <PROJECT_ROOT>, intent, files? })` to archive the “what/why” and associate the changes to the active requirement.
   - Prefer omitting `files` to let the server auto-link all pending changes, unless you intentionally want a subset.
   - Write `intent` as a concise, user-facing summary: what changed + why + any follow-ups.
-  - If `read_file_lines`, `grep`, `query_codebase`, `get_pending_changes`, or `sync_change_intent` returns `development_warnings`, address them before continuing or explain why the current requirement truly needs that scope.
+  - If `preflight_change_scope` returns `safe_to_edit=false`, stop before editing and narrow the plan/scope. If `preflight_change_scope`, `read_file_lines`, `grep`, `query_codebase`, `get_pending_changes`, or `sync_change_intent` returns `development_warnings`, address them before continuing or explain why the current requirement truly needs that scope.
 
 ### 5) When you need to find code or recall context
 

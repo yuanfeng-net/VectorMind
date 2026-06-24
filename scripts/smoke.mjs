@@ -318,6 +318,33 @@ async function main() {
   console.log("\n--- start_requirement ---\n");
   console.log(readText(req));
 
+  const preflightMissingContract = await client.callTool({
+    name: "preflight_change_scope",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      intent: "smoke: verify pre-edit scope contract is required",
+      files: ["vm_smoke_test.md"],
+      format: "json",
+    },
+  });
+  console.log("\n--- preflight_change_scope (missing scope contract) ---\n");
+  const preflightMissingContractText = readText(preflightMissingContract);
+  console.log(preflightMissingContractText);
+  try {
+    const parsed = JSON.parse(preflightMissingContractText);
+    const warnings = parsed?.development_warnings;
+    if (parsed?.safe_to_edit !== false || parsed?.ok !== false) {
+      throw new Error("expected preflight_change_scope without scope contract to block editing");
+    }
+    if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "scope_contract_missing")) {
+      throw new Error("expected preflight_change_scope to include scope_contract_missing warning");
+    }
+  } catch (err) {
+    console.error("\n[smoke] missing scope contract preflight check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
   const rtk = await client.callTool({
     name: "detect_rtk",
     arguments: useToolProjectRoot ? { project_root: toolProjectRoot } : {},
@@ -517,19 +544,45 @@ async function main() {
     name: "start_requirement",
     arguments: {
       ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
-      title: "Add external scan login service",
-      background: "Add a new external QR scan login service endpoint and session plumbing.",
+      title: "Add billing export",
+      background: "Add a billing export endpoint and small report helper.",
+      allowed_paths: ["src/billing/**"],
     },
   });
   console.log("\n--- start_requirement (scope contract) ---\n");
   console.log(readText(scopeReq));
 
-  const claimModulePath = path.join(toolProjectRoot, "src", "claim_module.ts");
+  const preflightScopeDrift = await client.callTool({
+    name: "preflight_change_scope",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      intent: "smoke: add billing export helper",
+      files: ["src/notifications/email.ts"],
+      format: "json",
+    },
+  });
+  console.log("\n--- preflight_change_scope (scope drift warning) ---\n");
+  const preflightScopeDriftText = readText(preflightScopeDrift);
+  console.log(preflightScopeDriftText);
+  try {
+    const parsed = JSON.parse(preflightScopeDriftText);
+    const warnings = parsed?.development_warnings;
+    if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "scope_drift")) {
+      throw new Error("expected preflight_change_scope to include scope_drift development warning");
+    }
+  } catch (err) {
+    console.error("\n[smoke] preflight scope drift development warning check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const outOfScopeModulePath = path.join(toolProjectRoot, "src", "notifications", "email.ts");
+  fs.mkdirSync(path.dirname(outOfScopeModulePath), { recursive: true });
   fs.writeFileSync(
-    claimModulePath,
+    outOfScopeModulePath,
     [
-      "export function mutateClaimStateForSmoke() {",
-      "  return { claimed_by_member_id: 1, canRelease: true };",
+      "export function sendBillingExportSmokeEmail() {",
+      "  return true;",
       "}",
       "",
     ].join("\n"),
@@ -539,8 +592,8 @@ async function main() {
     name: "sync_change_intent",
     arguments: {
       ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
-      intent: "smoke: add external QR scan login service plumbing",
-      files: ["src/claim_module.ts"],
+      intent: "smoke: add billing export helper",
+      files: ["src/notifications/email.ts"],
     },
   });
   console.log("\n--- sync_change_intent (scope drift warning) ---\n");

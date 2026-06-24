@@ -20,13 +20,14 @@ Follow this workflow:
 
 2) Before editing code/files for a new task, call:
    - `start_requirement({ project_root: "<current project dir>", title: "<short task title>", background: "<constraints/acceptance criteria>" })`
-   For narrow work, pass `scope_allow` / `scope_deny` or `allowed_paths` / `denied_paths` when useful; for example external scan-login work should deny claim/release/assignment domains unless the user explicitly asks for them.
+   For narrow work, pass `scope_allow` / `scope_deny` or `allowed_paths` / `denied_paths` when useful; these are project-specific boundaries, not hardcoded business rules.
+   Once you know the files/modules you intend to edit, call `preflight_change_scope({ project_root: "<current project dir>", intent, files })` before editing. If useful, pass extra `scope_allow` / `scope_deny` or `allowed_paths` / `denied_paths` for this planned change. Do not edit until it returns `safe_to_edit=true`; if it returns `safe_to_edit=false`, narrow the files/scope first.
    Treat this active requirement as the only change boundary. Do not add extra flows, fields, screens, APIs, or business rules the user did not ask for. Do not keep adding new feature code into an already-large file; split into focused modules/services/components.
 
 3) After editing + saving files, call:
    - `get_pending_changes({ project_root: "<current project dir>" })`
    - `sync_change_intent({ project_root: "<current project dir>", intent: "<what changed + why + next steps>", files?: <omit to auto-link pending> })`
-   If `read_file_lines`, `grep`, `query_codebase`, `get_pending_changes`, or `sync_change_intent` returns `development_warnings`, address them before continuing or explain why the current requirement truly needs that scope.
+   If `preflight_change_scope` returns `safe_to_edit=false`, stop before editing and narrow the plan/scope. If `preflight_change_scope`, `read_file_lines`, `grep`, `query_codebase`, `get_pending_changes`, or `sync_change_intent` returns `development_warnings`, address them before continuing or explain why the current requirement truly needs that scope.
 
 4) For code navigation and recall:
    - `query_codebase({ project_root: "<current project dir>", query: "<symbol name>" })` before guessing file paths; if it warns about a huge implementation file, avoid adding new feature code there unless the task is explicitly a planned extraction.

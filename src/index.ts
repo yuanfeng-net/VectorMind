@@ -100,7 +100,7 @@ type RtkDetection = {
 };
 
 const SERVER_NAME = "vector-mind";
-const SERVER_VERSION = "1.0.47";
+const SERVER_VERSION = "1.0.48";
 
 type RootSource = "tool_arg" | "env" | "mcp_roots" | "cwd" | "fallback";
 
@@ -1707,7 +1707,8 @@ type DevelopmentWarning = {
     | "cross_project_path"
     | "multiple_active_requirements"
     | "broad_requirement_scope"
-    | "scope_drift";
+    | "scope_drift"
+    | "scope_contract_missing";
   severity: "info" | "warning" | "blocker";
   message: string;
   files?: string[];
@@ -1930,43 +1931,6 @@ function normalizeScopeTerms(values: string[] | undefined): string[] {
   return Array.from(new Set((values ?? []).map((v) => v.trim()).filter(Boolean)));
 }
 
-function textHasAny(text: string, terms: string[]): boolean {
-  const lower = text.toLowerCase();
-  return terms.some((term) => lower.includes(term.toLowerCase()));
-}
-
-const CLAIM_DOMAIN_TERMS = [
-  "申领",
-  "领取",
-  "释放",
-  "分配",
-  "claim",
-  "claimed",
-  "claimed_by",
-  "canrelease",
-  "release",
-  "reserved",
-  "reserved_for",
-  "assign",
-  "assignment",
-  "allocation",
-  "teamtaskclaim",
-];
-
-const EXTERNAL_SCAN_LOGIN_TERMS = [
-  "外部扫码",
-  "扫码登录",
-  "二维码",
-  "qr",
-  "scan",
-  "external login",
-  "web-login",
-  "web login",
-  "login report",
-  "登录上报",
-  "登录服务",
-];
-
 function buildRequirementScopeContract(args: {
   title: string;
   background: string;
@@ -1975,27 +1939,17 @@ function buildRequirementScopeContract(args: {
   allowed_paths?: string[];
   denied_paths?: string[];
 }): RequirementScopeContract {
-  const text = `${args.title}\n${args.background}`;
   const allowTerms = normalizeScopeTerms(args.scope_allow);
   const denyTerms = normalizeScopeTerms(args.scope_deny);
   const allowedPaths = normalizeScopeTerms(args.allowed_paths).map(normalizeToDbPath);
   const deniedPaths = normalizeScopeTerms(args.denied_paths).map((p) => p.replace(/\\/g, "/"));
-  const inferredFrom: string[] = [];
-
-  if (textHasAny(text, EXTERNAL_SCAN_LOGIN_TERMS)) {
-    for (const term of CLAIM_DOMAIN_TERMS) {
-      if (!denyTerms.some((t) => t.toLowerCase() === term.toLowerCase())) denyTerms.push(term);
-    }
-    deniedPaths.push("*claim*", "*Claim*", "*申领*", "*release*", "*Release*");
-    inferredFrom.push("external_scan_login_claim_guard");
-  }
 
   return {
     allow_terms: allowTerms,
     deny_terms: Array.from(new Set(denyTerms)),
     allowed_paths: Array.from(new Set(allowedPaths)),
     denied_paths: Array.from(new Set(deniedPaths)),
-    inferred_from: inferredFrom,
+    inferred_from: [],
   };
 }
 
@@ -2046,15 +2000,54 @@ function fileContentHasDeniedTerms(filePath: string, terms: string[]): string[] 
   return terms.filter((term) => lower.includes(term.toLowerCase()));
 }
 
+function mergeScopeContracts(
+  base: RequirementScopeContract | null | undefined,
+  extra: RequirementScopeContract | null | undefined,
+): RequirementScopeContract | null {
+  if (!base && !extra) return null;
+  return {
+    allow_terms: Array.from(new Set([...(base?.allow_terms ?? []), ...(extra?.allow_terms ?? [])])),
+    deny_terms: Array.from(new Set([...(base?.deny_terms ?? []), ...(extra?.deny_terms ?? [])])),
+    allowed_paths: Array.from(new Set([...(base?.allowed_paths ?? []), ...(extra?.allowed_paths ?? [])])),
+    denied_paths: Array.from(new Set([...(base?.denied_paths ?? []), ...(extra?.denied_paths ?? [])])),
+    inferred_from: Array.from(new Set([...(base?.inferred_from ?? []), ...(extra?.inferred_from ?? [])])),
+  };
+}
+
 function buildScopeDriftWarnings(args: {
-  requirement: RequirementRow;
+  requirement?: RequirementRow;
+  contract?: RequirementScopeContract | null;
   intent?: string;
   files: Array<{ file_path: string }>;
+  includeMissingContractHint?: boolean;
 }): DevelopmentWarning[] {
-  const contract = getRequirementScopeContract(args.requirement.id);
-  if (!contract) return [];
+  const requirementContract = args.requirement ? getRequirementScopeContract(args.requirement.id) : null;
+  const contract = mergeScopeContracts(requirementContract, args.contract);
+  const hasScopeRules = !!contract && (
+    contract.allow_terms.length > 0 ||
+    contract.deny_terms.length > 0 ||
+    contract.allowed_paths.length > 0 ||
+    contract.denied_paths.length > 0
+  );
 
   const warnings: DevelopmentWarning[] = [];
+  if (!contract || !hasScopeRules) {
+    if (args.includeMissingContractHint && args.files.length > 0) {
+      warnings.push({
+        code: "scope_contract_missing",
+        severity: "warning",
+        message:
+          "No explicit scope allow/deny contract is set for this requirement, so the planned files cannot be proven in-scope before editing. Define scope_allow/scope_deny or allowed_paths/denied_paths before editing.",
+        files: args.files.map((f) => normalizeToDbPath(f.file_path)).slice(0, 12),
+        details: {
+          requirement_id: args.requirement?.id ?? null,
+          requirement_title: args.requirement?.title ?? null,
+        },
+      });
+    }
+    return warnings;
+  }
+
   const allowTerms = contract.allow_terms;
   const denyTerms = contract.deny_terms;
   const allowedPaths = contract.allowed_paths;
@@ -2074,11 +2067,18 @@ function buildScopeDriftWarnings(args: {
     const isExplicitlyAllowed =
       pathMatchesAnyPattern(fp, allowedPaths).length > 0 ||
       allowTerms.some((term) => fp.toLowerCase().includes(term.toLowerCase()));
-    if ((matchedDeniedPaths.length || matchedDeniedTerms.length || intentDenied.length) && !isExplicitlyAllowed) {
+    const violatesAllowedPaths = allowedPaths.length > 0 && pathMatchesAnyPattern(fp, allowedPaths).length === 0;
+    if (
+      (matchedDeniedPaths.length || matchedDeniedTerms.length || intentDenied.length || violatesAllowedPaths) &&
+      !isExplicitlyAllowed
+    ) {
       suspicious.push({
         file_path: fp,
         matched_terms: Array.from(new Set([...matchedDeniedTerms, ...intentDenied])).slice(0, 12),
-        matched_paths: matchedDeniedPaths.slice(0, 12),
+        matched_paths: [
+          ...matchedDeniedPaths.slice(0, 12),
+          ...(violatesAllowedPaths ? [`outside allowed_paths: ${allowedPaths.slice(0, 5).join(", ")}`] : []),
+        ],
       });
     }
   }
@@ -2091,8 +2091,8 @@ function buildScopeDriftWarnings(args: {
         "The current requirement appears to be touching a denied or out-of-scope domain. Stop and narrow the change unless the user explicitly expanded this requirement.",
       files: suspicious.slice(0, 12).map((s) => s.file_path),
       details: {
-        requirement_id: args.requirement.id,
-        requirement_title: args.requirement.title,
+        requirement_id: args.requirement?.id ?? null,
+        requirement_title: args.requirement?.title ?? null,
         inferred_from: contract.inferred_from,
         deny_terms: denyTerms.slice(0, 30),
         denied_paths: deniedPaths.slice(0, 30),
@@ -2631,6 +2631,18 @@ const SyncChangeIntentArgsSchema = ProjectRootArgSchema.merge(
   }),
 );
 
+const PreflightChangeScopeArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
+  z.object({
+    intent: z.string().optional().default(""),
+    files: z.array(z.string().min(1)).optional(),
+    planned_files: z.array(z.string().min(1)).optional(),
+    scope_allow: z.array(z.string().min(1)).optional(),
+    scope_deny: z.array(z.string().min(1)).optional(),
+    allowed_paths: z.array(z.string().min(1)).optional(),
+    denied_paths: z.array(z.string().min(1)).optional(),
+  }),
+);
+
 const QueryCodebaseArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
   z.object({
     query: z.string().min(1),
@@ -3158,6 +3170,31 @@ function compactMaintenanceText(data: MaintenanceResult): string {
     for (const s of data.pruned.stale_files.samples.slice(0, 8)) lines.push(`- ${s}`);
   }
   lines.push("hint: dry_run=false applies changes; vacuum=true reclaims sqlite file space after pruning");
+  return lines.join("\n");
+}
+
+function compactPreflightChangeScopeText(data: {
+  ok: boolean;
+  safe_to_edit: boolean;
+  recommended_action: string;
+  active_requirement: { id: number; title: string } | null;
+  intent: string;
+  files: string[];
+  scope_contract: RequirementScopeContract | null;
+  development_warnings: DevelopmentWarning[];
+}): string {
+  const req = data.active_requirement ? `#${data.active_requirement.id} ${data.active_requirement.title}` : "none";
+  const lines = [
+    `preflight_change_scope ok=${data.ok} safe_to_edit=${data.safe_to_edit} requirement=${req} files=${data.files.length} intent="${oneLine(data.intent, 120)}"`,
+    `action: ${oneLine(data.recommended_action, 180)}`,
+  ];
+  if (data.scope_contract) {
+    lines.push(
+      `scope allow_terms=${data.scope_contract.allow_terms.length} deny_terms=${data.scope_contract.deny_terms.length} allowed_paths=${data.scope_contract.allowed_paths.length} denied_paths=${data.scope_contract.denied_paths.length}`,
+    );
+  }
+  lines.push(...compactDevelopmentWarningsText(data.development_warnings));
+  if (!data.development_warnings.length) lines.push("- no development warnings");
   return lines.join("\n");
 }
 
@@ -5800,11 +5837,12 @@ function buildServerInstructions(): string {
     "- For raw repo text search with exact file+line+col matches, prefer grep({ query: <pattern> }). It uses ripgrep against real project files when available, applies built-in noise filters, and only falls back to indexed search if ripgrep is unavailable.",
     "- To read a bounded segment of a file, prefer read_file_lines({ path: <file>, from_line/to_line or total_count }) over unbounded file reads.",
     "- BEFORE editing code: call start_requirement(title, background) to set the active requirement.",
-    "  - When the user names a narrow feature/domain, pass scope_allow/allowed_paths and scope_deny/denied_paths when useful. Example: external scan-login work should deny claim/release/assignment domains unless the user explicitly asks for claim changes.",
+    "  - When the user names a narrow feature/domain, pass scope_allow/allowed_paths and scope_deny/denied_paths when useful. These are generic project-specific scope boundaries, not business-specific built-ins.",
+    "- BEFORE editing once target files/modules are known: call preflight_change_scope(intent, files/planned_files, optional scope_allow/scope_deny/allowed_paths/denied_paths). If ok=false/safe_to_edit=false or it returns development_warnings, stop before editing and narrow the plan unless the user explicitly expands the requirement.",
     "- Treat the active requirement as the only change boundary. Do not add extra business behavior, new flows, new fields, new interfaces, or touch completed/related features unless the user explicitly asked or the change is strictly necessary.",
     "- Do not keep piling new feature code into a large single file. Prefer small modules/services/components; if an implementation file is already large, split it before adding more responsibilities.",
     "- AFTER editing + saving: call get_pending_changes() to see unsynced files, then call sync_change_intent(intent, files). (You can omit files to auto-link all pending changes.)",
-    "- If read_file_lines, grep, query_codebase, get_pending_changes, or sync_change_intent returns development_warnings, address those warnings before continuing or explain why the current requirement truly needs that scope.",
+    "- If preflight_change_scope, read_file_lines, grep, query_codebase, get_pending_changes, or sync_change_intent returns development_warnings, address those warnings before continuing or explain why the current requirement truly needs that scope.",
     "- After major milestones/decisions: call upsert_project_summary(summary) and/or add_note(...) to persist durable context locally.",
     "- When a requirement or user decision changes/reverses an older behavior, call upsert_decision(key, title, content, supersedes_req_ids?/supersedes_memory_ids?) and/or supersede_memory(...). Current decisions are shown in bootstrap_context/get_brain_dump and superseded memories are hidden from default semantic recall so stale requirements do not override newer facts.",
     "- If the user states a durable project convention (build commands, frameworks, naming rules, output paths): call upsert_convention(key, content, tags) so it is applied in future sessions.",
@@ -6578,6 +6616,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: toJsonSchemaCompat(SyncChangeIntentArgsSchema),
       },
       {
+        name: "preflight_change_scope",
+        description:
+          "MUST call BEFORE editing once you know the intended files/modules. Checks planned files against the active requirement and optional generic scope_allow/scope_deny/allowed_paths/denied_paths. If ok=false/safe_to_edit=false, stop before editing and narrow the plan or scope contract.",
+        inputSchema: toJsonSchemaCompat(PreflightChangeScopeArgsSchema),
+      },
+      {
         name: "get_brain_dump",
         description:
           "Restore recent requirements/changes/notes/summary/pending changes. Prefer bootstrap_context() at session start when you also want recall from the local memory store.",
@@ -6969,6 +7013,80 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           {
             type: "text",
             text: toolCompactOrJson("maintain_memory", result, compactMaintenanceText(result), args.format),
+          },
+        ],
+      };
+    }
+
+    if (toolName === "preflight_change_scope") {
+      const args = PreflightChangeScopeArgsSchema.parse(rawArgs);
+      flushPendingChangeBuffer();
+      const files = (args.files ?? args.planned_files ?? []).filter(
+        (f): f is string => typeof f === "string" && f.length > 0,
+      );
+      const active = getActiveRequirementStmt.get() as RequirementRow | undefined;
+      const explicitContract = buildRequirementScopeContract({
+        title: active?.title ?? "",
+        background: active?.context_data ?? "",
+        scope_allow: args.scope_allow,
+        scope_deny: args.scope_deny,
+        allowed_paths: args.allowed_paths,
+        denied_paths: args.denied_paths,
+      });
+      const fileInputs = files.map((file_path) => ({ file_path }));
+      const development_warnings = [
+        ...buildDevelopmentWarnings(fileInputs, { includeUnspecified: fileInputs.length === 0 }),
+        ...buildScopeDriftWarnings({
+          requirement: active,
+          contract: explicitContract,
+          intent: args.intent,
+          files: fileInputs,
+          includeMissingContractHint: true,
+        }),
+      ];
+      const scope_contract = mergeScopeContracts(
+        active ? getRequirementScopeContract(active.id) : null,
+        explicitContract,
+      );
+
+      logActivity("preflight_change_scope", {
+        req_id: active?.id ?? null,
+        intent_preview: makePreviewText(args.intent, 200),
+        files: files.slice(0, 25),
+        files_total: files.length,
+        development_warnings: development_warnings.length,
+      });
+
+      const hasTargetFiles = fileInputs.length > 0;
+      const hasBlockingWarnings = development_warnings.some((w) => w.severity === "blocker" || w.severity === "warning");
+      const safeToEdit = hasTargetFiles && !hasBlockingWarnings;
+      const recommendedAction = !hasTargetFiles
+        ? "Identify the intended target files/modules and rerun preflight_change_scope before editing."
+        : hasBlockingWarnings
+          ? "Stop before editing. Narrow the planned files or explicitly expand the current requirement/scope contract."
+          : "Planned files are within the current generic scope checks.";
+
+      const outputValue = {
+        ok: safeToEdit,
+        safe_to_edit: safeToEdit,
+        recommended_action: recommendedAction,
+        active_requirement: active ? { id: active.id, title: active.title } : null,
+        intent: args.intent,
+        files: files.map(normalizeToDbPath),
+        scope_contract,
+        development_warnings,
+      };
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: toolCompactOrJson(
+              "preflight_change_scope",
+              outputValue,
+              compactPreflightChangeScopeText(outputValue),
+              args.format,
+            ),
           },
         ],
       };
