@@ -415,6 +415,33 @@ async function main() {
   );
   await new Promise((r) => setTimeout(r, 1000));
 
+  const preflightBig = await client.callTool({
+    name: "preflight_change_scope",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      intent: "smoke: verify large-file pre-edit guard",
+      files: ["src/god_file.ts"],
+      format: "json",
+    },
+  });
+  console.log("\n--- preflight_change_scope (large-file development warnings) ---\n");
+  const preflightBigText = readText(preflightBig);
+  console.log(preflightBigText);
+  try {
+    const parsed = JSON.parse(preflightBigText);
+    const warnings = parsed?.development_warnings;
+    if (parsed?.safe_to_edit !== false || parsed?.ok !== false) {
+      throw new Error("expected preflight_change_scope to block editing a very large file");
+    }
+    if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "very_large_file")) {
+      throw new Error("expected preflight_change_scope to include very_large_file development warning");
+    }
+  } catch (err) {
+    console.error("\n[smoke] preflight large-file development warning check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
   const pendingBig = await client.callTool({
     name: "get_pending_changes",
     arguments: {
