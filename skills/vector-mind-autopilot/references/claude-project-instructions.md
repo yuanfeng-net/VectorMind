@@ -15,10 +15,12 @@ When the VectorMind MCP tools are available in this chat, use them by default to
 
 2) **Before editing any code/files** for a new task/feature:
    - Call: `start_requirement({ project_root: "<项目根目录>", title: "<简短需求标题>", background: "<约束/验收标准/风险点>" })`
+   - Treat this active requirement as the only change boundary. Do not add extra flows, fields, screens, APIs, or business rules the user did not ask for. Do not keep adding new feature code into an already-large file; split into focused modules/services/components.
 
 3) **After editing + saving files**:
    - Call: `get_pending_changes({ project_root: "<项目根目录>" })`
    - Then call: `sync_change_intent({ project_root: "<项目根目录>", intent: "<改了什么 + 为什么 + 下一步>", files?: <通常省略，让服务端自动关联 pending> })`
+   - If either tool returns `development_warnings`, address them before continuing or explain why the current requirement truly needs that scope.
 
 4) **When locating code**:
    - Call: `query_codebase({ project_root: "<项目根目录>", query: "<符号名/关键词>" })` instead of guessing file paths.
@@ -27,6 +29,7 @@ When the VectorMind MCP tools are available in this chat, use them by default to
    - Call: `semantic_search({ project_root: "<项目根目录>", query: "<问题>", top_k: 8, preview_chars: 200 })` instead of guessing.
    - If you need full text for a specific result, call: `read_memory_item({ project_root: "<项目根目录>", id: <memory_item_id>, offset: 0, limit: 2000 })` and page as needed.
    - If a large/long-lived project feels slow, call: `maintain_memory({ project_root: "<项目根目录>", dry_run: true })` first, then apply with `dry_run: false` only when the plan looks safe.
+   - Avoid editing completed or merely related features while working on a new requirement unless the current user request explicitly requires it.
 
 6) **After major milestones**:
    - Call: `upsert_project_summary({ project_root: "<项目根目录>", summary: "<当前进度 + 已完成 + 未解决问题 + 下一步>" })`

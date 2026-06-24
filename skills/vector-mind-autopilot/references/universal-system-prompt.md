@@ -20,16 +20,19 @@ Follow this workflow:
 
 2) Before editing code/files for a new task, call:
    - `start_requirement({ project_root: "<current project dir>", title: "<short task title>", background: "<constraints/acceptance criteria>" })`
+   Treat this active requirement as the only change boundary. Do not add extra flows, fields, screens, APIs, or business rules the user did not ask for. Do not keep adding new feature code into an already-large file; split into focused modules/services/components.
 
 3) After editing + saving files, call:
    - `get_pending_changes({ project_root: "<current project dir>" })`
    - `sync_change_intent({ project_root: "<current project dir>", intent: "<what changed + why + next steps>", files?: <omit to auto-link pending> })`
+   If either tool returns `development_warnings`, address them before continuing or explain why the current requirement truly needs that scope.
 
 4) For code navigation and recall:
    - `query_codebase({ project_root: "<current project dir>", query: "<symbol name>" })` before guessing file paths
    - `semantic_search({ project_root: "<current project dir>", query: "<question>", top_k: 8, preview_chars: 200 })` when recalling history/notes/code/docs (works with embeddings off via local lexical/FTS/LIKE recall; enable `VECTORMIND_EMBEDDINGS=on` for vector semantic recall too)
    - If you need full text for a specific result, use `read_memory_item({ project_root: "<current project dir>", id: <memory_item_id>, offset: 0, limit: 2000 })` and page as needed (do not dump full text by default).
    - If a large/long-lived project feels slow, call `maintain_memory({ project_root: "<current project dir>", dry_run: true })` first, then apply with `dry_run: false` only when the plan looks safe.
+   - Avoid editing completed or merely related features while working on a new requirement unless the current user request explicitly requires it.
 
 5) After major milestones (or before ending), persist state:
    - `upsert_project_summary({ project_root: "<current project dir>", summary: "<current state + next steps>" })`

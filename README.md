@@ -15,7 +15,7 @@ VectorMind 是一个给 AI 编程助手使用的本地项目记忆 MCP。
 当前版本：
 
 ```text
-1.0.44
+1.0.45
 ```
 
 ---
@@ -33,6 +33,7 @@ VectorMind 是一个给 AI 编程助手使用的本地项目记忆 MCP。
 - 最近改动原因
 - 待同步文件变化
 - 和当前任务相关的历史记录
+- 当前改动是否过大、是否在继续堆大文件
 
 这样 AI 不需要只靠当前聊天窗口猜项目背景。
 
@@ -154,7 +155,20 @@ VectorMind 会记录“文件已经变化，但还没有同步改动意图”的
 
 ---
 
-### 10. 自动维护记忆和索引
+### 10. 开发边界提醒
+
+VectorMind 会提醒 AI 避免几类常见问题：
+
+- 把新功能一直堆到一个大文件里
+- 一次需求改太多无关文件
+- 顺手改已完成的其他功能
+- 自己加用户没说的新需求
+
+如果检测到文件过大或改动范围过散，工具会返回 `development_warnings`。
+
+---
+
+### 11. 自动维护记忆和索引
 
 VectorMind 会定期做轻量维护：
 
@@ -167,7 +181,7 @@ VectorMind 会定期做轻量维护：
 
 ---
 
-### 11. 低 token 输出
+### 12. 低 token 输出
 
 VectorMind 的常用工具默认返回 compact 输出，而不是大段 JSON。
 
@@ -182,7 +196,7 @@ VectorMind 的常用工具默认返回 compact 输出，而不是大段 JSON。
 
 ---
 
-### 12. RTK 集成
+### 13. RTK 集成
 
 VectorMind 包里带了一个 `rtk` 命令入口。
 
@@ -198,7 +212,7 @@ rtk rg "keyword" src
 
 ---
 
-### 13. 内置开发规范
+### 14. 内置开发规范
 
 VectorMind MCP 会提供一些有用的开发规范，例如：
 
@@ -208,6 +222,9 @@ VectorMind MCP 会提供一些有用的开发规范，例如：
 - git 提交说明要包含改动总结
 - 长线程和大输出要尽量克制
 - 破坏性操作要有风险意识
+- 不要把新功能持续堆到一个大文件
+- 不要乱改当前需求以外的已完成功能
+- 不要自行叠加用户没提出的新需求
 
 这些内容只用于统一项目协作、代码组织、交付质量和长期记忆。
 
@@ -307,6 +324,7 @@ args = ["-y", "@coreyuan/vector-mind"]
 | 恢复上下文 | `bootstrap_context`, `get_brain_dump` |
 | 记录需求 | `start_requirement`, `complete_requirement` |
 | 记录改动原因 | `sync_change_intent`, `get_pending_changes` |
+| 检查开发边界 | `get_pending_changes`, `sync_change_intent` 返回的 `development_warnings` |
 | 保存最新决策 | `upsert_decision`, `supersede_memory` |
 | 保存长期信息 | `upsert_project_summary`, `add_note`, `upsert_convention` |
 | 搜历史上下文 | `semantic_search`, `read_memory_item` |

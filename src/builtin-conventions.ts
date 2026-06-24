@@ -47,8 +47,26 @@ export const BUILTIN_CONVENTIONS: BuiltinConventionSpec[] = [
   {
     key: "builtin:architecture_single_responsibility",
     content:
-      `${DEVELOPMENT_GUIDELINE_SCOPE} 单个模块和单个文件应尽量只承担一种主职责。不得把路由、业务规则、数据访问、状态管理、渲染、工具函数、配置装配等多类职责混写在同一文件中；若职责已经混杂，应优先拆分。`,
+      `${DEVELOPMENT_GUIDELINE_SCOPE} 单个模块和单个文件必须保持单一主职责。不得把路由、业务规则、数据访问、状态管理、渲染、工具函数、配置装配等多类职责混写在同一文件中；若职责已经混杂，应立即拆分，不得继续把新需求堆进该文件。实现文件接近 800 行时应优先拆模块；超过 1200 行时默认禁止继续追加新功能，除非本次任务就是有计划地拆分它。`,
     tags: ["builtin", "architecture", "single-responsibility", "modularity"],
+  },
+  {
+    key: "builtin:requirement_scope_no_extra_work",
+    content:
+      `${DEVELOPMENT_GUIDELINE_SCOPE} 当前用户要求是唯一需求边界：只实现用户明确提出的行为、验收点和必要配套改动；不得自行叠加看似合理但用户未提出的新流程、新状态、新页面、新接口、新字段、新角色模型、新审核链路或新业务规则。`,
+    tags: ["builtin", "requirement", "scope", "no-extra-work"],
+  },
+  {
+    key: "builtin:completed_work_preservation",
+    content:
+      `${DEVELOPMENT_GUIDELINE_SCOPE} 已完成、已验收或当前需求未要求修改的功能默认保持不变；即使代码名称、模块位置或语义看起来相关，也不得为了顺手整理、统一风格、猜测后续需求而改动。必须触碰时，只能做当前需求必需的最小适配，并在改动意图中说明原因。`,
+    tags: ["builtin", "requirement", "completed-work", "preservation"],
+  },
+  {
+    key: "builtin:no_god_file_growth",
+    content:
+      `${DEVELOPMENT_GUIDELINE_SCOPE} 新增功能不得集中写进一个万能文件；路由/控制、业务规则、数据访问、状态管理、UI 渲染、工具函数和配置装配应按既有目录边界拆分。若目标文件已经很大，应优先创建同层子模块或提取服务/组件/工具，并让原文件只保留薄入口或装配代码。`,
+    tags: ["builtin", "architecture", "god-file", "modularity"],
   },
   {
     key: "builtin:architecture_dependency_discipline",

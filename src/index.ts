@@ -27,6 +27,7 @@ import {
   BUILTIN_LOW_OVERHEAD_WORKFLOW_INSTRUCTIONS,
   BUILTIN_PAYLOAD_GUARD_INSTRUCTIONS,
   BUILTIN_PLAN_LITE_INSTRUCTIONS,
+  BUILTIN_REQUIREMENT_BOUNDARY_AND_MODULARITY_INSTRUCTIONS,
   BUILTIN_THREAD_HANDOFF_SWITCH_INSTRUCTIONS,
   BUILTIN_WRITE_POLICY_INSTRUCTIONS,
 } from "./builtin-instructions.js";
@@ -99,7 +100,7 @@ type RtkDetection = {
 };
 
 const SERVER_NAME = "vector-mind";
-const SERVER_VERSION = "1.0.44";
+const SERVER_VERSION = "1.0.45";
 
 type RootSource = "tool_arg" | "env" | "mcp_roots" | "cwd" | "fallback";
 
@@ -150,6 +151,38 @@ const PENDING_PRUNE_EVERY = (() => {
   const n = Number.parseInt(raw, 10);
   if (!Number.isFinite(n) || n <= 0) return 500;
   return n;
+})();
+
+const DEVELOPMENT_WARN_FILE_LINES = (() => {
+  const raw = process.env.VECTORMIND_WARN_FILE_LINES?.trim();
+  if (!raw) return 800;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 100) return 800;
+  return Math.min(50_000, n);
+})();
+
+const DEVELOPMENT_BLOCK_FILE_LINES = (() => {
+  const raw = process.env.VECTORMIND_BLOCK_FILE_LINES?.trim();
+  if (!raw) return 1200;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < DEVELOPMENT_WARN_FILE_LINES) return Math.max(1200, DEVELOPMENT_WARN_FILE_LINES);
+  return Math.min(100_000, n);
+})();
+
+const DEVELOPMENT_WARN_FILE_BYTES = (() => {
+  const raw = process.env.VECTORMIND_WARN_FILE_BYTES?.trim();
+  if (!raw) return 120_000;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 10_000) return 120_000;
+  return Math.min(20_000_000, n);
+})();
+
+const DEVELOPMENT_WARN_PENDING_FILES = (() => {
+  const raw = process.env.VECTORMIND_WARN_PENDING_FILES?.trim();
+  if (!raw) return 12;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return 12;
+  return Math.min(500, n);
 })();
 
 const RIPGREP_RESOLVE_TIMEOUT_MS = 5_000;
@@ -1663,6 +1696,172 @@ function isContentIndexableFile(filePath: string): boolean {
   return getContentChunkKind(filePath) !== null;
 }
 
+type DevelopmentWarning = {
+  code:
+    | "large_file"
+    | "very_large_file"
+    | "many_pending_files"
+    | "broad_change_surface"
+    | "unspecified_change_target";
+  severity: "info" | "warning" | "blocker";
+  message: string;
+  files?: string[];
+  details?: Record<string, unknown>;
+};
+
+type DevelopmentWarningFileInput = {
+  file_path: string;
+  last_event?: string;
+  event?: string;
+  updated_at?: string;
+};
+
+function isLikelySourceImplementationFile(filePath: string): boolean {
+  const ext = path.extname(filePath).toLowerCase();
+  return new Set([
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".py",
+    ".go",
+    ".rs",
+    ".java",
+    ".kt",
+    ".cs",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".h",
+    ".hpp",
+    ".vue",
+    ".svelte",
+  ]).has(ext);
+}
+
+function countFileLinesBounded(absPath: string, maxBytes: number): { lines: number; truncated: boolean } | null {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(absPath);
+  } catch {
+    return null;
+  }
+  if (!stat.isFile()) return null;
+  const bytesToRead = Math.min(stat.size, maxBytes);
+  const fd = fs.openSync(absPath, "r");
+  try {
+    const buffer = Buffer.alloc(bytesToRead);
+    const read = fs.readSync(fd, buffer, 0, bytesToRead, 0);
+    let lines = read > 0 ? 1 : 0;
+    for (let i = 0; i < read; i++) {
+      if (buffer[i] === 10) lines += 1;
+    }
+    return { lines, truncated: stat.size > bytesToRead };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function buildDevelopmentWarnings(
+  files: DevelopmentWarningFileInput[],
+  opts: { includeUnspecified?: boolean } = {},
+): DevelopmentWarning[] {
+  const warnings: DevelopmentWarning[] = [];
+  const uniqueFiles = Array.from(
+    new Set(
+      files
+        .map((f) => f.file_path)
+        .filter((f) => !!f && f !== "(unspecified)")
+        .map((f) => normalizeToDbPath(f)),
+    ),
+  );
+
+  if (opts.includeUnspecified || files.some((f) => f.file_path === "(unspecified)")) {
+    warnings.push({
+      code: "unspecified_change_target",
+      severity: "warning",
+      message:
+        "No changed file target was captured. For development work, sync concrete files so the current requirement owns only its real changes.",
+    });
+  }
+
+  if (uniqueFiles.length >= DEVELOPMENT_WARN_PENDING_FILES) {
+    warnings.push({
+      code: "many_pending_files",
+      severity: "warning",
+      message:
+        "This requirement touches many files. Re-check the user request and keep only files required by the current requirement.",
+      files: uniqueFiles.slice(0, 20),
+      details: { total_files: uniqueFiles.length, threshold: DEVELOPMENT_WARN_PENDING_FILES },
+    });
+  }
+
+  const topDirs = new Set(
+    uniqueFiles
+      .map((f) => f.replace(/\\/g, "/").split("/").filter(Boolean)[0] ?? "")
+      .filter(Boolean),
+  );
+  if (uniqueFiles.length >= 6 && topDirs.size >= 4) {
+    warnings.push({
+      code: "broad_change_surface",
+      severity: "warning",
+      message:
+        "Changed files span several top-level areas. Avoid modifying completed or merely related features unless the current requirement explicitly needs it.",
+      files: uniqueFiles.slice(0, 20),
+      details: { top_level_dirs: Array.from(topDirs).slice(0, 12), total_dirs: topDirs.size },
+    });
+  }
+
+  for (const relPath of uniqueFiles) {
+    if (!isLikelySourceImplementationFile(relPath)) continue;
+    const absPath = path.isAbsolute(relPath) ? relPath : path.join(projectRoot, relPath);
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(absPath);
+    } catch {
+      continue;
+    }
+    if (!stat.isFile()) continue;
+
+    const lineInfo = countFileLinesBounded(absPath, 2_000_000);
+    const lineCount = lineInfo?.lines ?? 0;
+    const tooManyLines = lineCount >= DEVELOPMENT_BLOCK_FILE_LINES;
+    const warnLines = lineCount >= DEVELOPMENT_WARN_FILE_LINES;
+    const warnBytes = stat.size >= DEVELOPMENT_WARN_FILE_BYTES;
+    if (!tooManyLines && !warnLines && !warnBytes) continue;
+
+    warnings.push({
+      code: tooManyLines ? "very_large_file" : "large_file",
+      severity: tooManyLines ? "blocker" : "warning",
+      message: tooManyLines
+        ? "This implementation file is already very large. Do not add new feature code here by default; split into a focused module/service/component and keep this file as a thin entry."
+        : "This implementation file is getting large. Prefer extracting focused modules instead of continuing to pile unrelated responsibilities into it.",
+      files: [relPath],
+      details: {
+        lines: lineInfo?.truncated ? `${lineCount}+` : lineCount,
+        bytes: stat.size,
+        warn_lines: DEVELOPMENT_WARN_FILE_LINES,
+        block_lines: DEVELOPMENT_BLOCK_FILE_LINES,
+        warn_bytes: DEVELOPMENT_WARN_FILE_BYTES,
+      },
+    });
+  }
+
+  return warnings;
+}
+
+function compactDevelopmentWarningsText(warnings: DevelopmentWarning[]): string[] {
+  if (!warnings.length) return [];
+  const lines = ["development warnings:"];
+  for (const w of warnings.slice(0, 8)) {
+    const files = w.files?.length ? ` files=${w.files.slice(0, 5).join(",")}` : "";
+    lines.push(`- ${w.severity} ${w.code}: ${oneLine(w.message, 180)}${files}`);
+  }
+  return lines;
+}
+
 function extractSymbols(filePath: string, content: string): ExtractedSymbol[] {
   const ext = path.extname(filePath).toLowerCase();
   if (ext === ".py") return extractPythonSymbols(content);
@@ -2623,6 +2822,7 @@ function compactBootstrapText(data: {
   pending_limit: number;
   pending_truncated: boolean;
   pending_changes: PendingChangeRow[];
+  development_warnings?: DevelopmentWarning[];
   items: Array<{
     requirement: ReturnType<typeof toRequirementPreview>;
     recent_changes: Array<ReturnType<typeof toChangeLogPreview>>;
@@ -2652,6 +2852,7 @@ function compactBootstrapText(data: {
   } else {
     lines.push("pending 0");
   }
+  lines.push(...compactDevelopmentWarningsText(data.development_warnings ?? []));
   if (data.items.length) {
     lines.push("requirements:");
     for (const item of data.items) {
@@ -5211,6 +5412,9 @@ function buildServerInstructions(): string {
     "Built-in architecture and code-organization quality policy:",
     BUILTIN_ARCHITECTURE_AND_CODE_ORGANIZATION_INSTRUCTIONS,
     "",
+    "Built-in requirement boundary and modularity quality policy:",
+    BUILTIN_REQUIREMENT_BOUNDARY_AND_MODULARITY_INSTRUCTIONS,
+    "",
     "Built-in frontend output-purity quality policy:",
     BUILTIN_FRONTEND_OUTPUT_PURITY_INSTRUCTIONS,
     "",
@@ -5241,7 +5445,10 @@ function buildServerInstructions(): string {
     "- For raw repo text search with exact file+line+col matches, prefer grep({ query: <pattern> }). It uses ripgrep against real project files when available, applies built-in noise filters, and only falls back to indexed search if ripgrep is unavailable.",
     "- To read a bounded segment of a file, prefer read_file_lines({ path: <file>, from_line/to_line or total_count }) over unbounded file reads.",
     "- BEFORE editing code: call start_requirement(title, background) to set the active requirement.",
+    "- Treat the active requirement as the only change boundary. Do not add extra business behavior, new flows, new fields, new interfaces, or touch completed/related features unless the user explicitly asked or the change is strictly necessary.",
+    "- Do not keep piling new feature code into a large single file. Prefer small modules/services/components; if an implementation file is already large, split it before adding more responsibilities.",
     "- AFTER editing + saving: call get_pending_changes() to see unsynced files, then call sync_change_intent(intent, files). (You can omit files to auto-link all pending changes.)",
+    "- If get_pending_changes or sync_change_intent returns development_warnings, address those warnings before continuing or explain why the current requirement truly needs that scope.",
     "- After major milestones/decisions: call upsert_project_summary(summary) and/or add_note(...) to persist durable context locally.",
     "- When a requirement or user decision changes/reverses an older behavior, call upsert_decision(key, title, content, supersedes_req_ids?/supersedes_memory_ids?) and/or supersede_memory(...). Current decisions are shown in bootstrap_context/get_brain_dump and superseded memories are hidden from default semantic recall so stale requirements do not override newer facts.",
     "- If the user states a durable project convention (build commands, frameworks, naming rules, output paths): call upsert_convention(key, content, tags) so it is applied in future sessions.",
@@ -6005,13 +6212,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "start_requirement",
         description:
-          "MUST call BEFORE editing code. Starts/activates a requirement so all subsequent code changes can be linked to a concrete intent (do not edit code without an active requirement).",
+          "MUST call BEFORE editing code. Starts/activates the concrete user requirement so subsequent changes stay inside that requirement boundary and do not accumulate unrelated work.",
         inputSchema: toJsonSchemaCompat(StartRequirementArgsSchema),
       },
       {
         name: "sync_change_intent",
         description:
-          "MUST call AFTER you edit code and save files. Archives the intent summary and links affected files to the current active requirement. If you omit files, the server will auto-link all pending changed files since the last sync.",
+          "MUST call AFTER you edit code and save files. Archives the intent summary, links affected files to the current active requirement, and returns development_warnings for oversized files, broad change scope, or missing file targets.",
         inputSchema: toJsonSchemaCompat(SyncChangeIntentArgsSchema),
       },
       {
@@ -6023,13 +6230,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "bootstrap_context",
         description:
-          "MUST call at the start of every new chat/session. Returns brain dump + pending changes, and (if you pass query) matches from the local memory store to avoid guessing.",
+          "MUST call at the start of every new chat/session. Returns brain dump + pending changes + development_warnings, and (if you pass query) matches from the local memory store to avoid guessing.",
         inputSchema: toJsonSchemaCompat(BootstrapContextArgsSchema),
       },
       {
         name: "get_pending_changes",
         description:
-          "List files that changed locally but have not been acknowledged by sync_change_intent yet. Use this to see what needs syncing (or omit files in sync_change_intent to auto-link them).",
+          "List files that changed locally but have not been acknowledged by sync_change_intent yet. Also returns development_warnings to catch god-file growth, broad change scope, and requirement-boundary drift.",
         inputSchema: toJsonSchemaCompat(GetPendingChangesArgsSchema),
       },
       {
@@ -6514,6 +6721,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       });
       insertTx();
+      const development_warnings = buildDevelopmentWarnings(synced_files, {
+        includeUnspecified: synced_files.some((f) => f.file_path === "(unspecified)"),
+      });
 
       logActivity("sync_change_intent", {
         req_id: active.id,
@@ -6521,6 +6731,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         intent_preview: makePreviewText(args.intent, 200),
         files: synced_files.slice(0, 25),
         files_total: synced_files.length,
+        development_warnings: development_warnings.length,
       });
 
       return {
@@ -6532,6 +6743,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               linked_to_requirement: { id: active.id, title: active.title },
               synced_files,
               created,
+              development_warnings,
             }),
           },
         ],
@@ -6581,6 +6793,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const pending_total = mergedPending.total;
       const pending_truncated = mergedPending.truncated;
       const pending_changes = mergedPending.page;
+      const development_warnings = buildDevelopmentWarnings(pending_changes);
 
       const q = args.query?.trim() ?? "";
       const semanticKinds = args.kinds?.length ? args.kinds : BOOTSTRAP_DEFAULT_CONTEXT_KINDS;
@@ -6649,6 +6862,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         pending_limit,
         pending_truncated,
         pending_changes,
+        development_warnings,
         items,
         semantic,
       };
@@ -6705,6 +6919,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const pending_total = mergedPending.total;
       const pending_truncated = mergedPending.truncated;
       const pending_changes = mergedPending.page;
+      const development_warnings = buildDevelopmentWarnings(pending_changes);
 
       logActivity("get_brain_dump", {
         pending_total,
@@ -6751,6 +6966,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         pending_limit,
         pending_truncated,
         pending_changes,
+        development_warnings,
         items,
         semantic: null,
       };
@@ -6779,6 +6995,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const total = mergedPending.total;
       const truncated = mergedPending.truncated;
       const pending = mergedPending.page;
+      const development_warnings = buildDevelopmentWarnings(pending);
 
       logActivity("get_pending_changes", {
         total,
@@ -6786,13 +7003,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         limit,
         returned: pending.length,
         truncated,
+        development_warnings: development_warnings.length,
       });
 
       return {
         content: [
           {
             type: "text",
-            text: toolJson({ ok: true, total, offset, limit, truncated, pending }),
+            text: toolJson({ ok: true, total, offset, limit, truncated, pending, development_warnings }),
           },
         ],
       };

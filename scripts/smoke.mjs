@@ -196,6 +196,9 @@ async function main() {
       "builtin:plan_lite_trigger_scope",
       "builtin:destructive_operation_scope",
       "builtin:architecture_boundary_first",
+      "builtin:requirement_scope_no_extra_work",
+      "builtin:completed_work_preservation",
+      "builtin:no_god_file_growth",
       "builtin:frontend_output_purity_scope",
       "builtin:git_commit_summary_required",
       "builtin:low_overhead_execution_scope",
@@ -224,6 +227,15 @@ async function main() {
     }
     if (!serverInstructions?.includes("Built-in architecture and code-organization quality policy:")) {
       throw new Error("expected server instructions to include architecture/code-organization quality section");
+    }
+    if (!serverInstructions?.includes("Built-in requirement boundary and modularity quality policy:")) {
+      throw new Error("expected server instructions to include requirement-boundary/modularity quality section");
+    }
+    if (!serverInstructions?.includes("Do not keep piling new feature code into a large single file")) {
+      throw new Error("expected server instructions to include anti-god-file guidance");
+    }
+    if (!serverInstructions?.includes("Do not add extra business behavior")) {
+      throw new Error("expected server instructions to include no-extra-demand guidance");
     }
     if (!serverInstructions?.includes("Built-in frontend output-purity quality policy:")) {
       throw new Error("expected server instructions to include frontend output-purity quality section");
@@ -367,6 +379,59 @@ async function main() {
   });
   console.log("\n--- get_pending_changes (after) ---\n");
   console.log(readText(pending2));
+
+  const bigFilePath = path.join(toolProjectRoot, "src", "god_file.ts");
+  fs.mkdirSync(path.dirname(bigFilePath), { recursive: true });
+  fs.writeFileSync(
+    bigFilePath,
+    Array.from({ length: 1250 }, (_, i) => `export const smokeValue${i} = ${i};`).join("\n") + "\n",
+  );
+  await new Promise((r) => setTimeout(r, 1000));
+
+  const pendingBig = await client.callTool({
+    name: "get_pending_changes",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      limit: 50,
+    },
+  });
+  console.log("\n--- get_pending_changes (development warnings) ---\n");
+  const pendingBigText = readText(pendingBig);
+  console.log(pendingBigText);
+  try {
+    const parsed = JSON.parse(pendingBigText);
+    const warnings = parsed?.development_warnings;
+    if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "very_large_file")) {
+      throw new Error("expected very_large_file development warning");
+    }
+  } catch (err) {
+    console.error("\n[smoke] development warning check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const syncBig = await client.callTool({
+    name: "sync_change_intent",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      intent: "smoke: verify large-file development warnings",
+      files: ["src/god_file.ts"],
+    },
+  });
+  console.log("\n--- sync_change_intent (development warnings) ---\n");
+  const syncBigText = readText(syncBig);
+  console.log(syncBigText);
+  try {
+    const parsed = JSON.parse(syncBigText);
+    const warnings = parsed?.development_warnings;
+    if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "very_large_file")) {
+      throw new Error("expected sync_change_intent to include very_large_file development warning");
+    }
+  } catch (err) {
+    console.error("\n[smoke] sync development warning check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
 
   const summary = await client.callTool({
     name: "upsert_project_summary",

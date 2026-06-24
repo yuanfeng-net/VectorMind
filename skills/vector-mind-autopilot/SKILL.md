@@ -51,6 +51,8 @@ If you still cannot determine it confidently, ask the user for the project root 
 
 - If this is a new task/feature, call `start_requirement({ project_root: <PROJECT_ROOT>, title, background })` before changing anything.
 - Prefer short, specific titles (e.g., “Add avatar upload”) and put constraints in `background` (formats, edge cases, acceptance criteria).
+- Treat the active requirement as the only change boundary. Do not add extra flows, fields, screens, APIs, or business rules the user did not ask for.
+- Do not keep adding new feature code into an already-large file. Split into focused modules/services/components when a file is taking multiple responsibilities.
 
 ### 4) After editing + saving files
 
@@ -58,6 +60,7 @@ If you still cannot determine it confidently, ask the user for the project root 
 - Call `sync_change_intent({ project_root: <PROJECT_ROOT>, intent, files? })` to archive the “what/why” and associate the changes to the active requirement.
   - Prefer omitting `files` to let the server auto-link all pending changes, unless you intentionally want a subset.
   - Write `intent` as a concise, user-facing summary: what changed + why + any follow-ups.
+  - If `get_pending_changes` or `sync_change_intent` returns `development_warnings`, address them before continuing or explain why the current requirement truly needs that scope.
 
 ### 5) When you need to find code or recall context
 
@@ -65,6 +68,7 @@ If you still cannot determine it confidently, ask the user for the project root 
 - If you need an “rg -n / Select-String”-style search with exact file+line+col matches: call `grep({ project_root: <PROJECT_ROOT>, query: "<pattern>" })` first. It prefers ripgrep against real project files with built-in noise filtering, and only falls back to indexed search if ripgrep is unavailable.
 - If you need to read a specific file segment (like `Get-Content -TotalCount` / `head`): call `read_file_lines({ project_root: <PROJECT_ROOT>, path: "<file>", total_count: 240 })` or `read_file_lines({ ..., from_line, to_line })` first to keep output bounded.
 - Avoid whole-file dumps, full-repo recursive listings, or broad raw match echo in normal flow; narrow the scope first and only surface the minimum needed lines/paths.
+- Avoid editing completed or merely related features while working on a new requirement unless the current user request explicitly requires it.
 - If you need to recall prior context/notes/decisions/code/docs: call `semantic_search({ project_root: <PROJECT_ROOT>, query, top_k, kinds? })` instead of guessing.
   - Note: `semantic_search` works even when embeddings are off (uses local lexical/FTS/LIKE recall). Enable `VECTORMIND_EMBEDDINGS=on` if you want vector semantic recall too.
 - If you truly need full text for a specific match/note/summary, call `read_memory_item({ project_root: <PROJECT_ROOT>, id, offset, limit })` to fetch it in chunks instead of setting `include_content: true`.
