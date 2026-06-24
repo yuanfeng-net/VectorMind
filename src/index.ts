@@ -100,7 +100,7 @@ type RtkDetection = {
 };
 
 const SERVER_NAME = "vector-mind";
-const SERVER_VERSION = "1.0.45";
+const SERVER_VERSION = "1.0.46";
 
 type RootSource = "tool_arg" | "env" | "mcp_roots" | "cwd" | "fallback";
 
@@ -1702,7 +1702,11 @@ type DevelopmentWarning = {
     | "very_large_file"
     | "many_pending_files"
     | "broad_change_surface"
-    | "unspecified_change_target";
+    | "unspecified_change_target"
+    | "large_file_read"
+    | "cross_project_path"
+    | "multiple_active_requirements"
+    | "broad_requirement_scope";
   severity: "info" | "warning" | "blocker";
   message: string;
   files?: string[];
@@ -1714,6 +1718,13 @@ type DevelopmentWarningFileInput = {
   last_event?: string;
   event?: string;
   updated_at?: string;
+};
+
+type PathScopeCheck = {
+  input_path: string;
+  abs_path: string;
+  in_project: boolean;
+  project_root: string;
 };
 
 function isLikelySourceImplementationFile(filePath: string): boolean {
@@ -1762,6 +1773,148 @@ function countFileLinesBounded(absPath: string, maxBytes: number): { lines: numb
   } finally {
     fs.closeSync(fd);
   }
+}
+
+function isPathInsideProjectRoot(absPath: string): boolean {
+  const root = path.resolve(projectRoot);
+  const rel = path.relative(root, path.resolve(absPath));
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+function checkPathScope(inputPath: string): PathScopeCheck {
+  const normalizedInput = inputPath.trim() || ".";
+  const absPath = path.resolve(path.isAbsolute(normalizedInput) ? normalizedInput : path.join(projectRoot, normalizedInput));
+  return {
+    input_path: inputPath,
+    abs_path: absPath,
+    in_project: isPathInsideProjectRoot(absPath),
+    project_root: path.resolve(projectRoot),
+  };
+}
+
+function buildCrossProjectPathWarnings(paths: string[] | null | undefined): DevelopmentWarning[] {
+  const checks = (paths ?? []).map((p) => checkPathScope(p)).filter((c) => !c.in_project);
+  if (!checks.length) return [];
+  return [
+    {
+      code: "cross_project_path",
+      severity: "warning",
+      message:
+        "A path points outside the current project_root. Switch project_root intentionally before reading/searching another repo; do not mix unrelated project context into the current requirement.",
+      files: checks.slice(0, 10).map((c) => c.input_path),
+      details: {
+        project_root: path.resolve(projectRoot),
+        paths: checks.slice(0, 10),
+        total_paths: checks.length,
+      },
+    },
+  ];
+}
+
+function buildFileReadDevelopmentWarnings(filePath: string, absPath: string, stat?: fs.Stats): DevelopmentWarning[] {
+  const warnings: DevelopmentWarning[] = [];
+  if (!isPathInsideProjectRoot(absPath)) {
+    warnings.push(...buildCrossProjectPathWarnings([filePath]));
+    return warnings;
+  }
+  if (!isLikelySourceImplementationFile(filePath)) return warnings;
+
+  let st = stat;
+  try {
+    st ??= fs.statSync(absPath);
+  } catch {
+    return warnings;
+  }
+  if (!st.isFile()) return warnings;
+
+  const lineInfo = countFileLinesBounded(absPath, 2_000_000);
+  const lineCount = lineInfo?.lines ?? 0;
+  const tooManyLines = lineCount >= DEVELOPMENT_BLOCK_FILE_LINES;
+  const warnLines = lineCount >= DEVELOPMENT_WARN_FILE_LINES;
+  const warnBytes = st.size >= DEVELOPMENT_WARN_FILE_BYTES;
+  if (!tooManyLines && !warnLines && !warnBytes) return warnings;
+
+  warnings.push({
+    code: "large_file_read",
+    severity: tooManyLines ? "blocker" : "warning",
+    message: tooManyLines
+      ? "You are reading a very large implementation file. Do not keep patching new feature code into it; identify a narrow function and split new behavior into focused modules unless this task is explicitly a planned extraction."
+      : "You are reading a large implementation file. Keep the target narrow and prefer extracting focused modules before adding responsibilities.",
+    files: [filePath],
+    details: {
+      lines: lineInfo?.truncated ? `${lineCount}+` : lineCount,
+      bytes: st.size,
+      warn_lines: DEVELOPMENT_WARN_FILE_LINES,
+      block_lines: DEVELOPMENT_BLOCK_FILE_LINES,
+      warn_bytes: DEVELOPMENT_WARN_FILE_BYTES,
+    },
+  });
+  return warnings;
+}
+
+function buildMatchedFileDevelopmentWarnings(filePaths: Array<string | null | undefined>): DevelopmentWarning[] {
+  const seen = new Set<string>();
+  const warnings: DevelopmentWarning[] = [];
+  for (const fp of filePaths) {
+    if (!fp || seen.has(fp)) continue;
+    seen.add(fp);
+    const abs = path.isAbsolute(fp) ? path.resolve(fp) : path.join(projectRoot, fp);
+    warnings.push(...buildFileReadDevelopmentWarnings(normalizeToDbPath(fp), abs));
+    if (warnings.length >= 8) break;
+  }
+  return warnings;
+}
+
+function buildRequirementStartWarnings(args: {
+  title: string;
+  background: string;
+  close_previous: boolean;
+}): DevelopmentWarning[] {
+  const warnings: DevelopmentWarning[] = [];
+  const activeReqs = listActiveRequirementsStmt.all(10) as RequirementRow[];
+
+  if (!args.close_previous && activeReqs.length > 0) {
+    warnings.push({
+      code: "multiple_active_requirements",
+      severity: "warning",
+      message:
+        "Starting a requirement without closing previous active requirements can mix unrelated context. Only keep multiple active requirements when the user explicitly asked for parallel work.",
+      details: {
+        active_requirements: activeReqs.slice(0, 5).map((r) => ({ id: r.id, title: r.title, status: r.status })),
+      },
+    });
+  }
+
+  const text = `${args.title}\n${args.background}`.toLowerCase();
+  const broadTerms = [
+    "顺便",
+    "一起",
+    "所有",
+    "全部",
+    "整体",
+    "重构",
+    "统一",
+    "优化一下",
+    "顺手",
+    "相关的",
+    "all ",
+    "everything",
+    "refactor",
+    "cleanup",
+    "clean up",
+  ];
+  const matched = broadTerms.filter((term) => text.includes(term));
+  if (matched.length >= 2 || text.length > 1800) {
+    warnings.push({
+      code: "broad_requirement_scope",
+      severity: "warning",
+      message:
+        "The requirement wording looks broad. Treat the current user request as the only boundary; do not add extra workflows, fields, pages, interfaces, or touch completed related features unless explicitly required.",
+      details: { matched_terms: matched.slice(0, 10), text_length: text.length },
+    });
+  }
+
+  return warnings;
 }
 
 function buildDevelopmentWarnings(
@@ -2702,6 +2855,7 @@ function compactGrepText(data: {
   matches: GrepMatch[];
   total_matches?: number;
   truncated: boolean;
+  development_warnings?: DevelopmentWarning[];
   candidates?: { total: number; scanned: number };
 }): string {
   const total = data.total_matches ?? data.matches.length;
@@ -2710,6 +2864,7 @@ function compactGrepText(data: {
   const lines = [
     `grep ${data.backend}${fallback} mode=${data.mode} matches=${data.matches.length}/${total} truncated=${data.truncated}${candidateText} q="${oneLine(data.query, 100)}"`,
   ];
+  lines.push(...compactDevelopmentWarningsText(data.development_warnings ?? []));
   if (data.ripgrep_error) lines.push(`ripgrep_error ${oneLine(data.ripgrep_error, 180)}`);
   for (const m of data.matches.slice(0, 80)) {
     lines.push(`${m.file_path}:${m.line}:${m.col}: ${oneLine(m.preview, 220)}`);
@@ -2747,12 +2902,14 @@ function compactReadTextFileText(data: {
   returned_chars: number;
   total_chars: number;
   truncated: boolean;
+  development_warnings?: DevelopmentWarning[];
   text: string;
 }): string {
   const offset = data.offset != null ? ` offset=${data.offset}` : "";
   const header = `file ${data.file_path}${offset} chars=${data.returned_chars}/${data.total_chars} truncated=${data.truncated}`;
   const hint = data.truncated ? "\nhint: continue with offset or read_file_lines; use format=json for metadata fields" : "";
-  return `${header}\n${data.text}${hint}`;
+  const warnings = compactDevelopmentWarningsText(data.development_warnings ?? []).join("\n");
+  return `${header}${warnings ? `\n${warnings}` : ""}\n${data.text}${hint}`;
 }
 
 function compactReadFileLinesText(data: {
@@ -2761,15 +2918,22 @@ function compactReadFileLinesText(data: {
   to_line: number;
   returned: number;
   truncated: boolean;
+  development_warnings?: DevelopmentWarning[];
   text: string;
 }): string {
   const header = `lines ${data.file_path}:${data.from_line}-${data.to_line} returned=${data.returned} truncated=${data.truncated}`;
   const hint = data.truncated ? "\nhint: narrow range or raise max_lines/max_chars; use format=json for metadata fields" : "";
-  return `${header}\n${data.text}${hint}`;
+  const warnings = compactDevelopmentWarningsText(data.development_warnings ?? []).join("\n");
+  return `${header}${warnings ? `\n${warnings}` : ""}\n${data.text}${hint}`;
 }
 
-function compactQueryCodebaseText(data: { query: string; matches: SymbolRow[] }): string {
+function compactQueryCodebaseText(data: {
+  query: string;
+  matches: SymbolRow[];
+  development_warnings?: DevelopmentWarning[];
+}): string {
   const lines = [`query_codebase matches=${data.matches.length} q="${oneLine(data.query, 100)}"`];
+  lines.push(...compactDevelopmentWarningsText(data.development_warnings ?? []));
   for (const m of data.matches.slice(0, 50)) {
     lines.push(`${m.file_path}: ${m.type} ${m.name}${m.signature ? ` — ${oneLine(m.signature, 160)}` : ""}`);
   }
@@ -5448,7 +5612,7 @@ function buildServerInstructions(): string {
     "- Treat the active requirement as the only change boundary. Do not add extra business behavior, new flows, new fields, new interfaces, or touch completed/related features unless the user explicitly asked or the change is strictly necessary.",
     "- Do not keep piling new feature code into a large single file. Prefer small modules/services/components; if an implementation file is already large, split it before adding more responsibilities.",
     "- AFTER editing + saving: call get_pending_changes() to see unsynced files, then call sync_change_intent(intent, files). (You can omit files to auto-link all pending changes.)",
-    "- If get_pending_changes or sync_change_intent returns development_warnings, address those warnings before continuing or explain why the current requirement truly needs that scope.",
+    "- If read_file_lines, grep, query_codebase, get_pending_changes, or sync_change_intent returns development_warnings, address those warnings before continuing or explain why the current requirement truly needs that scope.",
     "- After major milestones/decisions: call upsert_project_summary(summary) and/or add_note(...) to persist durable context locally.",
     "- When a requirement or user decision changes/reverses an older behavior, call upsert_decision(key, title, content, supersedes_req_ids?/supersedes_memory_ids?) and/or supersede_memory(...). Current decisions are shown in bootstrap_context/get_brain_dump and superseded memories are hidden from default semantic recall so stale requirements do not override newer facts.",
     "- If the user states a durable project convention (build commands, frameworks, naming rules, output paths): call upsert_convention(key, content, tags) so it is applied in future sessions.",
@@ -6290,7 +6454,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "grep",
         description:
-          "Repo text search with precise file/line/col matches, powered by ripgrep against real project files plus built-in noise filters. Falls back to indexed search only when ripgrep is unavailable.",
+          "Repo text search with precise file/line/col matches, powered by ripgrep against real project files plus built-in noise filters. Falls back to indexed search only when ripgrep is unavailable. Returns development_warnings for cross-project paths or huge implementation-file matches.",
         inputSchema: toJsonSchemaCompat(GrepArgsSchema),
       },
       {
@@ -6308,7 +6472,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "read_file_lines",
         description:
-          "Read a specific line range from a file under project_root (with strict size limits). Prefer this over Get-Content for deterministic reads.",
+          "Read a specific line range from a file under project_root (with strict size limits). Prefer this over Get-Content for deterministic reads. Returns development_warnings when the target is a huge implementation file.",
         inputSchema: toJsonSchemaCompat(ReadFileLinesArgsSchema),
       },
       {
@@ -6320,7 +6484,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "query_codebase",
         description:
-          "Search the symbol index for class/function/type names (or substrings) to locate definitions by file path and signature. Use this when you need to find code—do not guess locations.",
+          "Search the symbol index for class/function/type names (or substrings) to locate definitions by file path and signature. Use this when you need to find code; do not guess locations. Returns development_warnings when matches point at huge implementation files.",
         inputSchema: toJsonSchemaCompat(QueryCodebaseArgsSchema),
       },
       {
@@ -6385,6 +6549,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (toolName === "start_requirement") {
       const args = StartRequirementArgsSchema.parse(rawArgs);
       flushPendingChangeBuffer();
+      const development_warnings = buildRequirementStartWarnings({
+        title: args.title,
+        background: args.background,
+        close_previous: args.close_previous,
+      });
 
       if (args.close_previous) {
         try {
@@ -6418,6 +6587,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         req_id: id,
         title: args.title,
         closed_previous: args.close_previous,
+        development_warnings: development_warnings.length,
       });
 
       return {
@@ -6429,6 +6599,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               requirement: { id, title: args.title },
               memory_item: { id: memory_id },
               closed_previous: args.close_previous,
+              development_warnings,
             }),
           },
         ],
@@ -7218,6 +7389,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const includePaths = args.include_paths?.length ? args.include_paths : null;
       const excludePaths = args.exclude_paths?.length ? args.exclude_paths : null;
       const maxResults = args.max_results;
+      const development_warnings = [
+        ...buildCrossProjectPathWarnings(includePaths),
+        ...buildCrossProjectPathWarnings(excludePaths),
+      ];
 
       const caseSensitive =
         args.case_sensitive ?? (smartCase ? hasUppercaseAscii(q) : true);
@@ -7232,6 +7407,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
 
       if (ripgrepResult.ok) {
+        const grepDevelopmentWarnings = [
+          ...development_warnings,
+          ...buildMatchedFileDevelopmentWarnings(ripgrepResult.matches.map((m) => m.file_path)),
+        ];
         logActivity("grep", {
           backend: ripgrepResult.backend,
           rg_command: ripgrepResult.rg_command,
@@ -7244,6 +7423,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           matches: ripgrepResult.matches.length,
           total_matches: ripgrepResult.total_matches,
           truncated: ripgrepResult.truncated,
+          development_warnings: grepDevelopmentWarnings.length,
         });
 
         const outputValue = {
@@ -7259,6 +7439,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           matches: ripgrepResult.matches,
           total_matches: ripgrepResult.total_matches,
           truncated: ripgrepResult.truncated,
+          development_warnings: grepDevelopmentWarnings,
         };
 
         return {
@@ -7327,6 +7508,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      const grepDevelopmentWarnings = [
+        ...development_warnings,
+        ...buildMatchedFileDevelopmentWarnings(indexedResult.matches.map((m) => m.file_path)),
+      ];
       logActivity("grep", {
         backend: indexedResult.backend,
         fallback_reason: "ripgrep_unavailable",
@@ -7343,6 +7528,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         candidates_scanned: indexedResult.candidates.scanned,
         matches: indexedResult.matches.length,
         truncated: indexedResult.truncated,
+        development_warnings: grepDevelopmentWarnings.length,
       });
 
       const outputValue = {
@@ -7362,6 +7548,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         candidates: indexedResult.candidates,
         matches: indexedResult.matches,
         truncated: indexedResult.truncated,
+        development_warnings: grepDevelopmentWarnings,
       };
 
       return {
@@ -7495,6 +7682,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         truncated: result.truncated,
       });
 
+      const development_warnings = buildFileReadDevelopmentWarnings(resolved.dbFilePath, resolved.absPath, st);
       const outputValue = {
         ok: true,
         file_path: resolved.dbFilePath,
@@ -7502,6 +7690,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         returned_chars: result.returnedChars,
         total_chars: result.totalChars,
         truncated: result.truncated,
+        development_warnings,
         text: result.text,
       };
 
@@ -7647,6 +7836,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         truncated: result.truncated,
       });
 
+      const development_warnings = buildFileReadDevelopmentWarnings(resolved.dbFilePath, resolved.absPath, st);
       const outputValue = {
         ok: true,
         file_path: resolved.dbFilePath,
@@ -7654,6 +7844,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         to_line: toLine,
         returned: result.returned,
         truncated: result.truncated,
+        development_warnings,
         text: result.text,
       };
 
@@ -7674,14 +7865,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const like = `%${escaped}%`;
       const rows = searchSymbolsStmt.all(like, like, q, like, 250) as SymbolRow[];
       const filtered = rows.filter((r) => !shouldIgnoreDbFilePath(r.file_path)).slice(0, 50);
+      const development_warnings = buildMatchedFileDevelopmentWarnings(filtered.map((m) => m.file_path));
 
       logActivity("query_codebase", {
         query: q,
         matches: filtered.length,
+        development_warnings: development_warnings.length,
         sample: filtered.slice(0, 10).map((m) => ({ name: m.name, type: m.type, file_path: m.file_path })),
       });
 
-      const outputValue = { ok: true, query: q, matches: filtered };
+      const outputValue = { ok: true, query: q, matches: filtered, development_warnings };
 
       return {
         content: [

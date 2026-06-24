@@ -20,10 +20,10 @@ When the VectorMind MCP tools are available in this chat, use them by default to
 3) **After editing + saving files**:
    - Call: `get_pending_changes({ project_root: "<项目根目录>" })`
    - Then call: `sync_change_intent({ project_root: "<项目根目录>", intent: "<改了什么 + 为什么 + 下一步>", files?: <通常省略，让服务端自动关联 pending> })`
-   - If either tool returns `development_warnings`, address them before continuing or explain why the current requirement truly needs that scope.
+   - If `read_file_lines`, `grep`, `query_codebase`, `get_pending_changes`, or `sync_change_intent` returns `development_warnings`, address them before continuing or explain why the current requirement truly needs that scope.
 
 4) **When locating code**:
-   - Call: `query_codebase({ project_root: "<项目根目录>", query: "<符号名/关键词>" })` instead of guessing file paths.
+   - Call: `query_codebase({ project_root: "<项目根目录>", query: "<符号名/关键词>" })` instead of guessing file paths. If it warns about a huge implementation file, avoid adding new feature code there unless the task is explicitly a planned extraction.
 
 5) **When recalling history / notes / code / docs**:
    - Call: `semantic_search({ project_root: "<项目根目录>", query: "<问题>", top_k: 8, preview_chars: 200 })` instead of guessing.

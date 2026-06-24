@@ -15,7 +15,7 @@ VectorMind 是一个给 AI 编程助手使用的本地项目记忆 MCP。
 当前版本：
 
 ```text
-1.0.45
+1.0.46
 ```
 
 ---
@@ -164,7 +164,7 @@ VectorMind 会提醒 AI 避免几类常见问题：
 - 顺手改已完成的其他功能
 - 自己加用户没说的新需求
 
-如果检测到文件过大或改动范围过散，工具会返回 `development_warnings`。
+如果检测到文件过大、改动范围过散、读取/搜索跨出了当前项目，工具会返回 `development_warnings`。现在读取或搜索到超大源码文件时也会提前提醒，不等到改完后才发现问题。
 
 ---
 
@@ -324,7 +324,7 @@ args = ["-y", "@coreyuan/vector-mind"]
 | 恢复上下文 | `bootstrap_context`, `get_brain_dump` |
 | 记录需求 | `start_requirement`, `complete_requirement` |
 | 记录改动原因 | `sync_change_intent`, `get_pending_changes` |
-| 检查开发边界 | `get_pending_changes`, `sync_change_intent` 返回的 `development_warnings` |
+| 检查开发边界 | `read_file_lines`, `grep`, `query_codebase`, `get_pending_changes`, `sync_change_intent` 返回的 `development_warnings` |
 | 保存最新决策 | `upsert_decision`, `supersede_memory` |
 | 保存长期信息 | `upsert_project_summary`, `add_note`, `upsert_convention` |
 | 搜历史上下文 | `semantic_search`, `read_memory_item` |

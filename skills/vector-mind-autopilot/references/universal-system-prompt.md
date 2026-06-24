@@ -25,10 +25,10 @@ Follow this workflow:
 3) After editing + saving files, call:
    - `get_pending_changes({ project_root: "<current project dir>" })`
    - `sync_change_intent({ project_root: "<current project dir>", intent: "<what changed + why + next steps>", files?: <omit to auto-link pending> })`
-   If either tool returns `development_warnings`, address them before continuing or explain why the current requirement truly needs that scope.
+   If `read_file_lines`, `grep`, `query_codebase`, `get_pending_changes`, or `sync_change_intent` returns `development_warnings`, address them before continuing or explain why the current requirement truly needs that scope.
 
 4) For code navigation and recall:
-   - `query_codebase({ project_root: "<current project dir>", query: "<symbol name>" })` before guessing file paths
+   - `query_codebase({ project_root: "<current project dir>", query: "<symbol name>" })` before guessing file paths; if it warns about a huge implementation file, avoid adding new feature code there unless the task is explicitly a planned extraction.
    - `semantic_search({ project_root: "<current project dir>", query: "<question>", top_k: 8, preview_chars: 200 })` when recalling history/notes/code/docs (works with embeddings off via local lexical/FTS/LIKE recall; enable `VECTORMIND_EMBEDDINGS=on` for vector semantic recall too)
    - If you need full text for a specific result, use `read_memory_item({ project_root: "<current project dir>", id: <memory_item_id>, offset: 0, limit: 2000 })` and page as needed (do not dump full text by default).
    - If a large/long-lived project feels slow, call `maintain_memory({ project_root: "<current project dir>", dry_run: true })` first, then apply with `dry_run: false` only when the plan looks safe.

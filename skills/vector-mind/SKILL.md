@@ -36,13 +36,13 @@ Use this skill for any coding session where:
 
 - Call `get_pending_changes()`
 - Then call `sync_change_intent({ intent: "<what changed + why + next steps>", files?: <omit to auto-link pending> })`.
-- If either tool returns `development_warnings`, address them before continuing or explain why the current requirement truly needs that scope.
+- If `read_file_lines`, `grep`, `query_codebase`, `get_pending_changes`, or `sync_change_intent` returns `development_warnings`, address them before continuing or explain why the current requirement truly needs that scope.
 
 ### 4) Don’t guess paths or history
 
-- Need a symbol location? Call `query_codebase({ query: "<name>" })`.
+- Need a symbol location? Call `query_codebase({ query: "<name>" })`. If it warns about a huge implementation file, avoid adding new feature code there unless the task is explicitly a planned extraction.
 - Need an `rg -n`-style search with exact file+line+col matches? Call `grep({ query: "<pattern>" })` first; it now prefers ripgrep against real project files and only falls back to indexed search if ripgrep is unavailable.
-- Need to read a file segment (like `Get-Content -TotalCount` / `head`)? Call `read_file_lines({ path: "<file>", total_count: 240 })` or `read_file_lines({ from_line, to_line })`.
+- Need to read a file segment (like `Get-Content -TotalCount` / `head`)? Call `read_file_lines({ path: "<file>", total_count: 240 })` or `read_file_lines({ from_line, to_line })`. If it returns `large_file_read`, treat the file as a thin entry point and split new behavior into focused modules.
 - Avoid whole-file dumps, full-repo recursive listings, or broad raw match echo unless the user explicitly wants the raw output.
 - Avoid editing completed or merely related features while working on a new requirement unless the current user request explicitly requires it.
 - Need to recall context/notes/code/docs? Call `semantic_search({ query: "<question>", top_k: 8 })`.

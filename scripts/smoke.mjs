@@ -433,6 +433,86 @@ async function main() {
     return;
   }
 
+  const readBig = await client.callTool({
+    name: "read_file_lines",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      path: "src/god_file.ts",
+      from_line: 1,
+      total_count: 5,
+      format: "json",
+    },
+  });
+  console.log("\n--- read_file_lines (large-file development warnings) ---\n");
+  const readBigText = readText(readBig);
+  console.log(readBigText);
+  try {
+    const parsed = JSON.parse(readBigText);
+    const warnings = parsed?.development_warnings;
+    if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "large_file_read")) {
+      throw new Error("expected read_file_lines to include large_file_read development warning");
+    }
+  } catch (err) {
+    console.error("\n[smoke] read large-file development warning check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const grepBig = await client.callTool({
+    name: "grep",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      query: "smokeValue1249",
+      mode: "literal",
+      include_paths: ["src/god_file.ts"],
+      max_results: 5,
+      format: "json",
+    },
+  });
+  console.log("\n--- grep (large-file development warnings) ---\n");
+  const grepBigText = readText(grepBig);
+  console.log(grepBigText);
+  try {
+    const parsed = JSON.parse(grepBigText);
+    const warnings = parsed?.development_warnings;
+    if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "large_file_read")) {
+      throw new Error("expected grep to include large_file_read development warning");
+    }
+  } catch (err) {
+    console.error("\n[smoke] grep large-file development warning check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const outsideProjectDir = fs.mkdtempSync(path.join(os.tmpdir(), "vectormind-outside-project-"));
+  const outsideProjectFile = path.join(outsideProjectDir, "outside.ts");
+  fs.writeFileSync(outsideProjectFile, "export const outsideProjectToken = true;\n");
+  const grepOutside = await client.callTool({
+    name: "grep",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      query: "outsideProjectToken",
+      mode: "literal",
+      include_paths: [outsideProjectFile],
+      max_results: 5,
+      format: "json",
+    },
+  });
+  console.log("\n--- grep (cross-project path warning) ---\n");
+  const grepOutsideText = readText(grepOutside);
+  console.log(grepOutsideText);
+  try {
+    const parsed = JSON.parse(grepOutsideText);
+    const warnings = parsed?.development_warnings;
+    if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "cross_project_path")) {
+      throw new Error("expected grep to include cross_project_path development warning");
+    }
+  } catch (err) {
+    console.error("\n[smoke] grep cross-project development warning check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
   const summary = await client.callTool({
     name: "upsert_project_summary",
     arguments: {
