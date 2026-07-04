@@ -23,14 +23,15 @@ Follow this workflow:
    For narrow work, pass `scope_allow` / `scope_deny` or `allowed_paths` / `denied_paths` when useful; these are project-specific boundaries, not hardcoded business rules.
    Once you know the files/modules you intend to edit, call `preflight_change_scope({ project_root: "<current project dir>", intent, files })` before editing. If useful, pass extra `scope_allow` / `scope_deny` or `allowed_paths` / `denied_paths` for this planned change. Do not edit until it returns `safe_to_edit=true`; if it returns `safe_to_edit=false`, narrow the files/scope first.
    Treat this active requirement as the only change boundary. Do not add extra flows, fields, screens, APIs, or business rules the user did not ask for. Do not keep adding new feature code into an already-large file; split into focused modules/services/components.
+   If any VectorMind tool returns `huge_file_modularization_required`, stop normal feature work. Call `plan_large_file_split({ project_root: "<current project dir>", file })`, perform mechanical modularization with real module names/directories, never create generated/parts/partN files, then call `record_large_file_split(...)`.
 
 3) After editing + saving files, call:
    - `get_pending_changes({ project_root: "<current project dir>" })`
    - `sync_change_intent({ project_root: "<current project dir>", intent: "<what changed + why + next steps>", files?: <omit to auto-link pending> })`
-   If `preflight_change_scope` returns `safe_to_edit=false`, stop before editing and narrow the plan/scope. If `preflight_change_scope`, `read_file_lines`, `grep`, `query_codebase`, `get_pending_changes`, or `sync_change_intent` returns `development_warnings`, address them before continuing or explain why the current requirement truly needs that scope.
+   If `preflight_change_scope` returns `safe_to_edit=false`, stop before editing and narrow the plan/scope. If it returns `huge_file_modularization_required`, rerun only the split preflight with `change_mode: "mechanical_modularization"` and do the mechanical split first. Other `development_warnings` must be addressed before continuing or explicitly justified by the current requirement.
 
 4) For code navigation and recall:
-   - `query_codebase({ project_root: "<current project dir>", query: "<symbol name>" })` before guessing file paths; if it warns about a huge implementation file, avoid adding new feature code there unless the task is explicitly a planned extraction.
+   - `query_codebase({ project_root: "<current project dir>", query: "<symbol name>" })` before guessing file paths; if it warns about a huge implementation file, split it first unless the current task is only an emergency hotfix.
    - `semantic_search({ project_root: "<current project dir>", query: "<question>", top_k: 8, preview_chars: 200 })` when recalling history/notes/code/docs (works with embeddings off via local lexical/FTS/LIKE recall; enable `VECTORMIND_EMBEDDINGS=on` for vector semantic recall too)
    - If you need full text for a specific result, use `read_memory_item({ project_root: "<current project dir>", id: <memory_item_id>, offset: 0, limit: 2000 })` and page as needed (do not dump full text by default).
    - If a large/long-lived project feels slow, call `maintain_memory({ project_root: "<current project dir>", dry_run: true })` first, then apply with `dry_run: false` only when the plan looks safe.

@@ -33,6 +33,7 @@ Use this skill for any coding session where:
 - Once you know the files/modules you intend to edit, call `preflight_change_scope({ intent, files })` before editing. If useful, pass extra `scope_allow` / `scope_deny` or `allowed_paths` / `denied_paths` for this planned change. Do not edit until it returns `safe_to_edit=true`; if it returns `safe_to_edit=false`, narrow the files/scope first.
 - Treat this active requirement as the only change boundary. Do not add extra flows, fields, screens, APIs, or business rules the user did not ask for.
 - Do not keep adding new feature code into an already-large file. Split into focused modules/services/components when a file is taking multiple responsibilities.
+- If a tool returns `huge_file_modularization_required`, stop normal feature work. Call `plan_large_file_split`, perform mechanical modularization with real module names/directories, never create generated/parts/partN files, then call `record_large_file_split`.
 
 ### 3) After editing + saving files
 
@@ -42,9 +43,9 @@ Use this skill for any coding session where:
 
 ### 4) Don’t guess paths or history
 
-- Need a symbol location? Call `query_codebase({ query: "<name>" })`. If it warns about a huge implementation file, avoid adding new feature code there unless the task is explicitly a planned extraction.
+- Need a symbol location? Call `query_codebase({ query: "<name>" })`. If it warns about a huge implementation file, split it first unless the current task is only an emergency hotfix.
 - Need an `rg -n`-style search with exact file+line+col matches? Call `grep({ query: "<pattern>" })` first; it now prefers ripgrep against real project files and only falls back to indexed search if ripgrep is unavailable.
-- Need to read a file segment (like `Get-Content -TotalCount` / `head`)? Call `read_file_lines({ path: "<file>", total_count: 240 })` or `read_file_lines({ from_line, to_line })`. If it returns `large_file_read`, treat the file as a thin entry point and split new behavior into focused modules.
+- Need to read a file segment (like `Get-Content -TotalCount` / `head`)? Call `read_file_lines({ path: "<file>", total_count: 240 })` or `read_file_lines({ from_line, to_line })`. If it returns `large_file_read`, treat the file as a thin entry point and split new behavior into focused modules. If it returns `huge_file_modularization_required`, use `plan_large_file_split` before adding normal feature code.
 - Avoid whole-file dumps, full-repo recursive listings, or broad raw match echo unless the user explicitly wants the raw output.
 - Avoid editing completed or merely related features while working on a new requirement unless the current user request explicitly requires it.
 - Need to recall context/notes/code/docs? Call `semantic_search({ query: "<question>", top_k: 8 })`.

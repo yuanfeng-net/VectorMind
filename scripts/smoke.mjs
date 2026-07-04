@@ -108,7 +108,14 @@ async function main() {
     process.exitCode = 1;
     return;
   }
-  for (const toolName of ["detect_rtk", "install_rtk", "get_token_savings", "maintain_memory"]) {
+  for (const toolName of [
+    "detect_rtk",
+    "install_rtk",
+    "get_token_savings",
+    "maintain_memory",
+    "plan_large_file_split",
+    "record_large_file_split",
+  ]) {
     if (!toolList.tools.some((t) => t.name === toolName)) {
       console.error(`\n[smoke] expected tool list to include ${toolName}`);
       process.exitCode = 1;
@@ -233,6 +240,9 @@ async function main() {
     }
     if (!serverInstructions?.includes("Do not keep piling new feature code into a large single file")) {
       throw new Error("expected server instructions to include anti-god-file guidance");
+    }
+    if (!serverInstructions?.includes("huge_file_modularization_required")) {
+      throw new Error("expected server instructions to include huge-file modularization guidance");
     }
     if (!serverInstructions?.includes("Do not add extra business behavior")) {
       throw new Error("expected server instructions to include no-extra-demand guidance");
@@ -534,6 +544,138 @@ async function main() {
     }
   } catch (err) {
     console.error("\n[smoke] grep large-file development warning check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const hugeFilePath = path.join(toolProjectRoot, "src", "huge_controller.ts");
+  fs.writeFileSync(
+    hugeFilePath,
+    Array.from({ length: 3200 }, (_, i) => {
+      if (i % 400 === 0) return `export function loadConfigSmoke${i}() { return ${i}; }`;
+      if (i % 400 === 100) return `export function syncApiSmoke${i}() { return ${i}; }`;
+      if (i % 400 === 200) return `export function renderViewSmoke${i}() { return ${i}; }`;
+      if (i % 400 === 300) return `export function normalizePathSmoke${i}() { return ${i}; }`;
+      return `export const hugeSmokeValue${i} = ${i};`;
+    }).join("\n") + "\n",
+  );
+  await new Promise((r) => setTimeout(r, 1000));
+
+  const preflightHuge = await client.callTool({
+    name: "preflight_change_scope",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      intent: "smoke: normal feature should be blocked on huge files",
+      files: ["src/huge_controller.ts"],
+      format: "json",
+    },
+  });
+  console.log("\n--- preflight_change_scope (huge-file normal mode) ---\n");
+  const preflightHugeText = readText(preflightHuge);
+  console.log(preflightHugeText);
+  try {
+    const parsed = JSON.parse(preflightHugeText);
+    const warnings = parsed?.development_warnings;
+    if (parsed?.safe_to_edit !== false || parsed?.ok !== false) {
+      throw new Error("expected normal preflight to block editing a huge file");
+    }
+    if (parsed?.required_action !== "mechanical_modularization") {
+      throw new Error("expected required_action=mechanical_modularization for huge files");
+    }
+    if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "huge_file_modularization_required")) {
+      throw new Error("expected huge_file_modularization_required development warning");
+    }
+  } catch (err) {
+    console.error("\n[smoke] huge-file normal preflight check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const preflightHugeSplit = await client.callTool({
+    name: "preflight_change_scope",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      intent: "smoke: mechanically split huge file",
+      files: ["src/huge_controller.ts"],
+      change_mode: "mechanical_modularization",
+      format: "json",
+    },
+  });
+  console.log("\n--- preflight_change_scope (huge-file split mode) ---\n");
+  const preflightHugeSplitText = readText(preflightHugeSplit);
+  console.log(preflightHugeSplitText);
+  try {
+    const parsed = JSON.parse(preflightHugeSplitText);
+    const warnings = parsed?.development_warnings;
+    if (parsed?.safe_to_edit !== true || parsed?.ok !== true) {
+      throw new Error("expected mechanical_modularization preflight to allow the split");
+    }
+    if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "huge_file_modularization_required")) {
+      throw new Error("expected huge warning to remain visible during split mode");
+    }
+  } catch (err) {
+    console.error("\n[smoke] huge-file split-mode preflight check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const hugeSplitPlan = await client.callTool({
+    name: "plan_large_file_split",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      file: "src/huge_controller.ts",
+      intent: "smoke: mechanically split huge controller",
+      format: "json",
+    },
+  });
+  console.log("\n--- plan_large_file_split (json) ---\n");
+  const hugeSplitPlanText = readText(hugeSplitPlan);
+  console.log(hugeSplitPlanText);
+  let splitModules = [];
+  try {
+    const parsed = JSON.parse(hugeSplitPlanText);
+    if (parsed?.ok !== true) throw new Error("expected plan_large_file_split ok=true");
+    if (parsed?.required_action !== "mechanical_modularization") {
+      throw new Error("expected split plan required_action=mechanical_modularization");
+    }
+    if (!Array.isArray(parsed?.forbidden_patterns) || !parsed.forbidden_patterns.includes("*.parts")) {
+      throw new Error("expected split plan to forbid *.parts");
+    }
+    splitModules = Array.isArray(parsed?.modules) ? parsed.modules : [];
+    if (!splitModules.length) throw new Error("expected split plan modules");
+    if (splitModules.some((m) => String(m?.target_path ?? "").includes(".parts"))) {
+      throw new Error("split plan must not create .parts target paths");
+    }
+    if (splitModules.some((m) => /part\d*$/i.test(String(m?.module ?? "")))) {
+      throw new Error("split plan must not use partN module names");
+    }
+  } catch (err) {
+    console.error("\n[smoke] plan_large_file_split check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const recordHugeSplit = await client.callTool({
+    name: "record_large_file_split",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      file: "src/huge_controller.ts",
+      status: "planned",
+      summary: "Smoke planned mechanical split into real modules.",
+      modules: splitModules.slice(0, 4).map((m) => m.target_path),
+      remaining_lines: 3200,
+    },
+  });
+  console.log("\n--- record_large_file_split ---\n");
+  const recordHugeSplitText = readText(recordHugeSplit);
+  console.log(recordHugeSplitText);
+  try {
+    const parsed = JSON.parse(recordHugeSplitText);
+    if (parsed?.ok !== true || Number(parsed?.note?.id ?? 0) <= 0) {
+      throw new Error("expected record_large_file_split to create a note");
+    }
+  } catch (err) {
+    console.error("\n[smoke] record_large_file_split check failed:", err);
     process.exitCode = 1;
     return;
   }

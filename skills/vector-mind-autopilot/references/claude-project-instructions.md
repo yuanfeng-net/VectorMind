@@ -18,14 +18,15 @@ When the VectorMind MCP tools are available in this chat, use them by default to
    - For narrow work, pass `scope_allow` / `scope_deny` or `allowed_paths` / `denied_paths` when useful; these are project-specific boundaries, not hardcoded business rules.
    - Once you know the files/modules you intend to edit, call `preflight_change_scope({ project_root: "<项目根目录>", intent, files })` before editing. If useful, pass extra `scope_allow` / `scope_deny` or `allowed_paths` / `denied_paths` for this planned change. Do not edit until it returns `safe_to_edit=true`; if it returns `safe_to_edit=false`, narrow the files/scope first.
    - Treat this active requirement as the only change boundary. Do not add extra flows, fields, screens, APIs, or business rules the user did not ask for. Do not keep adding new feature code into an already-large file; split into focused modules/services/components.
+   - If any VectorMind tool returns `huge_file_modularization_required`, stop normal feature work. Call `plan_large_file_split({ project_root: "<项目根目录>", file })`, perform mechanical modularization with real module names/directories, never create generated/parts/partN files, then call `record_large_file_split(...)`.
 
 3) **After editing + saving files**:
    - Call: `get_pending_changes({ project_root: "<项目根目录>" })`
    - Then call: `sync_change_intent({ project_root: "<项目根目录>", intent: "<改了什么 + 为什么 + 下一步>", files?: <通常省略，让服务端自动关联 pending> })`
-   - If `preflight_change_scope` returns `safe_to_edit=false`, stop before editing and narrow the plan/scope. If `preflight_change_scope`, `read_file_lines`, `grep`, `query_codebase`, `get_pending_changes`, or `sync_change_intent` returns `development_warnings`, address them before continuing or explain why the current requirement truly needs that scope.
+   - If `preflight_change_scope` returns `safe_to_edit=false`, stop before editing and narrow the plan/scope. If it returns `huge_file_modularization_required`, rerun only the split preflight with `change_mode: "mechanical_modularization"` and do the mechanical split first. Other `development_warnings` must be addressed before continuing or explicitly justified by the current requirement.
 
 4) **When locating code**:
-   - Call: `query_codebase({ project_root: "<项目根目录>", query: "<符号名/关键词>" })` instead of guessing file paths. If it warns about a huge implementation file, avoid adding new feature code there unless the task is explicitly a planned extraction.
+   - Call: `query_codebase({ project_root: "<项目根目录>", query: "<符号名/关键词>" })` instead of guessing file paths. If it warns about a huge implementation file, split it first unless the current task is only an emergency hotfix.
 
 5) **When recalling history / notes / code / docs**:
    - Call: `semantic_search({ project_root: "<项目根目录>", query: "<问题>", top_k: 8, preview_chars: 200 })` instead of guessing.

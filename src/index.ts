@@ -100,7 +100,7 @@ type RtkDetection = {
 };
 
 const SERVER_NAME = "vector-mind";
-const SERVER_VERSION = "1.0.48";
+const SERVER_VERSION = "1.0.49";
 
 type RootSource = "tool_arg" | "env" | "mcp_roots" | "cwd" | "fallback";
 
@@ -167,6 +167,16 @@ const DEVELOPMENT_BLOCK_FILE_LINES = (() => {
   const n = Number.parseInt(raw, 10);
   if (!Number.isFinite(n) || n < DEVELOPMENT_WARN_FILE_LINES) return Math.max(1200, DEVELOPMENT_WARN_FILE_LINES);
   return Math.min(100_000, n);
+})();
+
+const DEVELOPMENT_HUGE_FILE_LINES = (() => {
+  const raw = process.env.VECTORMIND_HUGE_FILE_LINES?.trim();
+  if (!raw) return 3000;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < DEVELOPMENT_BLOCK_FILE_LINES) {
+    return Math.max(3000, DEVELOPMENT_BLOCK_FILE_LINES);
+  }
+  return Math.min(200_000, n);
 })();
 
 const DEVELOPMENT_WARN_FILE_BYTES = (() => {
@@ -1700,6 +1710,7 @@ type DevelopmentWarning = {
   code:
     | "large_file"
     | "very_large_file"
+    | "huge_file_modularization_required"
     | "many_pending_files"
     | "broad_change_surface"
     | "unspecified_change_target"
@@ -1714,6 +1725,13 @@ type DevelopmentWarning = {
   files?: string[];
   details?: Record<string, unknown>;
 };
+
+type ChangeMode =
+  | "feature"
+  | "bugfix"
+  | "refactor"
+  | "mechanical_modularization"
+  | "emergency_hotfix";
 
 type DevelopmentWarningFileInput = {
   file_path: string;
@@ -1821,6 +1839,64 @@ function buildCrossProjectPathWarnings(paths: string[] | null | undefined): Deve
   ];
 }
 
+function buildLargeImplementationFileWarning(args: {
+  code: "large_file" | "very_large_file" | "large_file_read" | "huge_file_modularization_required";
+  filePath: string;
+  lineCount: number;
+  bytes: number;
+  lineCountTruncated?: boolean;
+  reading?: boolean;
+}): DevelopmentWarning {
+  const linesValue = args.lineCountTruncated ? `${args.lineCount}+` : args.lineCount;
+  if (args.lineCount >= DEVELOPMENT_HUGE_FILE_LINES) {
+    return {
+      code: "huge_file_modularization_required",
+      severity: "blocker",
+      message:
+        "This implementation file is huge. Before any normal feature work, perform mechanical modularization: move whole functions/types/impl blocks into real, clearly named modules/directories, avoid *.generated.* or *.parts files, preserve behavior, then run format/build/tests.",
+      files: [args.filePath],
+      details: {
+        lines: linesValue,
+        bytes: args.bytes,
+        warn_lines: DEVELOPMENT_WARN_FILE_LINES,
+        block_lines: DEVELOPMENT_BLOCK_FILE_LINES,
+        huge_lines: DEVELOPMENT_HUGE_FILE_LINES,
+        required_action: "mechanical_modularization",
+        allowed_change_modes: ["mechanical_modularization", "emergency_hotfix"],
+        forbidden_file_patterns: ["*.generated.*", "*.parts", "*.rs.parts", "*_part*"],
+        mechanical_rules: [
+          "move whole declarations only",
+          "use real module names and clear directory boundaries",
+          "preserve behavior and public semantics",
+          "only add necessary mod/use/pub(crate)/re-export glue",
+          "run formatter, build, and tests after each phase",
+        ],
+        reading: !!args.reading,
+      },
+    };
+  }
+  return {
+    code: args.code,
+    severity: args.code === "large_file" || (args.code === "large_file_read" && args.lineCount < DEVELOPMENT_BLOCK_FILE_LINES)
+      ? "warning"
+      : "blocker",
+    message:
+      args.code === "large_file"
+        ? "This implementation file is getting large. Prefer extracting focused modules instead of continuing to pile unrelated responsibilities into it."
+        : args.reading
+          ? "You are reading a very large implementation file. Do not keep patching new feature code into it; identify a narrow function and split new behavior into focused modules unless this task is explicitly a planned extraction."
+          : "This implementation file is already very large. Do not add new feature code here by default; split into a focused module/service/component and keep this file as a thin entry.",
+    files: [args.filePath],
+    details: {
+      lines: linesValue,
+      bytes: args.bytes,
+      warn_lines: DEVELOPMENT_WARN_FILE_LINES,
+      block_lines: DEVELOPMENT_BLOCK_FILE_LINES,
+      huge_lines: DEVELOPMENT_HUGE_FILE_LINES,
+    },
+  };
+}
+
 function buildFileReadDevelopmentWarnings(filePath: string, absPath: string, stat?: fs.Stats): DevelopmentWarning[] {
   const warnings: DevelopmentWarning[] = [];
   if (!isPathInsideProjectRoot(absPath)) {
@@ -1844,21 +1920,16 @@ function buildFileReadDevelopmentWarnings(filePath: string, absPath: string, sta
   const warnBytes = st.size >= DEVELOPMENT_WARN_FILE_BYTES;
   if (!tooManyLines && !warnLines && !warnBytes) return warnings;
 
-  warnings.push({
-    code: "large_file_read",
-    severity: tooManyLines ? "blocker" : "warning",
-    message: tooManyLines
-      ? "You are reading a very large implementation file. Do not keep patching new feature code into it; identify a narrow function and split new behavior into focused modules unless this task is explicitly a planned extraction."
-      : "You are reading a large implementation file. Keep the target narrow and prefer extracting focused modules before adding responsibilities.",
-    files: [filePath],
-    details: {
-      lines: lineInfo?.truncated ? `${lineCount}+` : lineCount,
+  warnings.push(
+    buildLargeImplementationFileWarning({
+      code: "large_file_read",
+      filePath,
+      lineCount,
+      lineCountTruncated: lineInfo?.truncated,
       bytes: st.size,
-      warn_lines: DEVELOPMENT_WARN_FILE_LINES,
-      block_lines: DEVELOPMENT_BLOCK_FILE_LINES,
-      warn_bytes: DEVELOPMENT_WARN_FILE_BYTES,
-    },
-  });
+      reading: true,
+    }),
+  );
   return warnings;
 }
 
@@ -2172,24 +2243,39 @@ function buildDevelopmentWarnings(
     const warnBytes = stat.size >= DEVELOPMENT_WARN_FILE_BYTES;
     if (!tooManyLines && !warnLines && !warnBytes) continue;
 
-    warnings.push({
-      code: tooManyLines ? "very_large_file" : "large_file",
-      severity: tooManyLines ? "blocker" : "warning",
-      message: tooManyLines
-        ? "This implementation file is already very large. Do not add new feature code here by default; split into a focused module/service/component and keep this file as a thin entry."
-        : "This implementation file is getting large. Prefer extracting focused modules instead of continuing to pile unrelated responsibilities into it.",
-      files: [relPath],
-      details: {
-        lines: lineInfo?.truncated ? `${lineCount}+` : lineCount,
+    warnings.push(
+      buildLargeImplementationFileWarning({
+        code: tooManyLines ? "very_large_file" : "large_file",
+        filePath: relPath,
+        lineCount,
+        lineCountTruncated: lineInfo?.truncated,
         bytes: stat.size,
-        warn_lines: DEVELOPMENT_WARN_FILE_LINES,
-        block_lines: DEVELOPMENT_BLOCK_FILE_LINES,
-        warn_bytes: DEVELOPMENT_WARN_FILE_BYTES,
-      },
-    });
+      }),
+    );
   }
 
   return warnings;
+}
+
+function isLargeFileWarningCode(code: DevelopmentWarning["code"]): boolean {
+  return (
+    code === "large_file" ||
+    code === "very_large_file" ||
+    code === "large_file_read" ||
+    code === "huge_file_modularization_required"
+  );
+}
+
+function isDevelopmentWarningBlockingForChangeMode(warning: DevelopmentWarning, changeMode: ChangeMode): boolean {
+  if (changeMode === "mechanical_modularization") {
+    if (isLargeFileWarningCode(warning.code)) return false;
+    if (warning.code === "scope_contract_missing") return false;
+  }
+  if (changeMode === "emergency_hotfix") {
+    if (isLargeFileWarningCode(warning.code)) return false;
+    if (warning.code === "scope_contract_missing") return false;
+  }
+  return warning.severity === "blocker" || warning.severity === "warning";
 }
 
 function compactDevelopmentWarningsText(warnings: DevelopmentWarning[]): string[] {
@@ -2377,6 +2463,178 @@ function extractCLikeSymbols(content: string): ExtractedSymbol[] {
     }
   }
   return symbols;
+}
+
+type TopLevelDeclaration = {
+  line: number;
+  kind: string;
+  name: string;
+  signature: string;
+  suggested_module: string;
+};
+
+type LargeFileSplitPlan = {
+  ok: true;
+  file_path: string;
+  line_count: number;
+  bytes: number;
+  huge_threshold_lines: number;
+  required_action: "mechanical_modularization";
+  intent: string;
+  target_dir: string;
+  forbidden_patterns: string[];
+  mechanical_rules: string[];
+  modules: Array<{ module: string; target_path: string; declarations: string[]; reason: string }>;
+  steps: string[];
+  validation: string[];
+  notes: string[];
+};
+
+function declarationRegexForExtension(ext: string): RegExp {
+  switch (ext) {
+    case ".rs":
+      return /^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:fn|struct|enum|trait|impl|mod|type|const|static)\s+([A-Za-z_][\w]*)?/;
+    case ".go":
+      return /^\s*(?:func|type|const|var)\s+(?:\([^)]*\)\s*)?([A-Za-z_][\w]*)?/;
+    case ".py":
+      return /^(?:class|async\s+def|def)\s+([A-Za-z_][\w]*)/;
+    case ".ts":
+    case ".tsx":
+    case ".js":
+    case ".jsx":
+    case ".mjs":
+    case ".cjs":
+      return /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|class|interface|type|enum|const|let|var)\s+([A-Za-z_$][\w$]*)?/;
+    default:
+      return /^\s*(?:pub\s+)?(?:async\s+)?(?:fn|function|class|struct|enum|interface|type|const|static)\s+([A-Za-z_][\w]*)?/;
+  }
+}
+
+function moduleNameFromDeclaration(name: string, signature: string): string {
+  const text = `${name} ${signature}`.toLowerCase();
+  const rules: Array<[RegExp, string]> = [
+    [/(config|setting|env)/, "config"],
+    [/(state|store|persist)/, "state"],
+    [/(api|client|request|response|heartbeat|activate|sync)/, "api"],
+    [/(service|daemon|install|start|stop)/, "service"],
+    [/(log|logger|redact)/, "logging"],
+    [/(gui|window|dialog|form|view|button|list)/, "ui"],
+    [/(share|disk|smb|unc|folder|directory)/, "share"],
+    [/(repair|cleanup|probe|health)/, "maintenance"],
+    [/(path|sanitize|normalize|host|ip|util|helper)/, "util"],
+    [/(test|mock|fixture)/, "tests"],
+  ];
+  for (const [pattern, moduleName] of rules) {
+    if (pattern.test(text)) return moduleName;
+  }
+  return "core";
+}
+
+function topLevelDeclarationsForPlan(content: string, ext: string, maxDecls = 160): TopLevelDeclaration[] {
+  const decls: TopLevelDeclaration[] = [];
+  const lines = content.split(/\r?\n/);
+  const regex = declarationRegexForExtension(ext);
+  for (let i = 0; i < lines.length && decls.length < maxDecls; i++) {
+    const raw = lines[i];
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("#")) continue;
+    const m = raw.match(regex);
+    if (!m) continue;
+    const fallback = trimmed.split(/\s+/).slice(0, 3).join("_").replace(/[^\w$]+/g, "_");
+    const name = (m[1] || fallback || `declaration_${i + 1}`).replace(/^[^A-Za-z_]+/, "") || `declaration_${i + 1}`;
+    const kind = trimmed.split(/\s+/).find((part) =>
+      ["fn", "function", "class", "struct", "enum", "trait", "impl", "mod", "type", "const", "static", "interface"].includes(
+        part.replace(/[({].*$/, ""),
+      ),
+    ) ?? "declaration";
+    decls.push({
+      line: i + 1,
+      kind,
+      name,
+      signature: oneLine(trimmed, 180),
+      suggested_module: moduleNameFromDeclaration(name, trimmed),
+    });
+  }
+  return decls;
+}
+
+function targetPathForModule(originalFilePath: string, targetDir: string, moduleName: string): string {
+  const ext = path.extname(originalFilePath) || ".txt";
+  const normalizedTargetDir = targetDir.replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!normalizedTargetDir || normalizedTargetDir === ".") return `${moduleName}${ext}`;
+  return `${normalizedTargetDir}/${moduleName}${ext}`;
+}
+
+function buildLargeFileSplitPlan(args: {
+  filePath: string;
+  absPath: string;
+  intent: string;
+  targetDir?: string;
+  maxModules: number;
+}): LargeFileSplitPlan {
+  const content = fs.readFileSync(args.absPath, "utf8");
+  const st = fs.statSync(args.absPath);
+  const lines = content.split(/\r?\n/).length;
+  const ext = path.extname(args.absPath).toLowerCase();
+  const baseName = path.basename(args.filePath, path.extname(args.filePath));
+  const parentDir = path.dirname(args.filePath).replace(/\\/g, "/");
+  const defaultTargetDir = parentDir === "." ? baseName : `${parentDir}/${baseName}`;
+  const targetDir = normalizeToDbPath(args.targetDir ?? defaultTargetDir);
+  const declarations = topLevelDeclarationsForPlan(content, ext);
+  const grouped = new Map<string, TopLevelDeclaration[]>();
+  for (const decl of declarations) {
+    const key = grouped.size >= args.maxModules && !grouped.has(decl.suggested_module) ? "core" : decl.suggested_module;
+    const list = grouped.get(key) ?? [];
+    list.push(decl);
+    grouped.set(key, list);
+  }
+  if (!grouped.size) grouped.set("core", []);
+  const modules = Array.from(grouped.entries())
+    .slice(0, args.maxModules)
+    .map(([moduleName, decls]) => ({
+      module: moduleName,
+      target_path: targetPathForModule(args.filePath, targetDir, moduleName),
+      declarations: decls.slice(0, 24).map((d) => `${d.kind} ${d.name} @L${d.line}`),
+      reason: `Move whole ${moduleName}-related declarations together without changing behavior.`,
+    }));
+
+  return {
+    ok: true,
+    file_path: args.filePath,
+    line_count: lines,
+    bytes: st.size,
+    huge_threshold_lines: DEVELOPMENT_HUGE_FILE_LINES,
+    required_action: "mechanical_modularization",
+    intent: args.intent,
+    target_dir: targetDir,
+    forbidden_patterns: ["*.generated.*", "*.parts", "*.rs.parts", "*_part*", "*Part*"],
+    mechanical_rules: [
+      "Move only complete declarations/impl blocks/functions/classes/types; do not split a declaration body.",
+      "Use real module names and clear directory boundaries; do not create generated/parts/partN files.",
+      "Preserve behavior, names, API semantics, data formats, side effects, and test expectations.",
+      "Only add necessary module declarations, imports, pub(crate), and re-exports to make moved code compile.",
+      "Run formatter, build/check, and relevant tests after each small phase.",
+    ],
+    modules,
+    steps: [
+      "Create a dedicated mechanical modularization requirement before touching the huge file.",
+      "Add the target module directory and move one cohesive declaration group at a time.",
+      "Keep the original file as a thin entry/mod orchestration file where possible.",
+      "After each group, run formatter and the smallest available compile/test command.",
+      "Record the split with record_large_file_split(status='partial' or 'resolved').",
+      "Resume the original feature only after the target huge file is no longer the default place for new code.",
+    ],
+    validation: [
+      "No *.generated.*, *.parts, *.rs.parts, or numbered part files were created.",
+      "The original file line count decreased or contains only thin orchestration glue.",
+      "Formatter passes.",
+      "Build/check passes.",
+      "Relevant tests pass.",
+    ],
+    notes: declarations.length
+      ? [`Detected ${declarations.length} top-level declarations for mechanical grouping.`]
+      : ["No top-level declarations were detected by lightweight scanning; split by obvious cohesive sections and verify after each move."],
+  };
 }
 
 type TextChunk = { startLine: number; endLine: number; content: string };
@@ -2636,10 +2894,33 @@ const PreflightChangeScopeArgsSchema = ProjectRootArgSchema.merge(OutputFormatSc
     intent: z.string().optional().default(""),
     files: z.array(z.string().min(1)).optional(),
     planned_files: z.array(z.string().min(1)).optional(),
+    change_mode: z
+      .enum(["feature", "bugfix", "refactor", "mechanical_modularization", "emergency_hotfix"])
+      .optional()
+      .default("feature"),
     scope_allow: z.array(z.string().min(1)).optional(),
     scope_deny: z.array(z.string().min(1)).optional(),
     allowed_paths: z.array(z.string().min(1)).optional(),
     denied_paths: z.array(z.string().min(1)).optional(),
+  }),
+);
+
+const PlanLargeFileSplitArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
+  z.object({
+    file: z.string().min(1),
+    intent: z.string().optional().default("mechanical modularization"),
+    target_dir: z.string().optional(),
+    max_modules: z.number().int().min(2).max(30).optional().default(12),
+  }),
+);
+
+const RecordLargeFileSplitArgsSchema = ProjectRootArgSchema.merge(
+  z.object({
+    file: z.string().min(1),
+    status: z.enum(["planned", "in_progress", "partial", "resolved"]),
+    summary: z.string().min(1),
+    modules: z.array(z.string().min(1)).optional(),
+    remaining_lines: z.number().int().min(0).optional(),
   }),
 );
 
@@ -3177,6 +3458,9 @@ function compactPreflightChangeScopeText(data: {
   ok: boolean;
   safe_to_edit: boolean;
   recommended_action: string;
+  change_mode: ChangeMode;
+  required_action?: string;
+  allowed_change_modes?: ChangeMode[];
   active_requirement: { id: number; title: string } | null;
   intent: string;
   files: string[];
@@ -3185,9 +3469,11 @@ function compactPreflightChangeScopeText(data: {
 }): string {
   const req = data.active_requirement ? `#${data.active_requirement.id} ${data.active_requirement.title}` : "none";
   const lines = [
-    `preflight_change_scope ok=${data.ok} safe_to_edit=${data.safe_to_edit} requirement=${req} files=${data.files.length} intent="${oneLine(data.intent, 120)}"`,
+    `preflight_change_scope ok=${data.ok} safe_to_edit=${data.safe_to_edit} mode=${data.change_mode} requirement=${req} files=${data.files.length} intent="${oneLine(data.intent, 120)}"`,
     `action: ${oneLine(data.recommended_action, 180)}`,
   ];
+  if (data.required_action) lines.push(`required_action=${data.required_action}`);
+  if (data.allowed_change_modes?.length) lines.push(`allowed_change_modes=${data.allowed_change_modes.join(",")}`);
   if (data.scope_contract) {
     lines.push(
       `scope allow_terms=${data.scope_contract.allow_terms.length} deny_terms=${data.scope_contract.deny_terms.length} allowed_paths=${data.scope_contract.allowed_paths.length} denied_paths=${data.scope_contract.denied_paths.length}`,
@@ -3195,6 +3481,25 @@ function compactPreflightChangeScopeText(data: {
   }
   lines.push(...compactDevelopmentWarningsText(data.development_warnings));
   if (!data.development_warnings.length) lines.push("- no development warnings");
+  return lines.join("\n");
+}
+
+function compactLargeFileSplitPlanText(data: LargeFileSplitPlan): string {
+  const lines = [
+    `large_file_split ok=${data.ok} file=${data.file_path} lines=${data.line_count} threshold=${data.huge_threshold_lines} action=${data.required_action}`,
+    `target_dir=${data.target_dir}`,
+    `forbidden=${data.forbidden_patterns.join(",")}`,
+  ];
+  lines.push("modules:");
+  for (const m of data.modules.slice(0, 20)) {
+    const decls = m.declarations.length ? ` decls=${m.declarations.slice(0, 8).join("; ")}` : " decls=(manual sections)";
+    lines.push(`- ${m.module} -> ${m.target_path}${decls}`);
+  }
+  lines.push("steps:");
+  for (const step of data.steps.slice(0, 8)) lines.push(`- ${step}`);
+  lines.push("validation:");
+  for (const v of data.validation.slice(0, 8)) lines.push(`- ${v}`);
+  lines.push("hint: use format=json for full declarations/rules");
   return lines.join("\n");
 }
 
@@ -5841,6 +6146,7 @@ function buildServerInstructions(): string {
     "- BEFORE editing once target files/modules are known: call preflight_change_scope(intent, files/planned_files, optional scope_allow/scope_deny/allowed_paths/denied_paths). If ok=false/safe_to_edit=false or it returns development_warnings, stop before editing and narrow the plan unless the user explicitly expands the requirement.",
     "- Treat the active requirement as the only change boundary. Do not add extra business behavior, new flows, new fields, new interfaces, or touch completed/related features unless the user explicitly asked or the change is strictly necessary.",
     "- Do not keep piling new feature code into a large single file. Prefer small modules/services/components; if an implementation file is already large, split it before adding more responsibilities.",
+    "- If preflight_change_scope/read_file_lines/grep/query_codebase/get_pending_changes/sync_change_intent returns huge_file_modularization_required, do not continue normal feature work. Call plan_large_file_split, perform mechanical modularization with real module names/directories, never create generated/parts/partN files, then call record_large_file_split before resuming normal feature work. Only use preflight_change_scope(change_mode='mechanical_modularization') for the split itself; use change_mode='emergency_hotfix' only for the smallest urgent fix and still record why the split was deferred.",
     "- AFTER editing + saving: call get_pending_changes() to see unsynced files, then call sync_change_intent(intent, files). (You can omit files to auto-link all pending changes.)",
     "- If preflight_change_scope, read_file_lines, grep, query_codebase, get_pending_changes, or sync_change_intent returns development_warnings, address those warnings before continuing or explain why the current requirement truly needs that scope.",
     "- After major milestones/decisions: call upsert_project_summary(summary) and/or add_note(...) to persist durable context locally.",
@@ -6618,8 +6924,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "preflight_change_scope",
         description:
-          "MUST call BEFORE editing once you know the intended files/modules. Checks planned files against the active requirement and optional generic scope_allow/scope_deny/allowed_paths/denied_paths. If ok=false/safe_to_edit=false, stop before editing and narrow the plan or scope contract.",
+          "MUST call BEFORE editing once you know the intended files/modules. Checks planned files against the active requirement and optional generic scope_allow/scope_deny/allowed_paths/denied_paths. If ok=false/safe_to_edit=false, stop before editing and narrow the plan or scope contract. For huge files, use change_mode='mechanical_modularization' only when the task is to split the file.",
         inputSchema: toJsonSchemaCompat(PreflightChangeScopeArgsSchema),
+      },
+      {
+        name: "plan_large_file_split",
+        description:
+          "Plan a mechanical modularization split for a huge implementation file. Produces real module names/directories and explicitly forbids generated/parts/partN files. Use this before normal feature work when preflight_change_scope returns huge_file_modularization_required.",
+        inputSchema: toJsonSchemaCompat(PlanLargeFileSplitArgsSchema),
+      },
+      {
+        name: "record_large_file_split",
+        description:
+          "Record the planned/in-progress/partial/resolved status of a huge-file mechanical modularization split so future sessions know the file is being decomposed and where modules moved.",
+        inputSchema: toJsonSchemaCompat(RecordLargeFileSplitArgsSchema),
       },
       {
         name: "get_brain_dump",
@@ -7020,6 +7338,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (toolName === "preflight_change_scope") {
       const args = PreflightChangeScopeArgsSchema.parse(rawArgs);
+      const changeMode = args.change_mode as ChangeMode;
       flushPendingChangeBuffer();
       const files = (args.files ?? args.planned_files ?? []).filter(
         (f): f is string => typeof f === "string" && f.length > 0,
@@ -7052,24 +7371,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       logActivity("preflight_change_scope", {
         req_id: active?.id ?? null,
         intent_preview: makePreviewText(args.intent, 200),
+        change_mode: changeMode,
         files: files.slice(0, 25),
         files_total: files.length,
         development_warnings: development_warnings.length,
       });
 
       const hasTargetFiles = fileInputs.length > 0;
-      const hasBlockingWarnings = development_warnings.some((w) => w.severity === "blocker" || w.severity === "warning");
+      const hugeWarnings = development_warnings.filter((w) => w.code === "huge_file_modularization_required");
+      const hasHugeFile = hugeWarnings.length > 0;
+      const blockingWarnings = development_warnings.filter((w) =>
+        isDevelopmentWarningBlockingForChangeMode(w, changeMode),
+      );
+      const hasBlockingWarnings = blockingWarnings.length > 0;
       const safeToEdit = hasTargetFiles && !hasBlockingWarnings;
       const recommendedAction = !hasTargetFiles
         ? "Identify the intended target files/modules and rerun preflight_change_scope before editing."
-        : hasBlockingWarnings
-          ? "Stop before editing. Narrow the planned files or explicitly expand the current requirement/scope contract."
-          : "Planned files are within the current generic scope checks.";
+        : hasHugeFile && changeMode === "mechanical_modularization" && safeToEdit
+          ? "Proceed only with mechanical modularization: call plan_large_file_split, move whole declarations into real named modules/directories, avoid generated/parts files, validate, then record_large_file_split."
+          : hasHugeFile && changeMode === "emergency_hotfix" && safeToEdit
+            ? "Proceed only with the smallest urgent fix, do not add new responsibilities, record why mechanical modularization was deferred, and plan/record the split next."
+            : hasHugeFile
+              ? "Stop normal feature work. Call plan_large_file_split and perform mechanical modularization first, or rerun preflight_change_scope with change_mode='mechanical_modularization' for the split itself."
+              : hasBlockingWarnings
+                ? "Stop before editing. Narrow the planned files or explicitly expand the current requirement/scope contract."
+                : "Planned files are within the current generic scope checks.";
+      const requiredAction = hasHugeFile && changeMode !== "mechanical_modularization"
+        ? "mechanical_modularization"
+        : undefined;
+      const allowedChangeModes = hasHugeFile
+        ? (["mechanical_modularization", "emergency_hotfix"] as ChangeMode[])
+        : undefined;
 
       const outputValue = {
         ok: safeToEdit,
         safe_to_edit: safeToEdit,
+        change_mode: changeMode,
         recommended_action: recommendedAction,
+        required_action: requiredAction,
+        allowed_change_modes: allowedChangeModes,
         active_requirement: active ? { id: active.id, title: active.title } : null,
         intent: args.intent,
         files: files.map(normalizeToDbPath),
@@ -7087,6 +7427,146 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               compactPreflightChangeScopeText(outputValue),
               args.format,
             ),
+          },
+        ],
+      };
+    }
+
+    if (toolName === "plan_large_file_split") {
+      const args = PlanLargeFileSplitArgsSchema.parse(rawArgs);
+      flushPendingChangeBuffer();
+      const resolved = resolveReadPathUnderProjectRoot(args.file);
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(resolved.absPath);
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: toolJson({ ok: false, error: `File not found: ${String(err)}` }) }],
+        };
+      }
+      if (!stat.isFile()) {
+        return { isError: true, content: [{ type: "text", text: toolJson({ ok: false, error: "Not a file" }) }] };
+      }
+      if (!isLikelySourceImplementationFile(resolved.dbFilePath)) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: toolJson({
+                ok: false,
+                error: "Not a recognized source implementation file",
+                file_path: resolved.dbFilePath,
+              }),
+            },
+          ],
+        };
+      }
+
+      const lineInfo = countFileLinesBounded(resolved.absPath, 8_000_000);
+      const lineCount = lineInfo?.lines ?? 0;
+      if (lineCount < DEVELOPMENT_HUGE_FILE_LINES) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: toolJson({
+                ok: false,
+                file_path: resolved.dbFilePath,
+                line_count: lineInfo?.truncated ? `${lineCount}+` : lineCount,
+                huge_threshold_lines: DEVELOPMENT_HUGE_FILE_LINES,
+                recommended_action:
+                  "This file is not above the huge-file threshold. Use normal focused modularity rules unless the user explicitly asked for refactoring.",
+              }),
+            },
+          ],
+        };
+      }
+
+      let targetDir = args.target_dir;
+      if (targetDir) {
+        targetDir = resolveProjectPathUnderRoot(targetDir, { allowRoot: true }).dbFilePath;
+      }
+      const plan = buildLargeFileSplitPlan({
+        filePath: resolved.dbFilePath,
+        absPath: resolved.absPath,
+        intent: args.intent,
+        targetDir,
+        maxModules: args.max_modules,
+      });
+
+      logActivity("plan_large_file_split", {
+        file_path: plan.file_path,
+        line_count: plan.line_count,
+        target_dir: plan.target_dir,
+        modules: plan.modules.map((m) => m.module),
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: toolCompactOrJson("plan_large_file_split", plan, compactLargeFileSplitPlanText(plan), args.format),
+          },
+        ],
+      };
+    }
+
+    if (toolName === "record_large_file_split") {
+      const args = RecordLargeFileSplitArgsSchema.parse(rawArgs);
+      flushPendingChangeBuffer();
+      const normalizedFile = normalizeToDbPath(args.file);
+      const active = getActiveRequirementStmt.get() as RequirementRow | undefined;
+      const modules = (args.modules ?? []).map(normalizeToDbPath);
+      const content = [
+        `Huge-file mechanical modularization ${args.status}: ${normalizedFile}`,
+        "",
+        args.summary,
+        modules.length ? `\nModules:\n${modules.map((m) => `- ${m}`).join("\n")}` : "",
+        args.remaining_lines != null ? `\nRemaining lines: ${args.remaining_lines}` : "",
+      ].filter(Boolean).join("\n");
+      const meta = {
+        tags: ["large-file-split", "mechanical-modularization"],
+        file: normalizedFile,
+        status: args.status,
+        modules,
+        remaining_lines: args.remaining_lines ?? null,
+        active_requirement_id: active?.id ?? null,
+      };
+      const info = insertMemoryItemStmt.run(
+        "note",
+        `large-file-split:${normalizedFile}:${args.status}`,
+        content,
+        normalizedFile,
+        null,
+        null,
+        active?.id ?? null,
+        safeJson(meta),
+        sha256Hex(content),
+      );
+      const id = Number(info.lastInsertRowid);
+      enqueueEmbedding(id);
+      logActivity("record_large_file_split", {
+        memory_item_id: id,
+        file_path: normalizedFile,
+        status: args.status,
+        modules: modules.slice(0, 20),
+        remaining_lines: args.remaining_lines ?? null,
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: toolJson({
+              ok: true,
+              note: { id },
+              file_path: normalizedFile,
+              status: args.status,
+              modules,
+              remaining_lines: args.remaining_lines ?? null,
+            }),
           },
         ],
       };
