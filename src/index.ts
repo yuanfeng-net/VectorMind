@@ -359,7 +359,6 @@ let getEmbeddingMetaStmt: Database.Statement;
 let upsertEmbeddingStmt: Database.Statement;
 let upsertPendingChangeStmt: Database.Statement;
 let listPendingChangesStmt: Database.Statement;
-let listPendingChangesPageStmt: Database.Statement;
 let countPendingChangesStmt: Database.Statement;
 let deletePendingChangeStmt: Database.Statement;
 let deleteAllPendingChangesStmt: Database.Statement;
@@ -3185,8 +3184,6 @@ const SemanticSearchArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).
   }),
 );
 
-const ProjectRootOnlyArgsSchema = ProjectRootArgSchema;
-
 const GetTokenSavingsArgsSchema = ProjectRootArgSchema.merge(
   z.object({
     limit: z.number().int().min(1).max(100).optional().default(10),
@@ -4259,8 +4256,10 @@ const DECISION_CANDIDATE_KEYWORDS = [
   "不再",
   "改成",
   "改为",
-  "直接通过",
-  "不用审核",
+  "替换为",
+  "废弃",
+  "过时",
+  "移除旧",
   "decision",
   "decided",
   "confirmed",
@@ -6670,12 +6669,6 @@ function initDatabase(): void {
     `SELECT file_path, last_event, updated_at
      FROM pending_changes
      ORDER BY updated_at DESC`,
-  );
-  listPendingChangesPageStmt = db.prepare(
-    `SELECT file_path, last_event, updated_at
-     FROM pending_changes
-     ORDER BY updated_at DESC
-     LIMIT ? OFFSET ?`,
   );
   countPendingChangesStmt = db.prepare(`SELECT COUNT(*) as total FROM pending_changes`);
   deletePendingChangeStmt = db.prepare(

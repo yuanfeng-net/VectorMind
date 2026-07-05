@@ -87,7 +87,7 @@ args = ["-y", "@coreyuan/vector-mind"]
 ```
 
 ```text
-这是最新决定：任务申请不再需要上级审核，申请后直接通过。请写入 VectorMind，并标记旧审核需求已过时。
+这是最新决定：旧流程 A 已废弃，现在统一改为新流程 B。请写入 VectorMind，并标记旧规则已过时。
 ```
 
 ```text
