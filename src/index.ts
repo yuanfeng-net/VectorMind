@@ -2,8 +2,6 @@
 import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
-import os from "node:os";
-import { spawnSync } from "node:child_process";
 
 import chokidar, { type FSWatcher } from "chokidar";
 import Database from "better-sqlite3";
@@ -32,7 +30,6 @@ import type {
   ChangeLogRow,
   ExtractedSymbol,
   MemoryItemRow,
-  PendingChangeRow,
   RequirementRow,
   RootSource,
   SymbolRow,
@@ -64,6 +61,26 @@ import {
 } from "./project-files.js";
 import { hasUppercaseAscii, runIndexedGrepSearch, runRipgrepSearch } from "./grep.js";
 import { compactInstallRtkText, detectRtk, installRtk } from "./rtk-tools.js";
+import {
+  configurePendingChanges,
+  mergePendingWithGit,
+  prunePendingChanges,
+} from "./pending-changes.js";
+import {
+  configureEmbeddings,
+  dotProduct,
+  embedFilesMode,
+  embedModelName,
+  embeddingsEnabled,
+  enqueueEmbedding,
+  getEmbedder,
+} from "./embeddings.js";
+import {
+  configureTokenSavings,
+  tokenSavingsSummary,
+  toolCompactOrJson,
+  toolText,
+} from "./token-savings.js";
 import {
   configureFileIndexing,
   flushPendingChangeBuffer,
@@ -107,7 +124,6 @@ import {
   compactReadTextFileText,
   compactSemanticSearchText,
   compactTokenSavingsText,
-  estimateTokens,
   safeJson,
   sliceTextForOutput,
   toolJson,
@@ -153,7 +169,6 @@ import {
   UpsertConventionArgsSchema,
   UpsertDecisionArgsSchema,
   UpsertProjectSummaryArgsSchema,
-  type OutputFormat,
 } from "./tool-schemas.js";
 import {
   BOOTSTRAP_SEMANTIC_TIMEOUT_MS,
@@ -162,8 +177,6 @@ import {
   INDEX_MAX_CODE_BYTES,
   INDEX_MAX_DOC_BYTES,
   INDEX_SKIP_MINIFIED,
-  PENDING_MAX_ENTRIES,
-  PENDING_TTL_DAYS,
   ROOTS_LIST_TIMEOUT_MS,
   SEMANTIC_EMBEDDINGS_TIMEOUT_MS,
   SERVER_NAME,
@@ -260,6 +273,31 @@ configureDevelopmentWarnings({
   parseMetadataJson,
 });
 
+configureEmbeddings({
+  getMemoryItemByIdStatement: () => getMemoryItemByIdStmt,
+  getEmbeddingMetaStatement: () => getEmbeddingMetaStmt,
+  getUpsertEmbeddingStatement: () => upsertEmbeddingStmt,
+  sha256Hex,
+});
+
+configureTokenSavings({
+  getDb: () => db,
+  getInsertTokenSavingsStatement: () => insertTokenSavingsStmt,
+  getSummarizeTokenSavingsStatement: () => summarizeTokenSavingsStmt,
+  getSummarizeTokenSavingsByToolStatement: () => summarizeTokenSavingsByToolStmt,
+  getListRecentTokenSavingsStatement: () => listRecentTokenSavingsStmt,
+});
+
+configurePendingChanges({
+  getDb: () => db,
+  getProjectRoot: () => projectRoot,
+  getCountPendingChangesStatement: () => countPendingChangesStmt,
+  getDeleteOldPendingChangesStatement: () => deleteOldPendingChangesStmt,
+  getDeleteOldestPendingChangesStatement: () => deleteOldestPendingChangesStmt,
+  getFileStateHash,
+  getLatestSyncedFileHash,
+});
+
 configureMemoryMaintenance({
   getDb: () => db,
   getProjectRoot: () => projectRoot,
@@ -292,132 +330,6 @@ configureFileIndexing({
   prunePendingChanges,
 });
 
-function isProbablyGitRepository(): boolean {
-  try {
-    return fs.existsSync(path.join(projectRoot, ".git"));
-  } catch {
-    return false;
-  }
-}
-
-function normalizeGitStatusPath(raw: string): string {
-  const first = raw.split("\0")[0] ?? "";
-  return first.trim().replace(/\\/g, "/").replace(/^"(.*)"$/, "$1");
-}
-
-function collectGitPendingChanges(limit: number): PendingChangeRow[] {
-  if (limit <= 0 || !isProbablyGitRepository()) return [];
-  const git = spawnSync("git", ["status", "--porcelain=v1", "-z", "--untracked-files=normal"], {
-    cwd: projectRoot,
-    encoding: "utf8",
-    timeout: 5000,
-    windowsHide: true,
-    maxBuffer: 2_000_000,
-  });
-  if (git.error || git.status !== 0 || !git.stdout) return [];
-
-  const parts = git.stdout.split("\0").filter(Boolean);
-  const rows: PendingChangeRow[] = [];
-  for (let i = 0; i < parts.length && rows.length < limit; i++) {
-    const rec = parts[i] ?? "";
-    const status = rec.slice(0, 2);
-    let rawPath = rec.slice(3);
-    if (status.startsWith("R") || status.startsWith("C")) {
-      // Porcelain -z rename/copy records include the destination in the next NUL field.
-      rawPath = parts[i + 1] ?? rawPath;
-      i += 1;
-    }
-    const filePath = normalizeGitStatusPath(rawPath);
-    if (!filePath || filePath === ".vectormind" || filePath.startsWith(".vectormind/")) continue;
-    rows.push({
-      file_path: filePath,
-      last_event: status.includes("D") ? "unlink" : status === "??" ? "add" : "change",
-      updated_at: new Date().toISOString(),
-      source: "git",
-      git_status: status.trim() || "modified",
-      file_state_hash: getFileStateHash(filePath) ?? undefined,
-    });
-  }
-  return rows;
-}
-
-function mergePendingWithGit(
-  pending: PendingChangeRow[],
-  opts: { offset: number; limit: number },
-): { total: number; page: PendingChangeRow[]; truncated: boolean } {
-  const byPath = new Map<string, PendingChangeRow>();
-  for (const p of pending) {
-    if (shouldIgnoreDbFilePath(p.file_path)) continue;
-    byPath.set(p.file_path, { ...p, source: p.source ?? "watcher" });
-  }
-
-  const gitRows = collectGitPendingChanges(Math.max(500, opts.offset + opts.limit * 4));
-  for (const g of gitRows) {
-    const latestSyncedHash = getLatestSyncedFileHash(g.file_path);
-    if (latestSyncedHash && g.file_state_hash && latestSyncedHash === g.file_state_hash) continue;
-    const existing = byPath.get(g.file_path);
-    if (!existing) {
-      byPath.set(g.file_path, g);
-      continue;
-    }
-    byPath.set(g.file_path, {
-      ...existing,
-      source: existing.source === "watcher" ? "watcher" : g.source,
-      git_status: g.git_status,
-      file_state_hash: g.file_state_hash,
-    });
-  }
-
-  const all = Array.from(byPath.values()).sort((a, b) => {
-    const at = Date.parse(a.updated_at) || 0;
-    const bt = Date.parse(b.updated_at) || 0;
-    if (bt !== at) return bt - at;
-    return a.file_path.localeCompare(b.file_path);
-  });
-  const page = all.slice(opts.offset, opts.offset + opts.limit);
-  return { total: all.length, page, truncated: all.length > opts.offset + opts.limit };
-}
-
-function pruneIgnoredPendingChanges(): void {
-  if (!db) return;
-  try {
-    if (!IGNORED_LIKE_PATTERNS.length) return;
-    const where = IGNORED_LIKE_PATTERNS
-      .map(() => "LOWER(REPLACE(file_path, '\\\\', '/')) LIKE ?")
-      .join(" OR ");
-    db.prepare(`DELETE FROM pending_changes WHERE ${where}`).run(...IGNORED_LIKE_PATTERNS);
-  } catch (err) {
-    console.error("[vectormind] prune pending_changes failed:", err);
-  }
-}
-
-function prunePendingChanges(): void {
-  if (!db) return;
-  try {
-    const before = Number((countPendingChangesStmt.get() as { total: number } | undefined)?.total ?? 0);
-    pruneIgnoredPendingChanges();
-
-    if (PENDING_TTL_DAYS > 0) {
-      deleteOldPendingChangesStmt?.run(`-${PENDING_TTL_DAYS} days`);
-    }
-
-    if (PENDING_MAX_ENTRIES > 0) {
-      const total = Number((countPendingChangesStmt.get() as { total: number } | undefined)?.total ?? 0);
-      const overflow = total - PENDING_MAX_ENTRIES;
-      if (overflow > 0) {
-        deleteOldestPendingChangesStmt?.run(overflow);
-      }
-    }
-
-    const after = Number((countPendingChangesStmt.get() as { total: number } | undefined)?.total ?? 0);
-    if (before !== after) {
-      logActivity("pending_prune", { before, after });
-    }
-  } catch (err) {
-    console.error("[vectormind] prune pending_changes failed:", err);
-  }
-}
-
 
 function escapeLike(pattern: string): string {
   return pattern.replace(/[\\\\%_]/g, (m) => `\\${m}`);
@@ -446,201 +358,6 @@ function getLatestSyncedFileHash(dbFilePath: string): string | null {
   if (!row) return null;
   const meta = parseMetadataJson(row.metadata_json);
   return typeof meta.file_state_hash === "string" ? meta.file_state_hash : null;
-}
-
-function recordTokenSavings(tool: string, rawText: string, outputText: string): void {
-  if (!db || !insertTokenSavingsStmt) return;
-  const rawTokens = estimateTokens(rawText);
-  const outputTokens = estimateTokens(outputText);
-  const savedTokens = Math.max(0, rawTokens - outputTokens);
-  const savingsPct = rawTokens > 0 ? (savedTokens / rawTokens) * 100 : 0;
-  try {
-    insertTokenSavingsStmt.run(tool, rawTokens, outputTokens, savedTokens, savingsPct);
-  } catch (err) {
-    console.error("[vectormind] token savings record failed:", err);
-  }
-}
-
-function toolText(tool: string, rawValue: unknown, compactText: string, format: "compact" | "json" = "compact"): string {
-  const rawText = toolJson(rawValue);
-  if (format === "json") return rawText;
-  recordTokenSavings(tool, rawText, compactText);
-  return compactText;
-}
-
-function toolCompactOrJson(tool: string, rawValue: unknown, compactText: string, format: OutputFormat): string {
-  return toolText(tool, rawValue, compactText, format);
-}
-
-function tokenSavingsSummary(limit: number) {
-  const summary = summarizeTokenSavingsStmt.get() as
-    | {
-        calls: number;
-        raw_tokens: number;
-        output_tokens: number;
-        saved_tokens: number;
-        avg_savings_pct: number;
-      }
-    | undefined;
-  const by_tool = summarizeTokenSavingsByToolStmt.all(limit) as Array<{
-    tool: string;
-    calls: number;
-    raw_tokens: number;
-    output_tokens: number;
-    saved_tokens: number;
-    avg_savings_pct: number;
-  }>;
-  const recent = listRecentTokenSavingsStmt.all(limit) as Array<{
-    id: number;
-    tool: string;
-    raw_tokens: number;
-    output_tokens: number;
-    saved_tokens: number;
-    savings_pct: number;
-    created_at: string;
-  }>;
-  return {
-    ok: true,
-    summary: summary ?? { calls: 0, raw_tokens: 0, output_tokens: 0, saved_tokens: 0, avg_savings_pct: 0 },
-    by_tool,
-    recent,
-  };
-}
-
-const embeddingsEnabled = !["0", "false", "off", "disabled"].includes(
-  (process.env.VECTORMIND_EMBEDDINGS ?? "off").toLowerCase(),
-);
-const embedFilesMode = (process.env.VECTORMIND_EMBED_FILES ?? "all").toLowerCase();
-const embedModelName = process.env.VECTORMIND_EMBED_MODEL ?? "Xenova/all-MiniLM-L6-v2";
-const embedCacheDir =
-  process.env.VECTORMIND_EMBED_CACHE_DIR ??
-  path.join(os.homedir(), ".cache", "vectormind");
-const allowRemoteModels = !["0", "false", "off"].includes(
-  (process.env.VECTORMIND_ALLOW_REMOTE_MODELS ?? "true").toLowerCase(),
-);
-
-let embedderPromise:
-  | Promise<(text: string) => Promise<Float32Array>>
-  | null = null;
-
-async function getEmbedder(): Promise<(text: string) => Promise<Float32Array>> {
-  if (embedderPromise) return embedderPromise;
-
-  embedderPromise = (async () => {
-    fs.mkdirSync(embedCacheDir, { recursive: true });
-    const mod: any = await import("@xenova/transformers");
-    const env: any = mod.env;
-    if (env) {
-      if (typeof env.cacheDir === "string" || env.cacheDir === undefined) {
-        env.cacheDir = embedCacheDir;
-      }
-      if (typeof env.allowRemoteModels === "boolean" || env.allowRemoteModels === undefined) {
-        env.allowRemoteModels = allowRemoteModels;
-      }
-      if (typeof env.allowLocalModels === "boolean" || env.allowLocalModels === undefined) {
-        env.allowLocalModels = true;
-      }
-    }
-
-    const pipeline: any = mod.pipeline;
-    const extractor: any = await pipeline("feature-extraction", embedModelName);
-
-    return async (text: string): Promise<Float32Array> => {
-      const input = text.trim() || " ";
-      const out: any = await extractor(input, { pooling: "mean", normalize: true });
-
-      const data = out?.data ?? out;
-      if (data instanceof Float32Array) return data;
-      if (ArrayBuffer.isView(data)) {
-        return new Float32Array(data.buffer, data.byteOffset, data.byteLength / 4);
-      }
-      if (Array.isArray(data)) {
-        return Float32Array.from(data.flat(Infinity) as number[]);
-      }
-      if (typeof out?.tolist === "function") {
-        return Float32Array.from((out.tolist() as number[]).flat(Infinity) as number[]);
-      }
-      throw new Error("Unexpected embedding output from embedder");
-    };
-  })();
-
-  return embedderPromise;
-}
-
-function buildEmbeddingInput(item: MemoryItemRow): string {
-  const headerParts: string[] = [];
-  headerParts.push(`kind: ${item.kind}`);
-  if (item.req_id != null) headerParts.push(`req_id: ${item.req_id}`);
-  if (item.file_path) headerParts.push(`file: ${item.file_path}`);
-  if (item.start_line != null && item.end_line != null) {
-    headerParts.push(`lines: ${item.start_line}-${item.end_line}`);
-  }
-  if (item.title) headerParts.push(`title: ${item.title}`);
-
-  const body = item.content ?? "";
-  return `${headerParts.join(" | ")}\n\n${body}`.trim();
-}
-
-async function embedMemoryItemById(memoryId: number): Promise<void> {
-  if (!embeddingsEnabled) return;
-
-  const item = getMemoryItemByIdStmt.get(memoryId) as MemoryItemRow | undefined;
-  if (!item) return;
-
-  const input = buildEmbeddingInput(item);
-  const inputHash = sha256Hex(input);
-
-  const existing = getEmbeddingMetaStmt.get(memoryId) as
-    | { memory_id: number; dim: number; content_hash: string | null }
-    | undefined;
-  if (existing?.content_hash === inputHash) return;
-
-  const embedder = await getEmbedder();
-  const vector = await embedder(input);
-
-  const dim = vector.length;
-  const bytes = Buffer.from(
-    vector.buffer.slice(vector.byteOffset, vector.byteOffset + vector.byteLength),
-  );
-  upsertEmbeddingStmt.run(memoryId, dim, bytes, inputHash);
-}
-
-const embeddingQueue: number[] = [];
-const embeddingQueued = new Set<number>();
-let embeddingWorkerRunning = false;
-
-function enqueueEmbedding(memoryId: number): void {
-  if (!embeddingsEnabled) return;
-  if (embeddingQueued.has(memoryId)) return;
-  embeddingQueued.add(memoryId);
-  embeddingQueue.push(memoryId);
-  void runEmbeddingWorker();
-}
-
-async function runEmbeddingWorker(): Promise<void> {
-  if (embeddingWorkerRunning) return;
-  embeddingWorkerRunning = true;
-  try {
-    while (embeddingQueue.length) {
-      const id = embeddingQueue.shift();
-      if (id == null) break;
-      embeddingQueued.delete(id);
-      try {
-        await embedMemoryItemById(id);
-      } catch (err) {
-        console.error("[vectormind] embedding failed:", { id, err });
-      }
-    }
-  } finally {
-    embeddingWorkerRunning = false;
-  }
-}
-
-function dotProduct(a: Float32Array, b: Float32Array): number {
-  let s = 0;
-  const n = Math.min(a.length, b.length);
-  for (let i = 0; i < n; i++) s += a[i] * b[i];
-  return s;
 }
 
 type SemanticSearchMode = "embeddings" | "fts" | "like" | "token" | "hybrid";
