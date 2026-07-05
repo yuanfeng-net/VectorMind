@@ -4,6 +4,7 @@ import {
   BootstrapContextArgsSchema,
   ClearActivityLogArgsSchema,
   CompleteRequirementArgsSchema,
+  CreateCheckpointArgsSchema,
   DetectRtkArgsSchema,
   GetActivityLogArgsSchema,
   GetActivitySummaryArgsSchema,
@@ -12,8 +13,10 @@ import {
   GetTokenSavingsArgsSchema,
   GrepArgsSchema,
   InstallRtkArgsSchema,
+  ListCheckpointsArgsSchema,
   ListProjectFilesArgsSchema,
   MaintainMemoryArgsSchema,
+  MemoryTimelineArgsSchema,
   PlanLargeFileSplitArgsSchema,
   PreflightChangeScopeArgsSchema,
   PruneIndexArgsSchema,
@@ -23,6 +26,7 @@ import {
   ReadFileTextArgsSchema,
   ReadMemoryItemArgsSchema,
   RecordLargeFileSplitArgsSchema,
+  RestoreCheckpointContextArgsSchema,
   SemanticSearchArgsSchema,
   StartRequirementArgsSchema,
   SupersedeMemoryArgsSchema,
@@ -32,9 +36,77 @@ import {
   UpsertProjectSummaryArgsSchema,
 } from "./tool-schemas.js";
 
-export async function listToolDefinitions() {
+type ToolDefinition = {
+  name: string;
+  description: string;
+  inputSchema: ReturnType<typeof toJsonSchemaCompat>;
+  annotations?: {
+    title?: string;
+    readOnlyHint?: boolean;
+    destructiveHint?: boolean;
+    idempotentHint?: boolean;
+    openWorldHint?: boolean;
+  };
+  _meta?: Record<string, unknown>;
+};
+
+type ToolBehavior = {
+  tags: string[];
+  readOnlyHint: boolean;
+  idempotentHint: boolean;
+  openWorldHint?: boolean;
+};
+
+const DEFAULT_READ_ONLY_BEHAVIOR: ToolBehavior = {
+  tags: ["read_only", "advisory_only", "bounded_output"],
+  readOnlyHint: true,
+  idempotentHint: true,
+  openWorldHint: false,
+};
+
+const TOOL_BEHAVIOR: Record<string, ToolBehavior> = {
+  start_requirement: { tags: ["write_memory", "requirement_boundary", "advisory_only"], readOnlyHint: false, idempotentHint: false },
+  sync_change_intent: { tags: ["write_memory", "change_intent", "advisory_only"], readOnlyHint: false, idempotentHint: false },
+  record_large_file_split: { tags: ["write_memory", "large_file_tracking", "advisory_only"], readOnlyHint: false, idempotentHint: false },
+  complete_requirement: { tags: ["write_memory", "requirement_lifecycle", "advisory_only"], readOnlyHint: false, idempotentHint: false },
+  clear_activity_log: { tags: ["diagnostic_state", "non_project_memory"], readOnlyHint: false, idempotentHint: true },
+  install_rtk: { tags: ["optional_setup", "dry_run_by_default"], readOnlyHint: false, idempotentHint: false, openWorldHint: true },
+  upsert_project_summary: { tags: ["write_memory", "project_summary", "advisory_only"], readOnlyHint: false, idempotentHint: true },
+  add_note: { tags: ["write_memory", "project_note", "advisory_only"], readOnlyHint: false, idempotentHint: false },
+  upsert_decision: { tags: ["write_memory", "current_decision", "advisory_only"], readOnlyHint: false, idempotentHint: true },
+  supersede_memory: { tags: ["write_memory", "stale_memory_control", "advisory_only"], readOnlyHint: false, idempotentHint: false },
+  upsert_convention: { tags: ["write_memory", "project_convention", "advisory_only"], readOnlyHint: false, idempotentHint: true },
+  maintain_memory: { tags: ["memory_maintenance", "dry_run_by_default", "advisory_only"], readOnlyHint: false, idempotentHint: false },
+  prune_index: { tags: ["index_maintenance", "dry_run_by_default", "advisory_only"], readOnlyHint: false, idempotentHint: false },
+  create_checkpoint: { tags: ["write_memory", "checkpoint", "advisory_only"], readOnlyHint: false, idempotentHint: false },
+  restore_checkpoint_context: { tags: ["read_only", "checkpoint_context", "advisory_only"], readOnlyHint: true, idempotentHint: true },
+};
+
+function withToolBehavior(tool: ToolDefinition): ToolDefinition {
+  const behavior = TOOL_BEHAVIOR[tool.name] ?? DEFAULT_READ_ONLY_BEHAVIOR;
   return {
-    tools: [
+    ...tool,
+    annotations: {
+      title: tool.name,
+      readOnlyHint: behavior.readOnlyHint,
+      destructiveHint: false,
+      idempotentHint: behavior.idempotentHint,
+      openWorldHint: behavior.openWorldHint ?? false,
+    },
+    _meta: {
+      ...tool._meta,
+      "vectormind/behavior": {
+        tags: behavior.tags,
+        advisory_only: true,
+        does_not_control_model_reasoning: true,
+        does_not_control_host_runtime: true,
+      },
+    },
+  };
+}
+
+export async function listToolDefinitions() {
+  const tools: ToolDefinition[] = [
       {
         name: "start_requirement",
         description:
@@ -204,6 +276,30 @@ export async function listToolDefinitions() {
         inputSchema: toJsonSchemaCompat(SemanticSearchArgsSchema),
       },
       {
+        name: "memory_timeline",
+        description:
+          "Read-only timeline around a memory item, requirement, file, timestamp, or query. Use this to understand what happened before/after a decision without letting old context override newer observed facts.",
+        inputSchema: toJsonSchemaCompat(MemoryTimelineArgsSchema),
+      },
+      {
+        name: "create_checkpoint",
+        description:
+          "Create a local context checkpoint/waypoint for long sessions. Stores a compact snapshot of active requirement, current decisions, recent memory, and pending changes. It is context evidence only and does not affect model reasoning or active client state.",
+        inputSchema: toJsonSchemaCompat(CreateCheckpointArgsSchema),
+      },
+      {
+        name: "list_checkpoints",
+        description:
+          "List local context checkpoints with bounded output. Use before restoring a long-session waypoint.",
+        inputSchema: toJsonSchemaCompat(ListCheckpointsArgsSchema),
+      },
+      {
+        name: "restore_checkpoint_context",
+        description:
+          "Read-only restore of checkpoint context. Returns the saved snapshot but does not mutate requirements, files, runtime state, or model decisions.",
+        inputSchema: toJsonSchemaCompat(RestoreCheckpointContextArgsSchema),
+      },
+      {
         name: "maintain_memory",
         description:
           "Compact old completed memory and prune stale/noisy indexes to keep long-lived large projects fast. Defaults to dry_run=true; automatic safe maintenance also runs periodically.",
@@ -215,6 +311,8 @@ export async function listToolDefinitions() {
           "Prune noisy auto-indexed items (code_chunk/doc_chunk + symbols). Useful after tightening ignore rules to shrink the index and improve search relevance.",
         inputSchema: toJsonSchemaCompat(PruneIndexArgsSchema),
       },
-    ],
+    ];
+  return {
+    tools: tools.map(withToolBehavior),
   };
 }

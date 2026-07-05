@@ -126,12 +126,38 @@ async function main() {
     "maintain_memory",
     "plan_large_file_split",
     "record_large_file_split",
+    "memory_timeline",
+    "create_checkpoint",
+    "list_checkpoints",
+    "restore_checkpoint_context",
   ]) {
     if (!toolList.tools.some((t) => t.name === toolName)) {
       console.error(`\n[smoke] expected tool list to include ${toolName}`);
       process.exitCode = 1;
       return;
     }
+  }
+  try {
+    const byName = new Map(toolList.tools.map((t) => [t.name, t]));
+    const timelineTool = byName.get("memory_timeline");
+    const checkpointTool = byName.get("create_checkpoint");
+    const restoreTool = byName.get("restore_checkpoint_context");
+    if (timelineTool?.annotations?.readOnlyHint !== true) {
+      throw new Error("expected memory_timeline to be annotated readOnlyHint=true");
+    }
+    if (checkpointTool?.annotations?.readOnlyHint !== false) {
+      throw new Error("expected create_checkpoint to be annotated readOnlyHint=false");
+    }
+    if (restoreTool?.annotations?.readOnlyHint !== true) {
+      throw new Error("expected restore_checkpoint_context to be annotated readOnlyHint=true");
+    }
+    if (!timelineTool?._meta?.["vectormind/behavior"]?.advisory_only) {
+      throw new Error("expected tool behavior metadata to mark tools advisory_only");
+    }
+  } catch (err) {
+    console.error("\n[smoke] tool behavior annotations check failed:", err);
+    process.exitCode = 1;
+    return;
   }
 
   const bootStart = Date.now();
@@ -211,6 +237,7 @@ async function main() {
     );
     for (const key of [
       "builtin:development_guideline_scope",
+      "builtin:model_autonomy_floor",
       "builtin:plan_lite_trigger_scope",
       "builtin:destructive_operation_scope",
       "builtin:architecture_boundary_first",
@@ -236,6 +263,15 @@ async function main() {
   try {
     if (!serverInstructions?.includes("Development guideline scope")) {
       throw new Error("expected server instructions to state development-guideline scope");
+    }
+    if (!serverInstructions?.includes("VectorMind autonomy floor")) {
+      throw new Error("expected server instructions to state autonomy floor");
+    }
+    if (!serverInstructions?.includes("newer/direct evidence wins over stale memory")) {
+      throw new Error("expected server instructions to keep model-judgment evidence priority");
+    }
+    if (serverInstructions?.includes("trust the tool output")) {
+      throw new Error("expected server instructions to avoid tool-output-over-model wording");
     }
     if (!serverInstructions?.includes("Required VectorMind call chain for development work:")) {
       throw new Error("expected server instructions to include required VectorMind call chain");
@@ -263,6 +299,9 @@ async function main() {
       "supersede_memory({ project_root",
       "query_codebase({ project_root",
       "semantic_search({ project_root",
+      "memory_timeline({ project_root",
+      "create_checkpoint({ project_root",
+      "restore_checkpoint_context({ project_root",
       "maintain_memory({ project_root",
     ]) {
       if (!serverInstructions?.includes(projectRootExample)) {

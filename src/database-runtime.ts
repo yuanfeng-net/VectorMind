@@ -31,8 +31,6 @@ export type PreparedDatabaseStatements = {
   listCurrentDecisionsStmt: Database.Statement;
   upsertProjectSummaryStmt: Database.Statement;
   getProjectSummaryStmt: Database.Statement;
-  listRecentNotesStmt: Database.Statement;
-  listRecentContextItemsStmt: Database.Statement;
   getLatestChangeIntentForFileStmt: Database.Statement;
   deleteFileChunkItemsStmt: Database.Statement;
   upsertPendingChangeStmt: Database.Statement;
@@ -87,8 +85,6 @@ let getDecisionByKeyStmt: Database.Statement;
 let listCurrentDecisionsStmt: Database.Statement;
 let upsertProjectSummaryStmt: Database.Statement;
 let getProjectSummaryStmt: Database.Statement;
-let listRecentNotesStmt: Database.Statement;
-let listRecentContextItemsStmt: Database.Statement;
 let getLatestChangeIntentForFileStmt: Database.Statement;
 let deleteFileChunkItemsStmt: Database.Statement;
 let upsertPendingChangeStmt: Database.Statement;
@@ -479,20 +475,6 @@ export function openDatabaseRuntime(projectRoot: string): DatabaseRuntime {
      WHERE kind = 'project_summary'
      LIMIT 1`,
   );
-  listRecentNotesStmt = db.prepare(
-    `SELECT id, kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at
-     FROM memory_items
-     WHERE kind = 'note'
-     ORDER BY updated_at DESC, id DESC
-     LIMIT ?`,
-  );
-  listRecentContextItemsStmt = db.prepare(
-    `SELECT id, kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at
-     FROM memory_items
-     WHERE kind IN ('note', 'requirement', 'change_intent')
-     ORDER BY updated_at DESC, id DESC
-     LIMIT ?`,
-  );
   getLatestChangeIntentForFileStmt = db.prepare(
     `SELECT id, kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at
      FROM memory_items
@@ -632,8 +614,6 @@ export function openDatabaseRuntime(projectRoot: string): DatabaseRuntime {
     listCurrentDecisionsStmt,
     upsertProjectSummaryStmt,
     getProjectSummaryStmt,
-    listRecentNotesStmt,
-    listRecentContextItemsStmt,
     getLatestChangeIntentForFileStmt,
     deleteFileChunkItemsStmt,
     upsertPendingChangeStmt,

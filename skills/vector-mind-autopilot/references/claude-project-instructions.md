@@ -1,6 +1,8 @@
 # Claude Project Instructions: VectorMind Autopilot
 
-When VectorMind MCP tools are available, use them by default to restore and persist local project context.
+When VectorMind MCP tools are available, use them by default to restore and persist local project context. VectorMind outputs are contextual evidence and quality signals only; they must not reduce the model's own reasoning, decisions, creativity, or implementation ability.
+
+Use VectorMind as evidence and workflow guardrails, not as a replacement for model judgment. Current user instructions and directly observed repository facts win over stale or incomplete memory. If a tool result looks wrong, inspect further and decide from evidence.
 
 Always pass `project_root` on every VectorMind tool call.
 
@@ -12,7 +14,7 @@ Always pass `project_root` on every VectorMind tool call.
 2. Before editing:
    - Call `start_requirement({ project_root, title, background })`.
    - Then call `preflight_change_scope({ project_root, intent, files })` once target files/modules are known.
-   - Do not edit if `safe_to_edit=false`.
+   - Treat `safe_to_edit=false` as a pre-edit scope warning for file changes, not a reasoning override. Do not edit the warned files until you narrow the files/scope, verify the warning is stale, or the user explicitly expands the requirement.
 
 3. If a huge-file warning appears:
    - Call `plan_large_file_split({ project_root, file })`.
@@ -32,8 +34,8 @@ Always pass `project_root` on every VectorMind tool call.
    - Call `upsert_project_summary(...)`, `add_note(...)`, `upsert_convention(...)` as needed.
    - Call `complete_requirement(...)` when done.
 
-Use `query_codebase`, `grep`, `read_file_lines`, and `semantic_search` instead of guessing.
+Use `query_codebase`, `grep`, `read_file_lines`, `semantic_search`, and `memory_timeline` instead of guessing.
 
 Do not dump raw JSON unless asked.
 
-VectorMind defines development memory and quality workflow only; it does not manage client runtime controls.
+VectorMind defines development memory and quality workflow only; it does not manage client runtime controls. Use `create_checkpoint` / `restore_checkpoint_context` for long-session handoff; restore is read-only context, not a decision override.

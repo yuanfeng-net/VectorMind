@@ -324,6 +324,50 @@ export const SemanticSearchArgsSchema = ProjectRootArgSchema.merge(OutputFormatS
   }),
 );
 
+export const MemoryTimelineArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
+  z.object({
+    memory_id: z.number().int().positive().optional(),
+    req_id: z.number().int().positive().optional(),
+    file: z.string().min(1).optional(),
+    query: z.string().min(1).optional(),
+    around_time: z.string().min(1).optional(),
+    window: z.number().int().min(1).max(100).optional().default(20),
+    include_hidden: z.boolean().optional().default(false),
+    include_content: z.boolean().optional().default(false),
+    preview_chars: z.number().int().min(50).max(10_000).optional().default(DEFAULT_PREVIEW_CHARS),
+    content_max_chars: z.number().int().min(0).max(200_000).optional().default(DEFAULT_CONTENT_MAX_CHARS),
+  }),
+);
+
+export const CreateCheckpointArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
+  z.object({
+    title: z.string().min(1),
+    summary: z.string().optional().default(""),
+    recent_limit: z.number().int().min(0).max(50).optional().default(10),
+    pending_limit: z.number().int().min(0).max(MAX_PENDING_LIMIT).optional().default(DEFAULT_PENDING_LIMIT),
+  }),
+);
+
+export const ListCheckpointsArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
+  z.object({
+    offset: z.number().int().min(0).optional().default(0),
+    limit: z.number().int().min(1).max(100).optional().default(20),
+    include_content: z.boolean().optional().default(false),
+    preview_chars: z.number().int().min(50).max(10_000).optional().default(DEFAULT_PREVIEW_CHARS),
+    content_max_chars: z.number().int().min(0).max(200_000).optional().default(DEFAULT_CONTENT_MAX_CHARS),
+  }),
+);
+
+export const RestoreCheckpointContextArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
+  z.object({
+    checkpoint_id: z.number().int().positive().optional(),
+    title: z.string().min(1).optional(),
+    include_content: z.boolean().optional().default(false),
+    preview_chars: z.number().int().min(50).max(10_000).optional().default(DEFAULT_PREVIEW_CHARS),
+    content_max_chars: z.number().int().min(0).max(200_000).optional().default(DEFAULT_CONTENT_MAX_CHARS),
+  }),
+);
+
 export const GetTokenSavingsArgsSchema = ProjectRootArgSchema.merge(
   z.object({
     limit: z.number().int().min(1).max(100).optional().default(10),

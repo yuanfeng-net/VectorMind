@@ -9,6 +9,7 @@ import { handleBootstrapContext, handleGetBrainDump, handleReadMemoryItem, handl
 import { handleGrep, handleListProjectFiles, handleReadFileText, handleReadCodexTextFile, handleReadFileLines, handleQueryCodebase } from "./tool-handlers/files.js";
 import { handleUpsertProjectSummary, handleAddNote, handleUpsertDecision, handleSupersedeMemory, handleUpsertConvention } from "./tool-handlers/notes-decisions.js";
 import { handleGetActivityLog, handleGetActivitySummary, handleClearActivityLog, handleDetectRtk, handleInstallRtk, handleGetTokenSavings } from "./tool-handlers/diagnostics.js";
+import { handleCreateCheckpoint, handleListCheckpoints, handleMemoryTimeline, handleRestoreCheckpointContext } from "./tool-handlers/context-recovery.js";
 
 export type { ToolHandlerContext } from "./tool-handlers/context.js";
 const TOOL_HANDLERS: Record<string, ToolHandler> = {
@@ -42,6 +43,10 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
   supersede_memory: handleSupersedeMemory,
   upsert_convention: handleUpsertConvention,
   semantic_search: handleSemanticSearch,
+  memory_timeline: handleMemoryTimeline,
+  create_checkpoint: handleCreateCheckpoint,
+  list_checkpoints: handleListCheckpoints,
+  restore_checkpoint_context: handleRestoreCheckpointContext,
 };
 export function registerToolHandlers(server: Server, context: ToolHandlerContext): void {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {

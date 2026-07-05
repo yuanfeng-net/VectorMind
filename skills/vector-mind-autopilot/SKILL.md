@@ -9,7 +9,11 @@ Use this skill for coding work when VectorMind MCP is configured.
 
 ## Goal
 
-Make the assistant restore and persist project context locally so long-running development work has less context loss, less scope drift, and fewer stale-rule regressions.
+Make the assistant restore and persist project context locally so long-running development work has less context loss, less scope drift, and fewer stale-rule regressions. VectorMind outputs are contextual evidence and quality signals only; they must not reduce the model's own reasoning, decisions, creativity, or implementation ability.
+
+## Autonomy floor
+
+Use VectorMind as evidence and workflow guardrails, not as a replacement for model judgment. Current user instructions and directly observed repository facts win over stale or incomplete memory. If a tool result looks wrong, inspect further and decide from evidence.
 
 ## Hard rule: always pass `project_root`
 
@@ -60,7 +64,7 @@ Once planned files/modules are known, call:
 preflight_change_scope({ project_root, intent, files })
 ```
 
-Do not edit until `safe_to_edit=true`. If it returns `safe_to_edit=false`, narrow the files or scope first.
+Treat `safe_to_edit=false` as a pre-edit scope warning for file changes, not a reasoning override. Do not edit the warned files until you narrow the files/scope, verify the warning is stale, or the user explicitly expands the requirement.
 
 ### 3. Huge files
 
@@ -96,6 +100,8 @@ For durable context:
 - `add_note(...)`
 - `upsert_convention(...)`
 - `complete_requirement(...)` when done
+- `create_checkpoint(...)` before long-session handoff or heavy compaction
+- `restore_checkpoint_context(...)` to read checkpoint context back without mutating active state
 
 ## Code search and reading
 
@@ -103,6 +109,7 @@ For durable context:
 - Use `grep({ project_root, query })` for exact text matches.
 - Use `read_file_lines(...)` or `read_file_text(...)` for bounded reads.
 - Use `semantic_search(...)` for prior requirements, decisions, notes, code chunks, and docs.
+- Use `memory_timeline(...)` to understand the order of related requirements, decisions, notes, and changes.
 - Use `read_memory_item(...)` for full text only when needed.
 
 ## Maintenance

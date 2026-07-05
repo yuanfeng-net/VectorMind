@@ -328,6 +328,101 @@ export async function runMemoryRecallCases(ctx) {
     return;
   }
 
+  const timeline = await client.callTool({
+    name: "memory_timeline",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      query: token,
+      window: 10,
+      format: "json",
+    },
+  });
+  console.log("\n--- memory_timeline ---\n");
+  const timelineText = readText(timeline);
+  console.log(timelineText);
+  try {
+    const parsed = JSON.parse(timelineText);
+    if (parsed?.ok !== true || !Array.isArray(parsed?.items)) {
+      throw new Error("expected memory_timeline to return items");
+    }
+    if (!JSON.stringify(parsed.items).includes(token)) {
+      throw new Error("expected memory_timeline to include the smoke token");
+    }
+  } catch (err) {
+    console.error("\n[smoke] memory_timeline check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const checkpoint = await client.callTool({
+    name: "create_checkpoint",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      title: "smoke-checkpoint",
+      summary: `Checkpoint token ${token}`,
+      format: "json",
+    },
+  });
+  console.log("\n--- create_checkpoint ---\n");
+  const checkpointText = readText(checkpoint);
+  console.log(checkpointText);
+  let checkpointId = 0;
+  try {
+    const parsed = JSON.parse(checkpointText);
+    checkpointId = Number(parsed?.checkpoint?.id ?? 0);
+    if (parsed?.ok !== true || checkpointId <= 0) {
+      throw new Error("expected create_checkpoint to return checkpoint id");
+    }
+    if (parsed?.snapshot?.note && !String(parsed.snapshot.note).includes("does not mutate")) {
+      throw new Error("expected checkpoint snapshot to be advisory-only context");
+    }
+  } catch (err) {
+    console.error("\n[smoke] create_checkpoint check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const checkpoints = await client.callTool({
+    name: "list_checkpoints",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      limit: 5,
+    },
+  });
+  console.log("\n--- list_checkpoints ---\n");
+  const checkpointsText = readText(checkpoints);
+  console.log(checkpointsText);
+  if (!checkpointsText.includes("checkpoints returned=") || !checkpointsText.includes("smoke-checkpoint")) {
+    console.error("\n[smoke] expected list_checkpoints compact output to include smoke-checkpoint");
+    process.exitCode = 1;
+    return;
+  }
+
+  const restored = await client.callTool({
+    name: "restore_checkpoint_context",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      checkpoint_id: checkpointId,
+      format: "json",
+    },
+  });
+  console.log("\n--- restore_checkpoint_context ---\n");
+  const restoredText = readText(restored);
+  console.log(restoredText);
+  try {
+    const parsed = JSON.parse(restoredText);
+    if (parsed?.ok !== true || parsed?.read_only !== true || parsed?.checkpoint?.id !== checkpointId) {
+      throw new Error("expected restore_checkpoint_context to read checkpoint without mutation");
+    }
+    if (!JSON.stringify(parsed?.snapshot ?? {}).includes(token)) {
+      throw new Error("expected restored checkpoint snapshot to include smoke token");
+    }
+  } catch (err) {
+    console.error("\n[smoke] restore_checkpoint_context check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
   const completeActive = await client.callTool({
     name: "complete_requirement",
     arguments: {

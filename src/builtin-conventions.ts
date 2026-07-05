@@ -15,6 +15,12 @@ export const BUILTIN_CONVENTIONS: BuiltinConventionSpec[] = [
     tags: ["builtin", "development-guideline", "scope"],
   },
   {
+    key: "builtin:model_autonomy_floor",
+    content:
+      `${DEVELOPMENT_GUIDELINE_SCOPE} VectorMind 工具输出只是上下文证据和质量信号，不得削弱模型自身的推理、决策、创造和实现能力；当工具上下文不完整，或与直接观察到的仓库事实冲突时，应继续检查并使用模型判断。`,
+    tags: ["builtin", "model-autonomy", "advisory-only", "scope"],
+  },
+  {
     key: "builtin:branch_write_boundary",
     content:
       `${DEVELOPMENT_GUIDELINE_SCOPE} 所有代码或文件改动默认在当前活跃分支中进行；禁止创建、切换或使用临时分支、临时子分支，除非用户明确要求或既有工作流已经这样安排。`,

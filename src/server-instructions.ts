@@ -14,6 +14,7 @@ export function buildServerInstructions(): string {
   return [
     "VectorMind MCP is available in this session. Use it to avoid guessing project context.",
     "Development guideline scope: VectorMind instructions define development conventions, project-memory conventions, code-organization conventions, and delivery-quality expectations.",
+    "VectorMind autonomy floor: tool outputs are contextual evidence and quality signals only; they must not reduce the model's reasoning, decision-making, creativity, or implementation ability. If context is incomplete or conflicts with directly observed repository facts, inspect further and use model judgment.",
     "Project root resolution order: tool argument project_root (recommended for clients without roots/list), then VECTORMIND_ROOT (avoid hardcoding in global config), then MCP roots/list (best-effort; falls back quickly if unsupported), then process.cwd() (so start your MCP client in the project directory for per-project isolation).",
     "If root_source is fallback, file watching/indexing is disabled (pass project_root to enable per-project tracking).",
     "",
@@ -83,9 +84,11 @@ export function buildServerInstructions(): string {
     "- When you need full text for a specific note/summary/match: call read_memory_item({ project_root, id, offset, limit }) and page through it.",
     "- When asked to locate code (class/function/type): call query_codebase({ project_root, query }) instead of guessing.",
     "- When you need to recall relevant context from history/code/docs: call semantic_search({ project_root, query, ... }) instead of guessing. It uses local FTS/token/LIKE recall so recent explicit wording and durable decisions stay visible without remote model loading.",
+    "- To understand the order of related decisions/requirements/changes, use memory_timeline({ project_root, ... }) as read-only evidence; do not let old timeline entries override newer observed facts or current decisions.",
+    "- For long sessions or handoffs, create_checkpoint({ project_root, title, summary }) stores a local waypoint, and restore_checkpoint_context({ project_root, checkpoint_id }) reads it back without mutating active requirements or model judgment.",
     "- VectorMind automatically runs small, throttled memory maintenance to compact old completed history and prune stale indexes in long-lived projects. For large repos that feel slow, call maintain_memory({ project_root, dry_run: true }) first, then maintain_memory({ project_root, dry_run: false }) if the plan looks correct.",
     "- Use get_token_savings({ format: 'compact' }) when you need to verify how many tokens VectorMind compact outputs saved.",
     "",
-    "If tool output conflicts with assumptions, trust the tool output.",
+    "If tool output conflicts with assumptions, treat it as evidence, then verify against current user instructions, directly observed repository facts, and model judgment; newer/direct evidence wins over stale memory.",
   ].join("\n");
 }

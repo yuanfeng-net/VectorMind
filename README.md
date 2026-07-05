@@ -4,7 +4,7 @@ VectorMind 是给 AI 编程助手用的本地项目记忆 MCP。
 
 它会把“当前在做什么、为什么这样改、哪些决策已经更新、哪些文件不能乱动”保存到项目本地，帮助 AI 在长期开发里少丢上下文、少猜路径、少把旧功能改回来。
 
-当前版本：`1.0.50`
+当前版本：`1.0.51`
 
 ## 它能做什么
 
@@ -12,6 +12,8 @@ VectorMind 是给 AI 编程助手用的本地项目记忆 MCP。
 - **守住需求边界**：修改前先确认当前需求和计划文件，减少乱改无关模块。
 - **记录改动原因**：改完后保存“改了什么、为什么改”，后续会话能接上。
 - **让新决策覆盖旧记忆**：需求反转或规则更新后，可以标记旧记忆过时，避免 AI 按旧规则回退功能。
+- **查看上下文时间线**：按需求、文件、记忆或关键词查看前后发生了什么，帮助判断新旧关系。
+- **保存会话检查点**：长会话或交接前保存 waypoint，后续只读恢复上下文，不改变模型判断。
 - **沉淀项目知识**：保存架构说明、构建命令、命名规则、注意事项和 TODO。
 - **定位代码和搜索文本**：帮 AI 找函数、类、配置、关键逻辑，不靠猜。
 - **安全读取文件**：按目录、按行、按大小读取，避免一次塞入过多上下文。
@@ -47,6 +49,8 @@ VectorMind 是给 AI 编程助手用的本地项目记忆 MCP。
 ## 它不做什么
 
 VectorMind 只定义开发规范、记忆和质量约束。
+
+它的输出只是上下文证据和质量信号，不替模型做决定，不削弱模型自己的推理、判断、创造和实现能力。
 
 它不接管 Codex、Claude 或其他客户端的运行控制，也不处理客户端自己的确认弹窗、执行策略或访问设置。
 
@@ -118,6 +122,7 @@ args = ["-y", "@coreyuan/vector-mind"]
 | 改动记录 | `sync_change_intent`, `get_pending_changes` |
 | 决策更新 | `upsert_decision`, `supersede_memory` |
 | 项目知识 | `upsert_project_summary`, `add_note`, `upsert_convention` |
+| 时间线/检查点 | `memory_timeline`, `create_checkpoint`, `list_checkpoints`, `restore_checkpoint_context` |
 | 代码定位 | `query_codebase`, `grep` |
 | 读项目文件 | `list_project_files`, `read_file_lines`, `read_file_text` |
 | 读 Codex 文本 | `read_codex_text_file` |

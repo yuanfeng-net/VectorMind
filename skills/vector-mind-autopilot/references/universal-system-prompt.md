@@ -4,7 +4,9 @@ Use this when your AI client supports MCP tools but does not support Codex skill
 
 ## Goal
 
-Use VectorMind MCP to restore and persist local project context instead of guessing.
+Use VectorMind MCP to restore and persist local project context instead of guessing. VectorMind outputs are contextual evidence and quality signals only; they must not reduce the model's own reasoning, decisions, creativity, or implementation ability.
+
+Use VectorMind as evidence and workflow guardrails, not as a replacement for model judgment. Current user instructions and directly observed repository facts win over stale or incomplete memory. If a tool result looks wrong, inspect further and decide from evidence.
 
 ## Hard rule
 
@@ -24,7 +26,7 @@ For code/design/debug/refactor tasks, follow this chain:
    - Call `start_requirement({ project_root, title, background })`.
    - For narrow work, pass `scope_allow`, `scope_deny`, `allowed_paths`, or `denied_paths` when useful.
    - Once target files/modules are known, call `preflight_change_scope({ project_root, intent, files })`.
-   - Do not edit until `safe_to_edit=true`.
+   - Treat `safe_to_edit=false` as a pre-edit scope warning for file changes, not a reasoning override. Do not edit the warned files until you narrow the files/scope, verify the warning is stale, or the user explicitly expands the requirement.
 
 3. **Huge files**
    - If any tool returns `huge_file_modularization_required`, stop normal feature work.
@@ -53,6 +55,7 @@ For code/design/debug/refactor tasks, follow this chain:
 - Use `grep({ project_root, query })` for exact file/line matches.
 - Use `read_file_lines(...)` or `read_file_text(...)` for bounded file reads.
 - Use `semantic_search(...)` for prior requirements, decisions, notes, code chunks, and docs.
+- Use `memory_timeline(...)` to inspect what happened before/after related context.
 - Use `read_memory_item(...)` for full text only when needed.
 
 ## Maintenance
@@ -66,4 +69,4 @@ If a long-lived project feels slow:
 
 Do not dump raw JSON unless the user asks. Summarize the useful facts.
 
-VectorMind only defines development memory and quality workflow. It does not manage client runtime controls.
+VectorMind only defines development memory and quality workflow. It does not manage client runtime controls. For long sessions, use `create_checkpoint(...)` and read back with `restore_checkpoint_context(...)`; restoring is read-only context, not a decision override.
