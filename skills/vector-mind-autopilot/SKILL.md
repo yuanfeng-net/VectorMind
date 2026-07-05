@@ -1,126 +1,134 @@
 ---
 name: vector-mind-autopilot
-description: "Automatically apply the VectorMind MCP workflow (local requirement-driven memory) and ALWAYS pass project_root in every VectorMind tool call (critical for Codex VS Code plugin where cwd/roots may be wrong): bootstrap_context on session start, start_requirement before edits, sync_change_intent after saves, and semantic_search/query_codebase instead of guessing. Use for coding work when VectorMind MCP is configured."
+description: "Automatically apply the VectorMind MCP workflow for local requirement-driven memory. Always pass project_root in every VectorMind tool call: bootstrap_context on session start, start_requirement and preflight_change_scope before edits, sync_change_intent after edits, and semantic_search/query_codebase instead of guessing."
 ---
 
-# VectorMind Autopilot (MCP)
+# VectorMind Autopilot
+
+Use this skill for coding work when VectorMind MCP is configured.
 
 ## Goal
 
-Make the assistant use VectorMind MCP by default so project context, intent, and progress are restored and persisted locally without the user manually asking for MCP calls.
+Make the assistant restore and persist project context locally so long-running development work has less context loss, less scope drift, and fewer stale-rule regressions.
 
-## Hard Rule: Always include `project_root`
+## Hard rule: always pass `project_root`
 
-In many clients (especially the **Codex VS Code plugin**), the MCP server process may start with an unrelated `cwd` (e.g. `C:\\Windows\\System32`) and without `roots/list`. In that case VectorMind will fall back to the VS Code User directory, which breaks per-project isolation.
+Always include `project_root` on every VectorMind tool call.
 
-Therefore:
+Why: some clients start MCP servers from unrelated folders. Passing `project_root` keeps each project isolated under:
 
-- **Always pass `project_root` on every VectorMind tool call** (including `bootstrap_context`, `get_brain_dump`, `get_pending_changes`, etc.).
-- Reuse the same `project_root` consistently within the same task.
-- If you switch to a different project in the same chat, pass the new `project_root` on the next tool call (VectorMind can re-bind per call).
+```text
+<project>/.vectormind/
+```
 
-### How to choose `project_root` (best-effort)
+## How to choose `project_root`
 
-1) If the user mentions a project path explicitly, use that exact directory.
-2) Otherwise, infer it from the **active file / open tabs paths** in the conversation context:
-   - Prefer the workspace folder that contains the files being discussed.
-   - If you can inspect local project files, walk upward until you find a marker like `.git/` (or a root file like `package.json`, `pyproject.toml`, `go.mod`, `Cargo.toml`, `*.sln`), and use that directory.
-3) Validate the choice once by calling `bootstrap_context({ project_root, query: "<goal>" })` and confirm:
-   - `root_source` is `"tool_arg"`
-   - `db_path` is under `<project_root>/.vectormind/`
+1. If the user gave a path, use it.
+2. Otherwise infer it from active files/workspace paths.
+3. If needed, walk upward to a marker like `.git`, `package.json`, `pyproject.toml`, `go.mod`, `Cargo.toml`, or `*.sln`.
+4. Validate once with `bootstrap_context({ project_root, query })`; prefer `root_source: "tool_arg"` and a `db_path` under `<project>/.vectormind/`.
 
-If you still cannot determine it confidently, ask the user for the project root path (do not guess).
+## Required call chain
 
-## Default Workflow (do this unless explicitly unnecessary)
+For development, debugging, refactoring, design, or code-change tasks:
 
-### 1) Detect VectorMind MCP availability
+### 1. Start / resume
 
-- If the tools `bootstrap_context`, `start_requirement`, and `sync_change_intent` exist, treat VectorMind as available and use it.
-- If VectorMind tools are missing or tool calls fail repeatedly, follow **Setup / Troubleshooting** and continue with best-effort reasoning (do not guess silently; tell the user what’s missing).
+Call:
 
-### 2) On every new session (or when the user says “继续/恢复/接着做”)
+```text
+bootstrap_context({ project_root, query, top_k: 5, pending_limit: 50, requirements_limit: 3, changes_limit: 5, notes_limit: 5, current_context_limit: 8, preview_chars: 200 })
+```
 
-- Unless the task is purely execution-first (for example compile/build/run/launch/package/publish/test rerun with already-known targets), call `bootstrap_context({ project_root: <PROJECT_ROOT>, query: <the user's current goal>, top_k: 5 })` first.
-  - Prefer keeping tool output small by default: `pending_limit: 50`, `requirements_limit: 3`, `changes_limit: 5`, `notes_limit: 5`, `current_context_limit: 8`, `preview_chars: 200`.
-  - Avoid `include_content: true` unless you truly need full text (it increases tokens).
-- Use the returned `project_summary`, `decisions`, `current_context`, `recent_notes`, `pending_changes`, and semantic `items` to ground your plan and avoid “blind guessing”.
-- Do **not** paste raw JSON unless the user asks for it (summarize key facts instead).
-- For pure execution-first tasks with explicit targets, prefer the minimum necessary shell or host tools first; only pull VectorMind retrieval tools back in when code/context lookup is actually needed to unblock execution.
+Use returned summaries, decisions, current context, notes, pending changes, and matches to ground the plan.
 
-### 3) Before editing code or files
+Skip this only for pure execution-first tasks with explicit targets, such as a known build/test/package command.
 
-- If this is a new task/feature, call `start_requirement({ project_root: <PROJECT_ROOT>, title, background })` before changing anything.
-- Prefer short, specific titles (e.g., “Add avatar upload”) and put constraints in `background` (formats, edge cases, acceptance criteria). For narrow work, pass `scope_allow` / `scope_deny` or `allowed_paths` / `denied_paths` when useful; these are project-specific boundaries, not hardcoded business rules.
-- Once you know the files/modules you intend to edit, call `preflight_change_scope({ project_root: <PROJECT_ROOT>, intent, files })` before editing. If useful, pass extra `scope_allow` / `scope_deny` or `allowed_paths` / `denied_paths` for this planned change. Do not edit until it returns `safe_to_edit=true`; if it returns `safe_to_edit=false`, narrow the files/scope first.
-- Treat the active requirement as the only change boundary. Do not add extra flows, fields, screens, APIs, or business rules the user did not ask for.
-- Do not keep adding new feature code into an already-large file. Split into focused modules/services/components when a file is taking multiple responsibilities.
-- If `preflight_change_scope`, `read_file_lines`, `grep`, `query_codebase`, `get_pending_changes`, or `sync_change_intent` returns `huge_file_modularization_required`, stop normal feature work. Call `plan_large_file_split({ project_root: <PROJECT_ROOT>, file })`, perform mechanical modularization with real module names/directories, never create generated/parts/partN files, then call `record_large_file_split(...)`.
+### 2. Before editing
 
-### 4) After editing + saving files
+Call:
 
-- Call `get_pending_changes({ project_root: <PROJECT_ROOT> })` to see what changed but isn’t yet linked to an intent.
-- Call `sync_change_intent({ project_root: <PROJECT_ROOT>, intent, files? })` to archive the “what/why” and associate the changes to the active requirement.
-  - Prefer omitting `files` to let the server auto-link all pending changes, unless you intentionally want a subset.
-  - Write `intent` as a concise, user-facing summary: what changed + why + any follow-ups.
-  - If `preflight_change_scope` returns `safe_to_edit=false`, stop before editing and narrow the plan/scope. If it returns `huge_file_modularization_required`, rerun only the split preflight with `change_mode: "mechanical_modularization"` and do the mechanical split first. Other `development_warnings` must be addressed before continuing or explicitly justified by the current requirement.
+```text
+start_requirement({ project_root, title, background })
+```
 
-### 5) When you need to find code or recall context
+For narrow tasks, pass `scope_allow`, `scope_deny`, `allowed_paths`, or `denied_paths` when useful.
 
-- If the user asks “X 在哪里定义的/哪个文件负责 Y”: call `query_codebase({ project_root: <PROJECT_ROOT>, query: "X" })` instead of guessing paths. If it warns about a huge implementation file, split it first unless the current task is only an emergency hotfix.
-- If you need an “rg -n / Select-String”-style search with exact file+line+col matches: call `grep({ project_root: <PROJECT_ROOT>, query: "<pattern>" })` first. It prefers ripgrep against real project files with built-in noise filtering, and only falls back to indexed search if ripgrep is unavailable.
-- If you need to read a specific file segment (like `Get-Content -TotalCount` / `head`): call `read_file_lines({ project_root: <PROJECT_ROOT>, path: "<file>", total_count: 240 })` or `read_file_lines({ ..., from_line, to_line })` first to keep output bounded. If it returns `large_file_read`, treat the file as a thin entry point and split new behavior into focused modules. If it returns `huge_file_modularization_required`, call `plan_large_file_split` before adding normal feature code.
-- Avoid whole-file dumps, full-repo recursive listings, or broad raw match echo in normal flow; narrow the scope first and only surface the minimum needed lines/paths.
-- Avoid editing completed or merely related features while working on a new requirement unless the current user request explicitly requires it.
-- If you need to recall prior context/notes/decisions/code/docs: call `semantic_search({ project_root: <PROJECT_ROOT>, query, top_k, kinds? })` instead of guessing.
-  - Note: `semantic_search` uses local lexical/FTS/LIKE recall; no extra vectorization service or env switch is required.
-- If you truly need full text for a specific match/note/summary, call `read_memory_item({ project_root: <PROJECT_ROOT>, id, offset, limit })` to fetch it in chunks instead of setting `include_content: true`.
-- If a large/long-lived project feels slow, call `maintain_memory({ project_root: <PROJECT_ROOT>, dry_run: true })` first, then apply with `dry_run: false` only when the plan looks safe.
+Once planned files/modules are known, call:
 
-### 6) After major milestones (or before ending the session)
+```text
+preflight_change_scope({ project_root, intent, files })
+```
 
-- Call `upsert_project_summary({ project_root: <PROJECT_ROOT>, summary })` to keep a single, up-to-date project summary.
-- Call `add_note({ project_root: <PROJECT_ROOT>, title?, content, tags? })` for durable decisions/constraints/TODOs that should survive across sessions.
-- When a user confirms a newer rule that overrides old behavior, prefer `upsert_decision({ project_root: <PROJECT_ROOT>, key, title, content, ... })` and supersede old records when possible.
-- If the user confirms a requirement is finished, call `complete_requirement({ project_root: <PROJECT_ROOT> })` so it no longer shows as active.
-- If the user states a durable project convention (framework, build command, naming rules, output paths), call `upsert_convention({ project_root: <PROJECT_ROOT>, key, content, tags? })`.
+Do not edit until `safe_to_edit=true`. If it returns `safe_to_edit=false`, narrow the files or scope first.
 
-## Output Policy (user-visible)
+### 3. Huge files
 
-- Don’t spam tool outputs. Summarize what matters (active requirement, pending changes, next steps).
-- Show raw JSON only when the user requests debugging/verification.
-- If debugging VectorMind behavior, prefer `get_activity_summary` first (small output), and only use `get_activity_log` with paging (and `verbose=true` only if necessary).
-- This skill covers VectorMind memory usage and development-quality guidance.
+If any VectorMind tool returns `huge_file_modularization_required`:
 
-## Setup / Troubleshooting
+1. Stop normal feature work.
+2. Call `plan_large_file_split({ project_root, file })`.
+3. Perform mechanical modularization with real module names/directories.
+4. Never create `*.generated.*`, `.parts`, `*.rs.parts`, or `part1/part2` fake split files.
+5. Call `record_large_file_split(...)`.
 
-### Skill changes not taking effect
+### 4. After editing
 
-- Skills are discovered at **Codex startup**; they are not hot-reloaded per message.
-- After installing/updating this skill, **restart Codex** (and in VS Code, fully restart the editor) and start a **new chat/Agent**.
-- Quick verification: the new session’s `## Skills` list should include `vector-mind-autopilot`. If it doesn’t, Codex isn’t loading it yet.
+Call:
 
-### Don’t hardcode a single project in global config
+```text
+get_pending_changes({ project_root })
+sync_change_intent({ project_root, intent, files? })
+```
 
-- If you set `[mcp_servers.vector-mind].cwd` or `env.VECTORMIND_ROOT` inside the **global** `~/.codex/config.toml`, VectorMind will be locked to that one directory and will NOT create `<project>/.vectormind/` for other projects.
-- For per-project isolation, remove those keys, restart Codex, and start Codex inside the target project directory (or use `codex -C <project>`).
-- VectorMind resolves `project_root` when the MCP server starts; switching projects in the same client process may require restarting the client/editor to re-bind to the new project.
-- As the assistant, do **not** auto-edit the user’s global config to hardcode per-project paths unless the user explicitly asks you to.
+The intent should say what changed, why, and any follow-up.
 
-### VectorMind tools are missing
+### 5. Decisions and durable memory
 
-- Configure your MCP client to run VectorMind via stdio (published package example): `npx -y @coreyuan/vector-mind`.
-- Codex CLI config location: `~/.codex/config.toml` (Windows: `C:\\Users\\<you>\\.codex\\config.toml`).
-  - Example:
-    - `[mcp_servers.vector-mind]`
-    - `type = "stdio"`
-    - `command = "npx"`
-    - `args = ["-y", "@coreyuan/vector-mind"]`
+When a user decision changes or reverses old behavior:
 
-### Tool calls fail with “Transport closed”
+- Call `upsert_decision(...)`.
+- Supersede old records through `supersede_memory(...)` or `upsert_decision` supersede fields.
 
-- Restart the MCP client (or the editor) so the MCP server reconnects.
-- Re-check the MCP server config and that `npx -y @coreyuan/vector-mind` runs successfully in the same environment.
+For durable context:
 
-## Universal (non-Codex) usage
+- `upsert_project_summary(...)`
+- `add_note(...)`
+- `upsert_convention(...)`
+- `complete_requirement(...)` when done
 
-If your AI client does not support Codex skills, copy/paste `references/universal-system-prompt.md` into that client’s system prompt/custom instructions.
+## Code search and reading
+
+- Use `query_codebase({ project_root, query })` for symbol/code location.
+- Use `grep({ project_root, query })` for exact text matches.
+- Use `read_file_lines(...)` or `read_file_text(...)` for bounded reads.
+- Use `semantic_search(...)` for prior requirements, decisions, notes, code chunks, and docs.
+- Use `read_memory_item(...)` for full text only when needed.
+
+## Maintenance
+
+If a large/long-lived project feels slow:
+
+1. Call `maintain_memory({ project_root, dry_run: true })`.
+2. Apply with `dry_run: false` only if the plan is safe.
+
+## Output policy
+
+- Do not paste raw JSON unless the user asks.
+- Summarize active requirement, key warnings, changed files, validation, and next step.
+- VectorMind defines development memory and quality workflow only. It does not manage client runtime controls.
+
+## Troubleshooting
+
+- Skills are loaded when the client starts. Restart the client after installing/updating this skill.
+- Do not hardcode one global `cwd` or `VECTORMIND_ROOT` for all projects.
+- If VectorMind tools are missing, configure the MCP server, for example:
+
+```toml
+[mcp_servers.vector-mind]
+type = "stdio"
+command = "npx"
+args = ["-y", "@coreyuan/vector-mind"]
+```
+
+If a client does not support skills, use `references/universal-system-prompt.md`.

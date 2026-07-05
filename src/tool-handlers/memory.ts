@@ -1,4 +1,5 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type Database from "better-sqlite3";
 
 import type { ToolHandlerContext } from "./context.js";
 import type { ChangeLogRow, MemoryItemRow, RequirementRow } from "../types.js";
@@ -8,9 +9,24 @@ import { buildDevelopmentWarnings, buildScopeDriftWarnings } from "../developmen
 import { mergePendingWithGit } from "../pending-changes.js";
 import { toolCompactOrJson, toolText } from "../token-savings.js";
 import { flushPendingChangeBuffer } from "../file-indexing.js";
-import { BOOTSTRAP_DEFAULT_CONTEXT_KINDS, getConventionPreviews, getCurrentContextPreviews, getDecisionPreviews, semanticSearchHybridInternal, toChangeLogPreview, toMemoryItemPreview, toRequirementPreview } from "../memory-recall.js";
+import { BOOTSTRAP_DEFAULT_CONTEXT_KINDS, getConventionPreviews, getCurrentContextPreviews, getDecisionPreviews, isHiddenFromDefaultRecall, semanticSearchHybridInternal, toChangeLogPreview, toMemoryItemPreview, toRequirementPreview } from "../memory-recall.js";
 import { logActivity } from "../activity-log.js";
 import { compactBootstrapText, compactBrainDumpText, compactSemanticSearchText, toolJson } from "../tool-output.js";
+function getVisibleRecentNotePreviews(
+  listRecentNotesStmt: Database.Statement,
+  limit: number,
+  includeContent: boolean,
+  previewChars: number,
+  contentMaxChars: number,
+) {
+  if (limit <= 0) return [];
+  const fetchLimit = Math.max(limit, Math.min(200, limit * 4));
+  return (listRecentNotesStmt.all(fetchLimit) as MemoryItemRow[])
+    .filter((n) => !isHiddenFromDefaultRecall(n))
+    .slice(0, limit)
+    .map((n) => toMemoryItemPreview(n, includeContent, previewChars, contentMaxChars));
+}
+
 export async function handleBootstrapContext(
   rawArgs: Record<string, unknown>,
   context: ToolHandlerContext,
@@ -54,8 +70,12 @@ export async function handleBootstrapContext(
   const project_summary = projectSummaryRow
     ? toMemoryItemPreview(projectSummaryRow, includeContent, previewChars, contentMaxChars)
     : null;
-  const recent_notes = (listRecentNotesStmt.all(notesLimit) as MemoryItemRow[]).map((n) =>
-    toMemoryItemPreview(n, includeContent, previewChars, contentMaxChars),
+  const recent_notes = getVisibleRecentNotePreviews(
+    listRecentNotesStmt,
+    notesLimit,
+    includeContent,
+    previewChars,
+    contentMaxChars,
   );
   const decisions = getDecisionPreviews(decisionsLimit, previewChars, contentMaxChars);
   const conventions = getConventionPreviews(conventionsLimit, previewChars, contentMaxChars);
@@ -197,8 +217,12 @@ export async function handleGetBrainDump(
   const project_summary = projectSummaryRow
     ? toMemoryItemPreview(projectSummaryRow, includeContent, previewChars, contentMaxChars)
     : null;
-  const recent_notes = (listRecentNotesStmt.all(notesLimit) as MemoryItemRow[]).map((n) =>
-    toMemoryItemPreview(n, includeContent, previewChars, contentMaxChars),
+  const recent_notes = getVisibleRecentNotePreviews(
+    listRecentNotesStmt,
+    notesLimit,
+    includeContent,
+    previewChars,
+    contentMaxChars,
   );
   const decisions = getDecisionPreviews(decisionsLimit, previewChars, contentMaxChars);
   const conventions = getConventionPreviews(conventionsLimit, previewChars, contentMaxChars);

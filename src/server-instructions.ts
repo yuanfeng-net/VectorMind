@@ -47,6 +47,14 @@ export function buildServerInstructions(): string {
     "Built-in thread handoff / switch-gate quality policy:",
     BUILTIN_THREAD_HANDOFF_SWITCH_INSTRUCTIONS,
     "",
+    "Required VectorMind call chain for development work:",
+    "- Start/resume: call bootstrap_context with project_root and a short query unless the task is purely execution-first and all targets are already known.",
+    "- Before edits: call start_requirement for the current user request, then call preflight_change_scope with the planned files/modules before changing files.",
+    "- During edits: if preflight_change_scope says safe_to_edit=false, narrow the plan first. If it returns huge_file_modularization_required, use plan_large_file_split, mechanical_modularization, and record_large_file_split before normal feature work.",
+    "- After edits: call get_pending_changes, then sync_change_intent with what changed and why.",
+    "- Newer decision wins: when the user changes/reverses a rule, call upsert_decision and supersede_memory/upsert_decision supersedes fields so old memories do not override the current rule.",
+    "- Milestone/end: update project summary or add durable notes/conventions, and complete_requirement when the requirement is done.",
+    "",
     "VectorMind workflow:",
     "- Tool outputs are compact by default. Pass format=json only when you need full structured data.",
     "- On every new conversation/session for analysis/design/development work: call bootstrap_context({ query: <current goal> }) first (or at least get_brain_dump()) to restore compact context and retrieve relevant matches from the local memory store (FTS/token/LIKE).",
@@ -81,4 +89,3 @@ export function buildServerInstructions(): string {
     "If tool output conflicts with assumptions, trust the tool output.",
   ].join("\n");
 }
-

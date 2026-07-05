@@ -220,6 +220,21 @@ async function main() {
     if (!serverInstructions?.includes("Development guideline scope")) {
       throw new Error("expected server instructions to state development-guideline scope");
     }
+    if (!serverInstructions?.includes("Required VectorMind call chain for development work:")) {
+      throw new Error("expected server instructions to include required VectorMind call chain");
+    }
+    for (const chainTerm of [
+      "call bootstrap_context with project_root",
+      "call start_requirement for the current user request",
+      "call preflight_change_scope with the planned files/modules",
+      "call get_pending_changes, then sync_change_intent",
+      "call upsert_decision and supersede_memory",
+      "complete_requirement when the requirement is done",
+    ]) {
+      if (!serverInstructions?.includes(chainTerm)) {
+        throw new Error(`expected server instructions call chain to include: ${chainTerm}`);
+      }
+    }
     if (!serverInstructions?.includes("Built-in task-list / Plan-Lite quality policy:")) {
       throw new Error("expected server instructions to include Plan-Lite quality section");
     }
@@ -794,7 +809,145 @@ async function main() {
     },
   });
   console.log("\n--- add_note ---\n");
-  console.log(readText(note));
+  const noteText = readText(note);
+  console.log(noteText);
+  let noteId = 0;
+  try {
+    noteId = Number(JSON.parse(noteText)?.note?.id ?? 0);
+    if (noteId <= 0) throw new Error("expected add_note to return note id");
+  } catch (err) {
+    console.error("\n[smoke] add_note id check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const staleDecisionToken = `VM_STALE_DECISION_${Date.now()}`;
+  const staleByDecision = await client.callTool({
+    name: "add_note",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      title: "stale-decision-note",
+      content: `Old smoke rule should disappear from default recall: ${staleDecisionToken}`,
+      tags: ["smoke", "stale"],
+    },
+  });
+  console.log("\n--- add_note (stale decision note) ---\n");
+  const staleByDecisionText = readText(staleByDecision);
+  console.log(staleByDecisionText);
+  let staleByDecisionId = 0;
+  try {
+    staleByDecisionId = Number(JSON.parse(staleByDecisionText)?.note?.id ?? 0);
+    if (staleByDecisionId <= 0) throw new Error("expected stale note id");
+  } catch (err) {
+    console.error("\n[smoke] stale decision note id check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const currentDecision = await client.callTool({
+    name: "upsert_decision",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      key: "smoke-current-rule",
+      title: "Smoke current rule",
+      content: `Current smoke rule overrides old behavior and keeps token searchable: ${staleDecisionToken}`,
+      tags: ["smoke"],
+      supersedes_memory_ids: [staleByDecisionId],
+    },
+  });
+  console.log("\n--- upsert_decision (supersedes old memory) ---\n");
+  const currentDecisionText = readText(currentDecision);
+  console.log(currentDecisionText);
+  let currentDecisionId = 0;
+  try {
+    const parsed = JSON.parse(currentDecisionText);
+    currentDecisionId = Number(parsed?.decision?.id ?? 0);
+    if (parsed?.ok !== true || currentDecisionId <= 0) {
+      throw new Error("expected upsert_decision to return current decision id");
+    }
+    const superseded = parsed?.superseded_memory_items;
+    if (!Array.isArray(superseded) || !superseded.includes(staleByDecisionId)) {
+      throw new Error("expected upsert_decision to supersede stale note");
+    }
+  } catch (err) {
+    console.error("\n[smoke] upsert_decision supersede check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const staleByToolToken = `VM_STALE_SUPERSEDE_${Date.now()}`;
+  const staleByTool = await client.callTool({
+    name: "add_note",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      title: "stale-supersede-note",
+      content: `Old smoke note should be explicitly superseded: ${staleByToolToken}`,
+      tags: ["smoke", "stale"],
+    },
+  });
+  console.log("\n--- add_note (stale supersede note) ---\n");
+  const staleByToolText = readText(staleByTool);
+  console.log(staleByToolText);
+  let staleByToolId = 0;
+  try {
+    staleByToolId = Number(JSON.parse(staleByToolText)?.note?.id ?? 0);
+    if (staleByToolId <= 0) throw new Error("expected supersede note id");
+  } catch (err) {
+    console.error("\n[smoke] stale supersede note id check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const supersedeTool = await client.callTool({
+    name: "supersede_memory",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      superseded_memory_ids: [staleByToolId],
+      replacement_memory_id: currentDecisionId,
+      reason: "Smoke current decision supersedes this old note",
+    },
+  });
+  console.log("\n--- supersede_memory ---\n");
+  const supersedeToolText = readText(supersedeTool);
+  console.log(supersedeToolText);
+  try {
+    const parsed = JSON.parse(supersedeToolText);
+    const superseded = parsed?.superseded_memory_items;
+    if (parsed?.ok !== true || !Array.isArray(superseded) || !superseded.includes(staleByToolId)) {
+      throw new Error("expected supersede_memory to supersede stale note");
+    }
+  } catch (err) {
+    console.error("\n[smoke] supersede_memory check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const supersededRecall = await client.callTool({
+    name: "semantic_search",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      query: staleDecisionToken,
+      top_k: 8,
+      format: "json",
+    },
+  });
+  console.log("\n--- semantic_search (superseded memory hidden) ---\n");
+  const supersededRecallText = readText(supersededRecall);
+  console.log(supersededRecallText);
+  try {
+    const parsed = JSON.parse(supersededRecallText);
+    const matches = Array.isArray(parsed?.matches) ? parsed.matches : [];
+    if (matches.some((m) => m?.item?.id === staleByDecisionId)) {
+      throw new Error("expected superseded note to be hidden from default recall");
+    }
+    if (!matches.some((m) => m?.item?.id === currentDecisionId)) {
+      throw new Error("expected current decision to remain searchable");
+    }
+  } catch (err) {
+    console.error("\n[smoke] superseded recall check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
 
   const search = await client.callTool({
     name: "semantic_search",
@@ -872,8 +1025,39 @@ async function main() {
     if (!haystack.includes(token)) {
       throw new Error("expected current_context to include recent synced/note context token");
     }
+    const fullPayload = JSON.stringify(parsed);
+    for (const stalePhrase of [
+      "Old smoke rule should disappear from default recall",
+      "Old smoke note should be explicitly superseded",
+    ]) {
+      if (fullPayload.includes(stalePhrase)) {
+        throw new Error(`expected bootstrap_context to hide superseded recent note: ${stalePhrase}`);
+      }
+    }
   } catch (err) {
     console.error("\n[smoke] current_context check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const completeActive = await client.callTool({
+    name: "complete_requirement",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      all_active: true,
+    },
+  });
+  console.log("\n--- complete_requirement (all active) ---\n");
+  const completeActiveText = readText(completeActive);
+  console.log(completeActiveText);
+  try {
+    const parsed = JSON.parse(completeActiveText);
+    const completed = parsed?.completed;
+    if (parsed?.ok !== true || !Array.isArray(completed) || completed.length < 1) {
+      throw new Error("expected complete_requirement to complete active requirements");
+    }
+  } catch (err) {
+    console.error("\n[smoke] complete_requirement check failed:", err);
     process.exitCode = 1;
     return;
   }
