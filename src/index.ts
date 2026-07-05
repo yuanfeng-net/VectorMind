@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import path from "node:path";
 import fs from "node:fs";
-import * as readline from "node:readline";
 import crypto from "node:crypto";
 import os from "node:os";
 import { spawnSync } from "node:child_process";
@@ -39,7 +38,6 @@ import type {
   SymbolRow,
 } from "./types.js";
 import {
-  getAllowedCodexTextRoots,
   isProbablySystemDir,
   isProbablyVscodeInstallDir,
   normalizeToDbPath as normalizePathText,
@@ -51,7 +49,6 @@ import {
 import { buildLargeFileSplitPlan, type LargeFileSplitPlan } from "./large-file-split.js";
 import {
   IGNORED_LIKE_PATTERNS,
-  IGNORED_PATH_SEGMENTS,
   NOISE_FILE_BASENAMES,
   NOISE_FILE_SUFFIXES,
   getContentChunkKind,
@@ -64,7 +61,25 @@ import {
   shouldIgnorePath,
 } from "./path-rules.js";
 import { extractSymbols } from "./symbols.js";
+import {
+  listProjectFilesInternal,
+  normalizeExtensionsFilter,
+  readTextFileLines,
+  readTextFileSlice,
+  resolveCodexTextPath,
+  resolveProjectPathUnderRoot,
+  resolveReadPathUnderProjectRoot,
+  type ProjectFileListEntry,
+} from "./project-files.js";
+import { hasUppercaseAscii, runIndexedGrepSearch, runRipgrepSearch, type GrepBackend, type GrepMatch } from "./grep.js";
 import { compactInstallRtkText, detectRtk, installRtk } from "./rtk-tools.js";
+import {
+  clearActivityLog,
+  configureActivityLogProjectRoot,
+  logActivity,
+  snapshotActivityLog,
+  summarizeActivityEvent,
+} from "./activity-log.js";
 import {
   AddNoteArgsSchema,
   BootstrapContextArgsSchema,
@@ -122,9 +137,6 @@ import {
   PENDING_MAX_ENTRIES,
   PENDING_PRUNE_EVERY,
   PENDING_TTL_DAYS,
-  RIPGREP_MAX_BUFFER_BYTES,
-  RIPGREP_RESOLVE_TIMEOUT_MS,
-  RIPGREP_SEARCH_TIMEOUT_MS,
   ROOTS_LIST_TIMEOUT_MS,
   SEMANTIC_EMBEDDINGS_TIMEOUT_MS,
   SERVER_NAME,
@@ -136,15 +148,14 @@ import {
 
 
 
-let cachedRipgrepCommand: string | null | undefined;
-let cachedRipgrepResolveError: string | null = null;
-
 
 
 let initialized = false;
 let rootSource: RootSource = "cwd";
 let projectRoot = "";
 let dbPath = "";
+
+configureActivityLogProjectRoot(() => projectRoot);
 
 let db: Database.Database;
 let watcher: FSWatcher | null = null;
@@ -200,133 +211,6 @@ let indexFileSymbolsTx:
   | ((filePath: string, symbols: ExtractedSymbol[]) => void)
   | null = null;
 
-type ActivityEvent = {
-  id: number;
-  ts: string;
-  type: string;
-  project_root: string;
-  data: Record<string, unknown>;
-};
-
-let activitySeq = 0;
-const activityLog: ActivityEvent[] = [];
-
-function sanitizeForLog(value: unknown, depth = 0): unknown {
-  if (depth > 4) return "[max-depth]";
-  if (value === null || value === undefined) return value;
-  if (typeof value === "string") {
-    return value.length > 500 ? `${value.slice(0, 500)}...` : value;
-  }
-  if (typeof value === "number" || typeof value === "boolean") return value;
-  if (Array.isArray(value)) {
-    const sliced = value.slice(0, 20).map((v) => sanitizeForLog(v, depth + 1));
-    return value.length > 20 ? [...sliced, `[+${value.length - 20} more]`] : sliced;
-  }
-  if (typeof value === "object") {
-    const obj = value as Record<string, unknown>;
-    const keys = Object.keys(obj).slice(0, 40);
-    const out: Record<string, unknown> = {};
-    for (const k of keys) out[k] = sanitizeForLog(obj[k], depth + 1);
-    if (Object.keys(obj).length > 40) out["__more_keys__"] = Object.keys(obj).length - 40;
-    return out;
-  }
-  try {
-    return String(value);
-  } catch {
-    return "[unserializable]";
-  }
-}
-
-function logActivity(type: string, data: Record<string, unknown>): void {
-  if (!debugLogEnabled) return;
-  activityLog.push({
-    id: ++activitySeq,
-    ts: new Date().toISOString(),
-    type,
-    project_root: projectRoot || "",
-    data: sanitizeForLog(data) as Record<string, unknown>,
-  });
-  while (activityLog.length > debugLogMaxEntries) activityLog.shift();
-}
-
-function snapshotActivityLog(opts: { sinceId: number; limit: number }): { events: ActivityEvent[]; last_id: number } {
-  const sinceId = Math.max(0, opts.sinceId);
-  const limit = Math.max(1, Math.min(500, opts.limit));
-  const lastId = activitySeq;
-  const events = activityLog.filter((e) => e.id > sinceId).slice(0, limit);
-  return { events, last_id: lastId };
-}
-
-function clearActivityLog(): void {
-  activityLog.length = 0;
-  activitySeq = 0;
-}
-
-function summarizeActivityEvent(e: ActivityEvent): string {
-  const d = e.data ?? {};
-  switch (e.type) {
-    case "index_file":
-      return `index ${String(d.file_path ?? "")} reason=${String(d.reason ?? "")} symbols=${String(
-        d.symbols ?? "",
-      )} chunks=${String(d.chunks ?? "")}`;
-    case "remove_file":
-      return `remove ${String(d.file_path ?? "")}`;
-    case "pending_flush":
-      return `pending_flush entries=${String(d.entries ?? "")}`;
-    case "pending_prune":
-      return `pending_prune ${String(d.before ?? "")}->${String(d.after ?? "")}`;
-    case "bootstrap_context":
-      return `bootstrap q=${String(d.query ?? "")} pending=${String(d.pending_returned ?? "")}/${String(
-        d.pending_total ?? "",
-      )} reqs=${String(d.requirements_returned ?? "")} semantic=${String(d.semantic_mode ?? "")}+${
-        String(d.semantic_matches ?? "")
-      }`;
-    case "get_brain_dump":
-      return `brain_dump pending=${String(d.pending_returned ?? "")}/${String(d.pending_total ?? "")} reqs=${String(
-        d.requirements_returned ?? "",
-      )} notes=${String(d.notes_returned ?? "")}`;
-    case "get_pending_changes":
-      return `pending_list returned=${String(d.returned ?? "")} total=${String(d.total ?? "")}`;
-    case "semantic_search":
-      return `semantic_search mode=${String(d.mode ?? "")} q=${String(d.query ?? "")} matches=${String(
-        d.matches ?? "",
-      )}`;
-    case "grep":
-      return `grep backend=${String(d.backend ?? "")} q=${String(d.query ?? "")} matches=${String(
-        d.matches ?? "",
-      )} truncated=${String(d.truncated ?? "")}`;
-    case "query_codebase":
-      return `query_codebase q=${String(d.query ?? "")} matches=${String(d.matches ?? "")}`;
-    case "read_file_lines":
-      return `read_file_lines file=${String(d.file_path ?? "")} returned=${String(d.returned ?? "")} truncated=${String(
-        d.truncated ?? "",
-      )}`;
-    case "read_file_text":
-      return `read_file_text file=${String(d.file_path ?? "")} returned=${String(d.returned_chars ?? "")}/${String(
-        d.total_chars ?? "",
-      )} truncated=${String(d.truncated ?? "")}`;
-    case "list_project_files":
-      return `list_project_files path=${String(d.path ?? "")} returned=${String(d.returned ?? "")} scanned=${String(
-        d.scanned ?? "",
-      )} truncated=${String(d.truncated ?? "")}`;
-    case "read_codex_text_file":
-      return `read_codex_text_file file=${String(d.file_path ?? "")} returned=${String(
-        d.returned_chars ?? "",
-      )}/${String(d.total_chars ?? "")} truncated=${String(d.truncated ?? "")}`;
-    case "start_requirement":
-      return `start_requirement #${String(d.req_id ?? "")} ${String(d.title ?? "")}`;
-    case "sync_change_intent":
-      return `sync_change_intent #${String(d.req_id ?? "")} files=${String(d.files_total ?? "")}`;
-    case "complete_requirement":
-      return `complete_requirement ${String(d.all_active ? "all_active" : d.req_id ?? "")}`;
-    case "memory_maintenance":
-      return `memory_maintenance trigger=${String(d.trigger ?? "")} compacted=${String(
-        d.compacted ?? "",
-      )} stale=${String(d.stale_files ?? "")} chunks_deleted=${String(d.chunks_deleted ?? "")}`;
-    default:
-      return e.type;
-  }
-}
 
 const FTS_TABLE_NAME = "memory_items_fts";
 let ftsAvailable = false;
@@ -3605,878 +3489,7 @@ function escapeRegExp(literal: string): string {
   return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function hasUppercaseAscii(s: string): boolean {
-  return /[A-Z]/.test(s);
-}
 
-function extractLongestLiteralFromRegex(pattern: string): string {
-  // Best-effort extraction: pull the longest literal run to use as an indexed candidate hint.
-  // This is intentionally conservative; if we can't find a reasonable literal anchor, callers
-  // should pass `literal_hint` or narrow with include_paths.
-  let best = "";
-  let cur = "";
-  let inClass = false;
-
-  const flush = () => {
-    if (cur.length > best.length) best = cur;
-    cur = "";
-  };
-
-  for (let i = 0; i < pattern.length; i++) {
-    const ch = pattern[i] ?? "";
-    if (!ch) break;
-
-    if (inClass) {
-      // Skip until the closing bracket.
-      if (ch === "]") inClass = false;
-      flush();
-      continue;
-    }
-    if (ch === "[") {
-      inClass = true;
-      flush();
-      continue;
-    }
-
-    if (ch === "\\") {
-      const next = pattern[i + 1] ?? "";
-      if (!next) {
-        flush();
-        continue;
-      }
-      // Common regex escapes that are NOT literal characters.
-      if (/[dDsSwWbB0-9]/.test(next)) {
-        flush();
-        i += 1;
-        continue;
-      }
-      // Treat \x as literal x (e.g. \( \) \. \\).
-      cur += next;
-      i += 1;
-      continue;
-    }
-
-    // Regex metacharacters.
-    if (".*+?^$|(){}".includes(ch)) {
-      flush();
-      continue;
-    }
-
-    cur += ch;
-  }
-
-  flush();
-  return best;
-}
-
-function normalizePathNeedle(s: string): string {
-  return s.replace(/\\/g, "/").toLowerCase();
-}
-
-function passesPathFilters(filePath: string, includePaths: string[] | null, excludePaths: string[] | null): boolean {
-  const fp = filePath.toLowerCase();
-
-  if (excludePaths?.length) {
-    for (const raw of excludePaths) {
-      const n = normalizePathNeedle(raw);
-      if (!n) continue;
-      if (fp.includes(n)) return false;
-    }
-  }
-
-  if (includePaths?.length) {
-    for (const raw of includePaths) {
-      const n = normalizePathNeedle(raw);
-      if (!n) continue;
-      if (fp.includes(n)) return true;
-    }
-    return false;
-  }
-
-  return true;
-}
-
-function buildLineStarts(text: string): number[] {
-  const starts = [0];
-  for (let i = 0; i < text.length; i++) {
-    if (text.charCodeAt(i) === 10) starts.push(i + 1); // '\n'
-  }
-  return starts;
-}
-
-function lineIndexForOffset(lineStarts: number[], offset: number): number {
-  let lo = 0;
-  let hi = lineStarts.length - 1;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    const v = lineStarts[mid] ?? 0;
-    if (v <= offset) lo = mid + 1;
-    else hi = mid - 1;
-  }
-  return Math.max(0, lo - 1);
-}
-
-type GrepMatch = {
-  file_path: string;
-  kind: string;
-  line: number;
-  col: number;
-  preview: string;
-  match: string;
-};
-
-type GrepBackend = "ripgrep" | "indexed_fallback";
-
-function compileGrepRegex(opts: {
-  query: string;
-  mode: "regex" | "literal";
-  caseSensitive: boolean;
-}): RegExp {
-  const flags = `${opts.caseSensitive ? "" : "i"}gm`;
-  const source = opts.mode === "literal" ? escapeRegExp(opts.query) : opts.query;
-  return new RegExp(source, flags);
-}
-
-function trimGrepText(input: string, maxChars: number): string {
-  if (input.length <= maxChars) return input;
-  return `${input.slice(0, maxChars)}…`;
-}
-
-function buildGrepPreviewSnippet(lineText: string, col: number, maxChars = 500): string {
-  const clean = lineText.replace(/\r$/, "");
-  if (clean.length <= maxChars) return clean;
-
-  const matchIndex = Math.max(0, col - 1);
-  let start = Math.max(0, matchIndex - Math.floor(maxChars * 0.35));
-  if (start + maxChars > clean.length) start = Math.max(0, clean.length - maxChars);
-  const end = Math.min(clean.length, start + maxChars);
-
-  let snippet = clean.slice(start, end);
-  if (start > 0) snippet = `…${snippet}`;
-  if (end < clean.length) snippet = `${snippet}…`;
-  return snippet;
-}
-
-function extractGrepMatchText(opts: {
-  lineText: string;
-  query: string;
-  mode: "regex" | "literal";
-  caseSensitive: boolean;
-  col: number;
-}): string {
-  const clean = opts.lineText.replace(/\r$/, "");
-  const startIndex = Math.max(0, opts.col - 1);
-
-  if (opts.mode === "literal") {
-    const slice = clean.slice(startIndex, startIndex + opts.query.length) || opts.query;
-    return trimGrepText(slice, 200);
-  }
-
-  try {
-    const flags = opts.caseSensitive ? "m" : "im";
-    const anchored = new RegExp(opts.query, flags);
-    const tail = clean.slice(startIndex);
-    const found = anchored.exec(tail);
-    if (found?.index === 0 && found[0]) return trimGrepText(found[0], 200);
-  } catch {}
-
-  const fallback = clean.slice(startIndex, Math.min(clean.length, startIndex + 200));
-  return trimGrepText(fallback || opts.query, 200);
-}
-
-function toProcessText(value: string | Buffer | null | undefined): string {
-  if (typeof value === "string") return value;
-  if (value == null) return "";
-  return value.toString("utf8");
-}
-
-function formatProcessFailure(result: {
-  error?: Error;
-  status?: number | null;
-  signal?: NodeJS.Signals | null;
-  stdout?: string | Buffer | null;
-  stderr?: string | Buffer | null;
-}): string {
-  if (result.error) return `${result.error.name}: ${result.error.message}`;
-  const stderr = toProcessText(result.stderr).trim();
-  if (stderr) return stderr;
-  const stdout = toProcessText(result.stdout).trim();
-  if (stdout) return stdout;
-  if (typeof result.status === "number") return `exit ${result.status}`;
-  if (result.signal) return `signal ${result.signal}`;
-  return "unknown failure";
-}
-
-function buildRipgrepEnv(): NodeJS.ProcessEnv {
-  const env = { ...process.env };
-  delete env.RIPGREP_CONFIG_PATH;
-  return env;
-}
-
-function pushUniqueCandidate(candidates: string[], seen: Set<string>, raw: string | null | undefined): void {
-  const value = raw?.trim();
-  if (!value || seen.has(value)) return;
-  seen.add(value);
-  candidates.push(value);
-}
-
-function listChildDirsSafe(dirPath: string): string[] {
-  try {
-    return fs
-      .readdirSync(dirPath, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => path.join(dirPath, entry.name));
-  } catch {
-    return [];
-  }
-}
-
-function collectRipgrepCandidates(): string[] {
-  const candidates: string[] = [];
-  const seen = new Set<string>();
-
-  const override = process.env.VECTORMIND_RG_PATH?.trim();
-  if (override) pushUniqueCandidate(candidates, seen, path.resolve(override));
-
-  if (process.platform === "win32") {
-    pushUniqueCandidate(candidates, seen, "rg.exe");
-    pushUniqueCandidate(candidates, seen, "rg");
-  } else {
-    pushUniqueCandidate(candidates, seen, "rg");
-  }
-
-  for (const rawDir of (process.env.PATH ?? "").split(path.delimiter)) {
-    const dir = rawDir.trim().replace(/^"+|"+$/g, "");
-    if (!dir) continue;
-    if (process.platform === "win32") {
-      pushUniqueCandidate(candidates, seen, path.join(dir, "rg.exe"));
-      pushUniqueCandidate(candidates, seen, path.join(dir, "rg"));
-    } else {
-      pushUniqueCandidate(candidates, seen, path.join(dir, "rg"));
-    }
-  }
-
-  if (process.platform === "win32") {
-    const localAppData = process.env.LOCALAPPDATA?.trim();
-    const programsDir = localAppData ? path.join(localAppData, "Programs") : "";
-    if (programsDir && fs.existsSync(programsDir)) {
-      for (const appDir of listChildDirsSafe(programsDir)) {
-        pushUniqueCandidate(
-          candidates,
-          seen,
-          path.join(appDir, "resources", "app", "node_modules", "@vscode", "ripgrep", "bin", "rg.exe"),
-        );
-        pushUniqueCandidate(
-          candidates,
-          seen,
-          path.join(
-            appDir,
-            "resources",
-            "app",
-            "extensions",
-            "kiro.kiro-agent",
-            "node_modules",
-            "@vscode",
-            "ripgrep",
-            "bin",
-            "rg.exe",
-          ),
-        );
-        for (const childDir of listChildDirsSafe(appDir)) {
-          pushUniqueCandidate(
-            candidates,
-            seen,
-            path.join(childDir, "resources", "app", "node_modules", "@vscode", "ripgrep", "bin", "rg.exe"),
-          );
-        }
-      }
-    }
-  }
-
-  return candidates;
-}
-
-function resolveRipgrepCommand():
-  | { ok: true; command: string }
-  | { ok: false; error: string; attempts: string[] } {
-  if (typeof cachedRipgrepCommand !== "undefined") {
-    if (cachedRipgrepCommand) return { ok: true, command: cachedRipgrepCommand };
-    return { ok: false, error: cachedRipgrepResolveError ?? "ripgrep unavailable", attempts: [] };
-  }
-
-  const env = buildRipgrepEnv();
-  const attempts: string[] = [];
-
-  for (const candidate of collectRipgrepCandidates()) {
-    const probe = spawnSync(candidate, ["--version"], {
-      cwd: projectRoot || undefined,
-      env,
-      encoding: "utf8",
-      windowsHide: true,
-      timeout: RIPGREP_RESOLVE_TIMEOUT_MS,
-      maxBuffer: 256 * 1024,
-    });
-    if (probe.status === 0) {
-      cachedRipgrepCommand = candidate;
-      cachedRipgrepResolveError = null;
-      return { ok: true, command: candidate };
-    }
-    attempts.push(`${candidate}: ${formatProcessFailure(probe)}`);
-  }
-
-  cachedRipgrepCommand = null;
-  cachedRipgrepResolveError = attempts.slice(0, 8).join(" | ") || "ripgrep unavailable";
-  return { ok: false, error: cachedRipgrepResolveError, attempts };
-}
-
-function appendBuiltInRipgrepExcludes(args: string[]): void {
-  for (const segment of IGNORED_PATH_SEGMENTS) {
-    args.push("-g", `!${segment}/**`);
-    args.push("-g", `!**/${segment}/**`);
-  }
-  for (const baseName of NOISE_FILE_BASENAMES) {
-    args.push("-g", `!**/${baseName}`);
-  }
-  for (const suffix of NOISE_FILE_SUFFIXES) {
-    args.push("-g", `!**/*${suffix}`);
-  }
-}
-
-function runRipgrepSearch(opts: {
-  query: string;
-  mode: "regex" | "literal";
-  smartCase: boolean;
-  caseSensitive: boolean;
-  includePaths: string[] | null;
-  excludePaths: string[] | null;
-  maxResults: number;
-}):
-  | {
-      ok: true;
-      backend: "ripgrep";
-      rg_command: string;
-      matches: GrepMatch[];
-      truncated: boolean;
-      total_matches: number;
-    }
-  | {
-      ok: false;
-      unavailable: boolean;
-      error: string;
-      attempts: string[];
-      rg_command?: string;
-      exit_status?: number | null;
-    } {
-  const resolved = resolveRipgrepCommand();
-  if (!resolved.ok) {
-    return { ok: false, unavailable: true, error: resolved.error, attempts: resolved.attempts };
-  }
-
-  const args = ["--vimgrep", "--no-heading", "--color", "never", "-m", String(opts.maxResults)];
-  args.push(opts.caseSensitive ? "-s" : "-i");
-  if (opts.mode === "literal") args.push("-F");
-  appendBuiltInRipgrepExcludes(args);
-  args.push("--", opts.query, ".");
-
-  const result = spawnSync(resolved.command, args, {
-    cwd: projectRoot,
-    env: buildRipgrepEnv(),
-    encoding: "utf8",
-    windowsHide: true,
-    timeout: RIPGREP_SEARCH_TIMEOUT_MS,
-    maxBuffer: RIPGREP_MAX_BUFFER_BYTES,
-  });
-
-  if (result.error) {
-    return {
-      ok: false,
-      unavailable: false,
-      error: formatProcessFailure(result),
-      attempts: [],
-      rg_command: resolved.command,
-      exit_status: result.status,
-    };
-  }
-
-  const status = result.status ?? 0;
-  if (status !== 0 && status !== 1) {
-    return {
-      ok: false,
-      unavailable: false,
-      error: formatProcessFailure(result),
-      attempts: [],
-      rg_command: resolved.command,
-      exit_status: status,
-    };
-  }
-
-  const matches: GrepMatch[] = [];
-  let totalMatches = 0;
-  let truncated = false;
-
-  for (const rawLine of toProcessText(result.stdout).split(/\r?\n/)) {
-    if (!rawLine) continue;
-    const parsed = /^(.*?):(\d+):(\d+):(.*)$/.exec(rawLine);
-    if (!parsed) continue;
-
-    const filePath = path.posix
-      .normalize(parsed[1].replace(/\\/g, "/"))
-      .replace(/^\.\/+/, "");
-    const lineNumber = Number.parseInt(parsed[2] ?? "0", 10);
-    const colNumber = Number.parseInt(parsed[3] ?? "0", 10);
-    const lineText = (parsed[4] ?? "").replace(/\r$/, "");
-
-    if (!filePath || !Number.isFinite(lineNumber) || !Number.isFinite(colNumber)) continue;
-    if (shouldIgnoreDbFilePath(filePath)) continue;
-    if (shouldIgnoreContentFile(filePath)) continue;
-    if (!passesPathFilters(filePath, opts.includePaths, opts.excludePaths)) continue;
-
-    totalMatches += 1;
-    if (matches.length >= opts.maxResults) {
-      truncated = true;
-      continue;
-    }
-
-    matches.push({
-      file_path: filePath,
-      kind: "file_match",
-      line: lineNumber,
-      col: colNumber,
-      preview: buildGrepPreviewSnippet(lineText, colNumber),
-      match: extractGrepMatchText({
-        lineText,
-        query: opts.query,
-        mode: opts.mode,
-        caseSensitive: opts.caseSensitive,
-        col: colNumber,
-      }),
-    });
-  }
-
-  return {
-    ok: true,
-    backend: "ripgrep",
-    rg_command: resolved.command,
-    matches,
-    truncated,
-    total_matches: totalMatches,
-  };
-}
-
-function runIndexedGrepSearch(opts: {
-  query: string;
-  mode: "regex" | "literal";
-  smartCase: boolean;
-  caseSensitive: boolean;
-  literalHint: string;
-  kinds: string[];
-  includePaths: string[] | null;
-  excludePaths: string[] | null;
-  maxResults: number;
-  maxCandidates?: number;
-}) {
-  const hint = (() => {
-    if (opts.mode === "literal") return opts.query;
-    const explicit = opts.literalHint.trim();
-    if (explicit) return explicit;
-    return extractLongestLiteralFromRegex(opts.query);
-  })();
-
-  if (opts.mode === "regex" && hint.trim().length < 3) {
-    throw new Error(
-      "Regex has no sufficiently long literal anchor for indexed narrowing. Provide literal_hint (>= 3 chars) or narrow with include_paths.",
-    );
-  }
-
-  let re: RegExp;
-  try {
-    re = compileGrepRegex({
-      query: opts.query,
-      mode: opts.mode,
-      caseSensitive: opts.caseSensitive,
-    });
-  } catch (err) {
-    throw new Error(`Invalid pattern: ${String(err)}`);
-  }
-
-  const maxCandidates = opts.maxCandidates ?? Math.min(50_000, Math.max(1000, opts.maxResults * 200));
-  const candidates: Array<{
-    id: number;
-    kind: string;
-    content: string;
-    file_path: string | null;
-    start_line: number | null;
-    end_line: number | null;
-  }> = (() => {
-    if (ftsAvailable) {
-      const matchQuery = buildFtsMatchQuery(hint);
-      const placeholders = opts.kinds.map(() => "?").join(", ");
-      const stmt = db.prepare(`
-        SELECT
-          m.id as id,
-          m.kind as kind,
-          m.content as content,
-          m.file_path as file_path,
-          m.start_line as start_line,
-          m.end_line as end_line
-        FROM ${FTS_TABLE_NAME}
-        JOIN memory_items m ON m.id = ${FTS_TABLE_NAME}.rowid
-        WHERE ${FTS_TABLE_NAME} MATCH ?
-          AND m.kind IN (${placeholders})
-        ORDER BY m.file_path ASC, m.start_line ASC, m.id ASC
-        LIMIT ?
-      `);
-      return stmt.all(matchQuery, ...opts.kinds, maxCandidates) as Array<{
-        id: number;
-        kind: string;
-        content: string;
-        file_path: string | null;
-        start_line: number | null;
-        end_line: number | null;
-      }>;
-    }
-
-    const needle = opts.mode === "literal" ? opts.query : hint;
-    const escaped = escapeLike(needle);
-    const like = `%${escaped}%`;
-    const placeholders = opts.kinds.map(() => "?").join(", ");
-    const stmt = db.prepare(`
-      SELECT
-        id,
-        kind,
-        content,
-        file_path,
-        start_line,
-        end_line
-      FROM memory_items
-      WHERE content LIKE ? ESCAPE '\\'
-        AND kind IN (${placeholders})
-      ORDER BY file_path ASC, start_line ASC, id ASC
-      LIMIT ?
-    `);
-    return stmt.all(like, ...opts.kinds, maxCandidates) as Array<{
-      id: number;
-      kind: string;
-      content: string;
-      file_path: string | null;
-      start_line: number | null;
-      end_line: number | null;
-    }>;
-  })();
-
-  const matches: GrepMatch[] = [];
-  let candidatesScanned = 0;
-  let truncated = false;
-
-  for (const c of candidates) {
-    candidatesScanned += 1;
-    if (!c.file_path || c.start_line == null) continue;
-    if (shouldIgnoreDbFilePath(c.file_path)) continue;
-    if (!passesPathFilters(c.file_path, opts.includePaths, opts.excludePaths)) continue;
-
-    const content = c.content ?? "";
-    const lineStarts = buildLineStarts(content);
-    re.lastIndex = 0;
-
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(content)) !== null) {
-      const idx = m.index ?? 0;
-      const matched = m[0] ?? "";
-      if (!matched) {
-        if (re.lastIndex >= content.length) break;
-        re.lastIndex += 1;
-        continue;
-      }
-
-      const lineIdx = lineIndexForOffset(lineStarts, idx);
-      const lineStart = lineStarts[lineIdx] ?? 0;
-      const lineEnd =
-        lineIdx + 1 < lineStarts.length
-          ? (lineStarts[lineIdx + 1] ?? content.length) - 1
-          : content.length;
-      const previewRaw = content.slice(lineStart, Math.max(lineStart, lineEnd));
-
-      matches.push({
-        file_path: c.file_path,
-        kind: c.kind,
-        line: c.start_line + lineIdx,
-        col: idx - lineStart + 1,
-        preview: trimGrepText(previewRaw, 500),
-        match: trimGrepText(matched, 200),
-      });
-
-      if (matches.length >= opts.maxResults) {
-        truncated = true;
-        break;
-      }
-    }
-
-    if (truncated) break;
-  }
-
-  return {
-    backend: "indexed_fallback" as const,
-    hint,
-    kinds: opts.kinds,
-    include_paths: opts.includePaths ?? [],
-    exclude_paths: opts.excludePaths ?? [],
-    candidates: { total: candidates.length, scanned: candidatesScanned },
-    matches,
-    truncated,
-  };
-}
-
-function resolveProjectPathUnderRoot(
-  inputPath: string,
-  opts: { allowRoot?: boolean } = {},
-): { absPath: string; dbFilePath: string } {
-  const normalizedInput = inputPath.trim() || ".";
-  const abs = path.isAbsolute(normalizedInput) ? normalizedInput : path.join(projectRoot, normalizedInput);
-  const absPath = path.resolve(abs);
-  const root = path.resolve(projectRoot);
-  const rel = path.relative(root, absPath);
-  const insideRoot = rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
-  if (!insideRoot) {
-    throw new Error(`[VectorMind] Path must be under project_root: ${inputPath}`);
-  }
-  if (rel === "" && !opts.allowRoot) {
-    throw new Error(`[VectorMind] Path must not be the project_root itself: ${inputPath}`);
-  }
-  return {
-    absPath,
-    dbFilePath: rel === "" ? "." : normalizeToDbPath(absPath),
-  };
-}
-
-function resolveReadPathUnderProjectRoot(inputPath: string): { absPath: string; dbFilePath: string } {
-  return resolveProjectPathUnderRoot(inputPath, { allowRoot: false });
-}
-
-function resolveCodexTextPath(inputPath: string): { absPath: string; displayPath: string; allowedRoot: string } {
-  const trimmed = inputPath.trim();
-  if (!trimmed) throw new Error("[VectorMind] path is required");
-  const uriPath = trimmed.startsWith("file:") ? parseFileUriToPath(trimmed) : null;
-  const absPath = path.resolve(uriPath ?? trimmed);
-  const allowedRoot = getAllowedCodexTextRoots().find((root) => {
-    const rel = path.relative(root, absPath);
-    return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
-  });
-  if (!allowedRoot) {
-    throw new Error(
-      `[VectorMind] Path must be under one of the allowed local text roots: ${getAllowedCodexTextRoots().join(", ")}`,
-    );
-  }
-  return { absPath, displayPath: absPath, allowedRoot };
-}
-
-function isHiddenBaseName(name: string): boolean {
-  return name.startsWith(".") && name !== "." && name !== "..";
-}
-
-function normalizeExtensionsFilter(values: string[] | undefined): string[] | null {
-  if (!values?.length) return null;
-  const normalized = values
-    .map((v) => v.trim().toLowerCase())
-    .filter(Boolean)
-    .map((v) => (v.startsWith(".") ? v : `.${v}`));
-  return normalized.length ? Array.from(new Set(normalized)) : null;
-}
-
-async function readTextFileLines(opts: {
-  absPath: string;
-  fromLine: number;
-  toLine: number;
-  maxLines: number;
-  maxChars: number;
-}): Promise<{ text: string; returned: number; truncated: boolean }> {
-  let lineNo = 0;
-  const lines: string[] = [];
-  let totalChars = 0;
-  let truncated = false;
-
-  const stream = fs.createReadStream(opts.absPath, { encoding: "utf8" });
-  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-  try {
-    for await (const line of rl) {
-      lineNo += 1;
-      if (lineNo < opts.fromLine) continue;
-      if (lineNo > opts.toLine) break;
-
-      const rendered = `${lineNo}:${line}`;
-      totalChars += rendered.length + 1;
-      if (lines.length >= opts.maxLines || totalChars > opts.maxChars) {
-        truncated = true;
-        break;
-      }
-
-      lines.push(rendered);
-    }
-  } finally {
-    try {
-      rl.close();
-    } catch {}
-    try {
-      stream.destroy();
-    } catch {}
-  }
-
-  return { text: lines.join("\n"), returned: lines.length, truncated };
-}
-
-function readTextFileSlice(opts: {
-  absPath: string;
-  offset: number;
-  maxChars: number;
-  maxFileBytes: number;
-}): { text: string; totalChars: number; returnedChars: number; truncated: boolean } {
-  const st = fs.statSync(opts.absPath);
-  if (!st.isFile()) throw new Error("Not a file");
-  if (st.size > opts.maxFileBytes) {
-    throw new Error(
-      `File is too large for raw text read (${st.size} bytes > limit ${opts.maxFileBytes}). Use read_file_lines instead.`,
-    );
-  }
-
-  const text = fs.readFileSync(opts.absPath, "utf8");
-  const totalChars = text.length;
-  const safeOffset = Math.min(opts.offset, totalChars);
-  const slice = text.slice(safeOffset, safeOffset + opts.maxChars);
-  const returnedChars = slice.length;
-  const truncated = safeOffset + returnedChars < totalChars;
-  return { text: slice, totalChars, returnedChars, truncated };
-}
-
-type ProjectFileListEntry = {
-  path: string;
-  kind: "file" | "dir";
-  depth: number;
-  size?: number;
-  mtime?: string;
-};
-
-function listProjectFilesInternal(opts: {
-  startAbsPath: string;
-  startDbPath: string;
-  recursive: boolean;
-  maxDepth: number;
-  includeFiles: boolean;
-  includeDirs: boolean;
-  includeHidden: boolean;
-  respectIgnore: boolean;
-  includePaths: string[] | null;
-  excludePaths: string[] | null;
-  extensions: string[] | null;
-  maxResults: number;
-  includeStats: boolean;
-}): { entries: ProjectFileListEntry[]; returned: number; scanned: number; truncated: boolean } {
-  const entries: ProjectFileListEntry[] = [];
-  let scanned = 0;
-  let truncated = false;
-
-  const pushEntry = (entry: ProjectFileListEntry): void => {
-    if (entries.length >= opts.maxResults) {
-      truncated = true;
-      return;
-    }
-    entries.push(entry);
-  };
-
-  const startStat = fs.statSync(opts.startAbsPath);
-  if (startStat.isFile()) {
-    const relPath = opts.startDbPath;
-    if ((!opts.respectIgnore || !shouldIgnoreDbFilePath(relPath)) && passesPathFilters(relPath, opts.includePaths, opts.excludePaths)) {
-      const ext = path.extname(relPath).toLowerCase();
-      if (!opts.extensions || opts.extensions.includes(ext)) {
-        pushEntry({
-          path: relPath,
-          kind: "file",
-          depth: 0,
-          ...(opts.includeStats ? { size: startStat.size, mtime: startStat.mtime.toISOString() } : {}),
-        });
-      }
-    }
-    return { entries, returned: entries.length, scanned: 1, truncated };
-  }
-
-  const effectiveMaxDepth = opts.recursive ? opts.maxDepth : 1;
-  const stack: Array<{ absPath: string; depth: number }> = [{ absPath: opts.startAbsPath, depth: 0 }];
-
-  while (stack.length > 0) {
-    const current = stack.pop();
-    if (!current) break;
-
-    let dirEntries: fs.Dirent[];
-    try {
-      dirEntries = fs.readdirSync(current.absPath, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-
-    dirEntries.sort((a, b) => a.name.localeCompare(b.name));
-    for (let idx = dirEntries.length - 1; idx >= 0; idx -= 1) {
-      const child = dirEntries[idx];
-      if (!child) continue;
-      if (!opts.includeHidden && isHiddenBaseName(child.name)) continue;
-
-      const childAbs = path.join(current.absPath, child.name);
-      const childRel = normalizeToDbPath(childAbs);
-      if (opts.respectIgnore && shouldIgnoreDbFilePath(childRel)) continue;
-
-      scanned += 1;
-      const childDepth = current.depth + 1;
-      const matchesPath = passesPathFilters(childRel, opts.includePaths, opts.excludePaths);
-
-      if (child.isDirectory()) {
-        if (opts.includeDirs && matchesPath) {
-          let stats: fs.Stats | null = null;
-          if (opts.includeStats) {
-            try {
-              stats = fs.statSync(childAbs);
-            } catch {
-              stats = null;
-            }
-          }
-          pushEntry({
-            path: childRel,
-            kind: "dir",
-            depth: childDepth,
-            ...(stats ? { size: stats.size, mtime: stats.mtime.toISOString() } : {}),
-          });
-          if (truncated) break;
-        }
-        if (childDepth < effectiveMaxDepth) {
-          stack.push({ absPath: childAbs, depth: childDepth });
-        }
-        continue;
-      }
-
-      if (!child.isFile()) continue;
-      if (!opts.includeFiles || !matchesPath) continue;
-      const ext = path.extname(childRel).toLowerCase();
-      if (opts.extensions && !opts.extensions.includes(ext)) continue;
-
-      let stats: fs.Stats | null = null;
-      if (opts.includeStats) {
-        try {
-          stats = fs.statSync(childAbs);
-        } catch {
-          stats = null;
-        }
-      }
-      pushEntry({
-        path: childRel,
-        kind: "file",
-        depth: childDepth,
-        ...(stats ? { size: stats.size, mtime: stats.mtime.toISOString() } : {}),
-      });
-      if (truncated) break;
-    }
-    if (truncated) break;
-  }
-
-  entries.sort((a, b) => a.path.localeCompare(b.path));
-  return { entries, returned: entries.length, scanned, truncated };
-}
 
 function buildServerInstructions(): string {
   return [
@@ -5817,7 +4830,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (toolName === "plan_large_file_split") {
       const args = PlanLargeFileSplitArgsSchema.parse(rawArgs);
       flushPendingChangeBuffer();
-      const resolved = resolveReadPathUnderProjectRoot(args.file);
+      const resolved = resolveReadPathUnderProjectRoot(projectRoot, normalizeToDbPath, args.file);
       let stat: fs.Stats;
       try {
         stat = fs.statSync(resolved.absPath);
@@ -5868,7 +4881,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       let targetDir = args.target_dir;
       if (targetDir) {
-        targetDir = resolveProjectPathUnderRoot(targetDir, { allowRoot: true }).dbFilePath;
+        targetDir = resolveProjectPathUnderRoot(projectRoot, normalizeToDbPath, targetDir, { allowRoot: true }).dbFilePath;
       }
       const plan = buildLargeFileSplitPlan({
         filePath: resolved.dbFilePath,
@@ -6603,6 +5616,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const caseSensitive =
         args.case_sensitive ?? (smartCase ? hasUppercaseAscii(q) : true);
       const ripgrepResult = runRipgrepSearch({
+        projectRoot,
         query: q,
         mode,
         smartCase,
@@ -6681,6 +5695,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       let indexedResult: ReturnType<typeof runIndexedGrepSearch>;
       try {
         indexedResult = runIndexedGrepSearch({
+          db,
+          ftsAvailable,
+          ftsTableName: FTS_TABLE_NAME,
+          buildFtsMatchQuery,
+          escapeLike,
           query: q,
           mode,
           smartCase,
@@ -6769,7 +5788,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (toolName === "list_project_files") {
       const args = ListProjectFilesArgsSchema.parse(rawArgs);
-      const resolved = resolveProjectPathUnderRoot(args.path, { allowRoot: true });
+      const resolved = resolveProjectPathUnderRoot(projectRoot, normalizeToDbPath, args.path, { allowRoot: true });
 
       let st: fs.Stats;
       try {
@@ -6785,6 +5804,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const excludePaths = args.exclude_paths?.length ? args.exclude_paths : null;
       const extensions = normalizeExtensionsFilter(args.extensions);
       const result = listProjectFilesInternal({
+        normalizeToDbPath,
         startAbsPath: resolved.absPath,
         startDbPath: resolved.dbFilePath,
         recursive: args.recursive,
@@ -6853,7 +5873,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (toolName === "read_file_text") {
       const args = ReadFileTextArgsSchema.parse(rawArgs);
-      const resolved = resolveReadPathUnderProjectRoot(args.path);
+      const resolved = resolveReadPathUnderProjectRoot(projectRoot, normalizeToDbPath, args.path);
 
       let st: fs.Stats;
       try {
@@ -6982,7 +6002,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (toolName === "read_file_lines") {
       const args = ReadFileLinesArgsSchema.parse(rawArgs);
-      const resolved = resolveReadPathUnderProjectRoot(args.path);
+      const resolved = resolveReadPathUnderProjectRoot(projectRoot, normalizeToDbPath, args.path);
 
       let fromLine = args.from_line;
       let toLine = args.to_line;
