@@ -37,7 +37,6 @@ type MemoryMaintenanceContext = {
   parseMetadataJson: (raw: string | null | undefined) => Record<string, unknown>;
   metadataStatus: (row: { metadata_json: string | null | undefined }) => string | null;
   isHiddenFromDefaultRecall: (row: { metadata_json: string | null | undefined }) => boolean;
-  enqueueEmbedding: (memoryId: number) => void;
 };
 
 let memoryMaintenanceContext: MemoryMaintenanceContext | null = null;
@@ -103,10 +102,6 @@ function metadataStatus(row: { metadata_json: string | null | undefined }): stri
 
 function isHiddenFromDefaultRecall(row: { metadata_json: string | null | undefined }): boolean {
   return requireMemoryMaintenanceContext().isHiddenFromDefaultRecall(row);
-}
-
-function enqueueEmbedding(memoryId: number): void {
-  requireMemoryMaintenanceContext().enqueueEmbedding(memoryId);
 }
 
 export function pruneIgnoredIndexesByPathPatterns(): { chunks_deleted: number; symbols_deleted: number } {
@@ -214,7 +209,6 @@ export type MaintenanceIndexPruneResult = {
     symbols_deleted: number;
     samples: string[];
   };
-  hidden_embeddings: { embeddings_deleted: number };
 };
 
 export type MaintenanceCompactionResult = {
@@ -443,39 +437,6 @@ export function countFilenameNoiseIndexDeletes(): { chunks_deleted: number; symb
   return { chunks_deleted: chunksDeleted, symbols_deleted: symbolsDeleted };
 }
 
-export function hiddenEmbeddingIds(limit = 10_000): number[] {
-  const rows = getDb()
-    .prepare(
-      `SELECT e.memory_id AS memory_id, m.metadata_json AS metadata_json
-       FROM embeddings e
-       JOIN memory_items m ON m.id = e.memory_id
-       WHERE m.metadata_json LIKE '%compacted%'
-          OR m.metadata_json LIKE '%superseded%'
-       LIMIT ?`,
-    )
-    .all(limit) as Array<{ memory_id: number; metadata_json: string | null }>;
-  return rows
-    .filter((r) => isHiddenFromDefaultRecall({ metadata_json: r.metadata_json }))
-    .map((r) => r.memory_id);
-}
-
-export function pruneHiddenEmbeddings(dryRun: boolean): MaintenanceIndexPruneResult["hidden_embeddings"] {
-  const ids = hiddenEmbeddingIds();
-  if (!ids.length) return { embeddings_deleted: 0 };
-  if (!dryRun) {
-    const deleteStmt = getDb().prepare(`DELETE FROM embeddings WHERE memory_id = ?`);
-    const tx = getDb().transaction(() => {
-      for (const id of ids) deleteStmt.run(id);
-    });
-    try {
-      tx();
-    } catch (err) {
-      console.error("[vectormind] prune hidden embeddings failed:", err);
-    }
-  }
-  return { embeddings_deleted: ids.length };
-}
-
 export function selectCompactionCandidates(opts: {
   compactAfterDays: number;
   maxMemoryItems: number;
@@ -581,7 +542,6 @@ export function compactOldMemoryItems(opts: {
      SET content = ?, metadata_json = ?, content_hash = ?, updated_at = CURRENT_TIMESTAMP
      WHERE id = ?`,
   );
-  const deleteEmbeddingStmt = getDb().prepare(`DELETE FROM embeddings WHERE memory_id = ?`);
 
   const tx = getDb().transaction(() => {
     const info = getInsertMemoryItemStatement().run(
@@ -629,13 +589,11 @@ export function compactOldMemoryItems(opts: {
         `Summary: ${oneLine(row.title || row.content, 260)}`,
       ].join("\n");
       updateMemoryStmt.run(stub, safeJson(patchedMeta), sha256Hex(stub), row.id);
-      deleteEmbeddingStmt.run(row.id);
     }
   });
 
   try {
     tx();
-    if (summaryMemoryId) enqueueEmbedding(summaryMemoryId);
   } catch (err) {
     console.error("[vectormind] compact old memory failed:", err);
     summaryMemoryId = 0;
@@ -696,10 +654,6 @@ export function runMemoryMaintenance(
     ? pruneStaleFileIndexes({ dryRun: args.dry_run, maxIndexFiles: args.max_index_files })
     : { files_checked: 0, files_matched: 0, chunks_deleted: 0, symbols_deleted: 0, samples: [] };
 
-  const hiddenEmbeddings = args.prune_hidden_embeddings
-    ? pruneHiddenEmbeddings(args.dry_run)
-    : { embeddings_deleted: 0 };
-
   let vacuumed = false;
   if (!args.dry_run && args.vacuum) {
     try {
@@ -728,7 +682,6 @@ export function runMemoryMaintenance(
       ignored_paths: ignoredPaths,
       filename_noise: filenameNoise,
       stale_files: staleFiles,
-      hidden_embeddings: hiddenEmbeddings,
     },
     vacuumed,
   };
@@ -765,7 +718,6 @@ export function runAutoMaintenanceIfDue(): void {
         prune_stale_indexes: true,
         prune_ignored_paths: true,
         prune_filename_noise: true,
-        prune_hidden_embeddings: true,
         compact_after_days: MAINTENANCE_COMPACT_AFTER_DAYS,
         max_memory_items: MAINTENANCE_MAX_MEMORY_ITEMS,
         max_index_files: MAINTENANCE_MAX_INDEX_FILES,

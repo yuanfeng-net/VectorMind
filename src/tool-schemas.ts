@@ -214,7 +214,6 @@ export const MaintainMemoryArgsSchema = ProjectRootArgSchema.merge(OutputFormatS
     prune_stale_indexes: z.boolean().optional().default(true),
     prune_ignored_paths: z.boolean().optional().default(true),
     prune_filename_noise: z.boolean().optional().default(true),
-    prune_hidden_embeddings: z.boolean().optional().default(true),
     compact_after_days: z.number().int().min(1).max(3650).optional().default(MAINTENANCE_COMPACT_AFTER_DAYS),
     max_memory_items: z.number().int().min(1).max(5000).optional().default(MAINTENANCE_MAX_MEMORY_ITEMS),
     max_index_files: z.number().int().min(1).max(50_000).optional().default(MAINTENANCE_MAX_INDEX_FILES),

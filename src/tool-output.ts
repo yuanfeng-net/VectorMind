@@ -64,7 +64,6 @@ type CompactMaintenanceResult = {
     ignored_paths: { chunks_deleted: number; symbols_deleted: number };
     filename_noise: { chunks_deleted: number; symbols_deleted: number };
     stale_files: { chunks_deleted: number; symbols_deleted: number; samples: string[] };
-    hidden_embeddings: { embeddings_deleted: number };
   };
 };
 
@@ -249,7 +248,7 @@ export function compactMaintenanceText(data: CompactMaintenanceResult): string {
     data.pruned.filename_noise.symbols_deleted +
     data.pruned.stale_files.symbols_deleted;
   const lines = [
-    `maintain_memory ok dry_run=${data.dry_run} trigger=${data.trigger} compacted=${data.compacted_memory.compacted}/${data.compacted_memory.candidates} archived=${data.compacted_memory.archived} pruned_chunks=${prunedChunks} pruned_symbols=${prunedSymbols} hidden_embeddings=${data.pruned.hidden_embeddings.embeddings_deleted}`,
+    `maintain_memory ok dry_run=${data.dry_run} trigger=${data.trigger} compacted=${data.compacted_memory.compacted}/${data.compacted_memory.candidates} archived=${data.compacted_memory.archived} pruned_chunks=${prunedChunks} pruned_symbols=${prunedSymbols}`,
   ];
   if (data.compacted_memory.summary_memory_id) {
     lines.push(`summary memory_compaction #${data.compacted_memory.summary_memory_id}`);

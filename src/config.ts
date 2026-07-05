@@ -176,11 +176,3 @@ export const BOOTSTRAP_SEMANTIC_TIMEOUT_MS = (() => {
   if (!Number.isFinite(n) || n <= 0) return 2500;
   return n;
 })();
-
-export const SEMANTIC_EMBEDDINGS_TIMEOUT_MS = (() => {
-  const raw = process.env.VECTORMIND_EMBEDDINGS_TIMEOUT_MS?.trim();
-  if (!raw) return 1500;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n <= 0) return 1500;
-  return n;
-})();

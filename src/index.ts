@@ -67,15 +67,6 @@ import {
   prunePendingChanges,
 } from "./pending-changes.js";
 import {
-  configureEmbeddings,
-  dotProduct,
-  embedFilesMode,
-  embedModelName,
-  embeddingsEnabled,
-  enqueueEmbedding,
-  getEmbedder,
-} from "./embeddings.js";
-import {
   configureTokenSavings,
   tokenSavingsSummary,
   toolCompactOrJson,
@@ -178,7 +169,6 @@ import {
   INDEX_MAX_DOC_BYTES,
   INDEX_SKIP_MINIFIED,
   ROOTS_LIST_TIMEOUT_MS,
-  SEMANTIC_EMBEDDINGS_TIMEOUT_MS,
   SERVER_NAME,
   SERVER_VERSION,
   debugLogEnabled,
@@ -227,8 +217,6 @@ let listRecentNotesStmt: Database.Statement;
 let listRecentContextItemsStmt: Database.Statement;
 let getLatestChangeIntentForFileStmt: Database.Statement;
 let deleteFileChunkItemsStmt: Database.Statement;
-let getEmbeddingMetaStmt: Database.Statement;
-let upsertEmbeddingStmt: Database.Statement;
 let upsertPendingChangeStmt: Database.Statement;
 let listPendingChangesStmt: Database.Statement;
 let countPendingChangesStmt: Database.Statement;
@@ -273,13 +261,6 @@ configureDevelopmentWarnings({
   parseMetadataJson,
 });
 
-configureEmbeddings({
-  getMemoryItemByIdStatement: () => getMemoryItemByIdStmt,
-  getEmbeddingMetaStatement: () => getEmbeddingMetaStmt,
-  getUpsertEmbeddingStatement: () => upsertEmbeddingStmt,
-  sha256Hex,
-});
-
 configureTokenSavings({
   getDb: () => db,
   getInsertTokenSavingsStatement: () => insertTokenSavingsStmt,
@@ -311,7 +292,6 @@ configureMemoryMaintenance({
   parseMetadataJson,
   metadataStatus,
   isHiddenFromDefaultRecall,
-  enqueueEmbedding,
 });
 
 configureFileIndexing({
@@ -324,9 +304,6 @@ configureFileIndexing({
   getUpsertPendingChangeStatement: () => upsertPendingChangeStmt,
   getDeleteSymbolsForFileStatement: () => deleteSymbolsForFileStmt,
   sha256Hex,
-  enqueueEmbedding,
-  getEmbeddingsEnabled: () => embeddingsEnabled,
-  getEmbedFilesMode: () => embedFilesMode,
   prunePendingChanges,
 });
 
@@ -360,7 +337,7 @@ function getLatestSyncedFileHash(dbFilePath: string): string | null {
   return typeof meta.file_state_hash === "string" ? meta.file_state_hash : null;
 }
 
-type SemanticSearchMode = "embeddings" | "fts" | "like" | "token" | "hybrid";
+type SemanticSearchMode = "fts" | "like" | "token" | "hybrid";
 
 type MemoryItemSearchRow = Pick<
   MemoryItemRow,
@@ -968,108 +945,6 @@ function supersedeRequirementIds(
   return updatedReqs;
 }
 
-async function semanticSearchInternal(opts: SemanticSearchOpts): Promise<SemanticSearchResult> {
-  if (!embeddingsEnabled) {
-    throw new Error("Embeddings are disabled");
-  }
-
-  const q = opts.query.trim();
-  if (!q) return { query: "", top_k: opts.topK, mode: "embeddings", matches: [] };
-  const embedder = await getEmbedder();
-  const qVec = await embedder(q);
-
-  const rawLimit = Math.min(500, Math.max(opts.topK, opts.topK * 8));
-
-  let candidateRows: Array<{ memory_id: number; dim: number; vector: Buffer }> = [];
-  if (opts.kinds?.length) {
-    const placeholders = opts.kinds.map(() => "?").join(", ");
-    const stmt = db.prepare(
-      `SELECT e.memory_id as memory_id, e.dim as dim, e.vector as vector
-       FROM embeddings e
-       JOIN memory_items m ON m.id = e.memory_id
-       WHERE m.kind IN (${placeholders})`,
-    );
-    candidateRows = stmt.all(...opts.kinds) as Array<{
-      memory_id: number;
-      dim: number;
-      vector: Buffer;
-    }>;
-  } else {
-    candidateRows = db
-      .prepare(`SELECT memory_id, dim, vector FROM embeddings`)
-      .all() as Array<{ memory_id: number; dim: number; vector: Buffer }>;
-  }
-
-  const top: Array<{ memory_id: number; score: number }> = [];
-  for (const row of candidateRows) {
-    const buf = row.vector;
-    if (!buf || buf.byteLength % 4 !== 0) continue;
-    const v = new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
-    if (row.dim !== v.length || v.length !== qVec.length) continue;
-    const score = dotProduct(qVec, v);
-
-    if (top.length < rawLimit) {
-      top.push({ memory_id: row.memory_id, score });
-      top.sort((a, b) => b.score - a.score);
-      continue;
-    }
-    if (score <= top[top.length - 1].score) continue;
-    top[top.length - 1] = { memory_id: row.memory_id, score };
-    top.sort((a, b) => b.score - a.score);
-  }
-
-  const matches = top
-    .map((t) => {
-      const item = getMemoryItemByIdStmt.get(t.memory_id) as MemoryItemRow | undefined;
-      if (!item) return null;
-      return toSemanticMatch(item, t.score, opts.includeContent, opts.previewChars, opts.contentMaxChars);
-    })
-    .filter(Boolean) as Array<{
-    score: number;
-    item: {
-      id: number;
-      kind: string;
-      title: string | null;
-      file_path: string | null;
-      start_line: number | null;
-      end_line: number | null;
-      req_id: number | null;
-      preview: string;
-      content?: string;
-      metadata_json: string | null;
-      updated_at: string;
-    };
-  }>;
-
-  const filtered = matches
-    .filter((m) => {
-      if (isHiddenFromDefaultRecall({ metadata_json: m.item.metadata_json })) return false;
-      if (shouldIgnoreDbFilePath(m.item.file_path) && m.item.kind !== "change_intent") return false;
-      return true;
-    })
-    .map((m) => ({
-      ...m,
-      score: adjustSemanticScore(
-        {
-          id: m.item.id,
-          kind: m.item.kind,
-          title: m.item.title,
-          content: m.item.content ?? m.item.preview,
-          file_path: m.item.file_path,
-          start_line: m.item.start_line,
-          end_line: m.item.end_line,
-          req_id: m.item.req_id,
-          metadata_json: m.item.metadata_json,
-          updated_at: m.item.updated_at,
-        },
-        m.score,
-      ),
-    }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, opts.topK);
-  return { query: q, top_k: opts.topK, mode: "embeddings", matches: filtered };
-}
-
 function buildFtsMatchQuery(raw: string): string {
   const terms = raw
     .trim()
@@ -1410,25 +1285,7 @@ function chooseLexicalResult(
 }
 
 async function semanticSearchHybridInternal(opts: SemanticSearchOpts): Promise<SemanticSearchResult> {
-  const lexical = chooseLexicalResult(opts).result;
-  if (!embeddingsEnabled) return lexical;
-
-  const embeddingsResult = await Promise.race([
-    semanticSearchInternal(opts),
-    new Promise<null>((resolve) => setTimeout(resolve, SEMANTIC_EMBEDDINGS_TIMEOUT_MS, null)),
-  ]).catch((err) => {
-    console.error("[vectormind] embeddings semantic_search failed; falling back:", err);
-    return null;
-  });
-
-  if (!embeddingsResult) return lexical;
-  const merged = mergeSemanticMatches([lexical.matches, embeddingsResult.matches], opts);
-  return {
-    query: opts.query.trim(),
-    top_k: opts.topK,
-    mode: merged.length ? "hybrid" : embeddingsResult.mode,
-    matches: merged,
-  };
+  return chooseLexicalResult(opts).result;
 }
 
 function buildServerInstructions(): string {
@@ -1470,7 +1327,7 @@ function buildServerInstructions(): string {
     "",
     "VectorMind workflow:",
     "- Tool outputs are compact by default. Pass format=json only when you need full structured data.",
-    "- On every new conversation/session for analysis/design/development work: call bootstrap_context({ query: <current goal> }) first (or at least get_brain_dump()) to restore compact context and retrieve relevant matches from the local memory store (vector if enabled; otherwise FTS/LIKE).",
+    "- On every new conversation/session for analysis/design/development work: call bootstrap_context({ query: <current goal> }) first (or at least get_brain_dump()) to restore compact context and retrieve relevant matches from the local memory store (FTS/token/LIKE).",
     "  - Output is compact by default. Use include_content=true only when you truly need full text (it increases tokens).",
     "  - bootstrap_context/get_brain_dump always include a small recency anchor named current_context (latest active requirements, recent notes, and recent change intents) in addition to query matches; tune output size with: requirements_limit/changes_limit/notes_limit/decisions_limit/current_context_limit, preview_chars, pending_limit/pending_offset.",
     "  - Prefer read_memory_item(id, offset, limit) to fetch full text on demand instead of returning large content in other tool outputs.",
@@ -1495,7 +1352,7 @@ function buildServerInstructions(): string {
     "- If the user states a durable project convention (build commands, frameworks, naming rules, output paths): call upsert_convention(key, content, tags) so it is applied in future sessions.",
     "- When you need full text for a specific note/summary/match: call read_memory_item(id, offset, limit) and page through it.",
     "- When asked to locate code (class/function/type): call query_codebase(query) instead of guessing.",
-    "- When you need to recall relevant context from history/code/docs: call semantic_search(query, ...) instead of guessing. It blends lexical/FTS recall with embeddings when enabled, so recent explicit wording and durable decisions are not hidden by older semantically similar matches.",
+    "- When you need to recall relevant context from history/code/docs: call semantic_search(query, ...) instead of guessing. It uses local FTS/token/LIKE recall so recent explicit wording and durable decisions stay visible without remote model loading.",
     "- VectorMind automatically runs small, throttled memory maintenance to compact old completed history and prune stale indexes in long-lived projects. For large repos that feel slow, call maintain_memory({ dry_run: true }) first, then maintain_memory({ dry_run: false }) if the plan looks correct.",
     "- Use get_token_savings({ format: 'compact' }) when you need to verify how many tokens VectorMind compact outputs saved.",
     "",
@@ -1741,19 +1598,6 @@ function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_memory_items_req_id
       ON memory_items(req_id);
 
-    CREATE TABLE IF NOT EXISTS embeddings (
-      memory_id INTEGER PRIMARY KEY,
-      dim INTEGER NOT NULL,
-      vector BLOB NOT NULL,
-      content_hash TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY(memory_id) REFERENCES memory_items(id) ON DELETE CASCADE
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_embeddings_updated_at
-      ON embeddings(updated_at DESC);
-
     CREATE TABLE IF NOT EXISTS pending_changes (
       file_path TEXT PRIMARY KEY,
       last_event TEXT NOT NULL,
@@ -1983,21 +1827,6 @@ function initDatabase(): void {
     `DELETE FROM memory_items
      WHERE file_path = ?
        AND (kind = 'code_chunk' OR kind = 'doc_chunk')`,
-  );
-
-  getEmbeddingMetaStmt = db.prepare(
-    `SELECT memory_id, dim, content_hash
-     FROM embeddings
-     WHERE memory_id = ?`,
-  );
-  upsertEmbeddingStmt = db.prepare(
-    `INSERT INTO embeddings (memory_id, dim, vector, content_hash)
-     VALUES (?, ?, ?, ?)
-     ON CONFLICT(memory_id) DO UPDATE SET
-       dim = excluded.dim,
-       vector = excluded.vector,
-       content_hash = excluded.content_hash,
-       updated_at = CURRENT_TIMESTAMP`,
   );
 
   upsertPendingChangeStmt = db.prepare(
@@ -2478,7 +2307,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         sha256Hex(content),
       );
       const memory_id = Number(memoryInfo.lastInsertRowid);
-      enqueueEmbedding(memory_id);
 
       logActivity("start_requirement", {
         req_id: id,
@@ -2882,7 +2710,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         sha256Hex(content),
       );
       const id = Number(info.lastInsertRowid);
-      enqueueEmbedding(id);
       logActivity("record_large_file_split", {
         memory_item_id: id,
         file_path: normalizedFile,
@@ -3008,7 +2835,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             sha256Hex(args.intent),
           );
           const memory_item_id = Number(memoryInfo.lastInsertRowid);
-          enqueueEmbedding(memory_item_id);
 
           synced_files.push({ file_path: t.dbFilePath, event: t.event, source: t.source });
           created.push({
@@ -3155,11 +2981,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         db_path: dbPath,
         watcher_enabled: !!watcher,
         watcher_ready: watcherReady,
-        embeddings: {
-          enabled: embeddingsEnabled,
-          model: embedModelName,
-          embed_files: embedFilesMode,
-        },
         output: {
           format: args.format,
           include_content: includeContent,
@@ -3265,11 +3086,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         db_path: dbPath,
         watcher_enabled: !!watcher,
         watcher_ready: watcherReady,
-        embeddings: {
-          enabled: embeddingsEnabled,
-          model: embedModelName,
-          embed_files: embedFilesMode,
-        },
         output: {
           format: args.format,
           include_content: includeContent,
@@ -4059,7 +3875,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       upsertProjectSummaryStmt.run(summary, safeJson({ source: "assistant" }), contentHash);
 
       const row = getProjectSummaryStmt.get() as MemoryItemRow | undefined;
-      if (row) enqueueEmbedding(row.id);
 
       return {
         content: [
@@ -4090,7 +3905,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         sha256Hex(content),
       );
       const id = Number(info.lastInsertRowid);
-      enqueueEmbedding(id);
 
       return {
         content: [
@@ -4118,7 +3932,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
       upsertDecisionStmt.run(key, `${title}\n\n${content}`, safeJson(meta), sha256Hex(`${title}\n\n${content}`));
       const row = getDecisionByKeyStmt.get(key) as MemoryItemRow | undefined;
-      if (row) enqueueEmbedding(row.id);
 
       const superseded_requirements = supersedeRequirementIds(args.supersedes_req_ids ?? [], {
         decision_id: row?.id,
@@ -4209,7 +4022,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       const row = getConventionByKeyStmt.get(key) as MemoryItemRow | undefined;
 
-      if (row) enqueueEmbedding(row.id);
       logActivity("upsert_convention", { key, content_preview: makePreviewText(content, 200) });
 
       return {

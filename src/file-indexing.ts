@@ -33,9 +33,6 @@ type FileIndexingContext = {
   getUpsertPendingChangeStatement: () => Database.Statement;
   getDeleteSymbolsForFileStatement: () => Database.Statement;
   sha256Hex: (input: string) => string;
-  enqueueEmbedding: (memoryId: number) => void;
-  getEmbeddingsEnabled: () => boolean;
-  getEmbedFilesMode: () => string;
   prunePendingChanges: () => void;
 };
 
@@ -96,18 +93,6 @@ function sha256Hex(input: string): string {
   return requireFileIndexingContext().sha256Hex(input);
 }
 
-function enqueueEmbedding(memoryId: number): void {
-  requireFileIndexingContext().enqueueEmbedding(memoryId);
-}
-
-function getEmbeddingsEnabled(): boolean {
-  return requireFileIndexingContext().getEmbeddingsEnabled();
-}
-
-function getEmbedFilesMode(): string {
-  return requireFileIndexingContext().getEmbedFilesMode();
-}
-
 function prunePendingChanges(): void {
   requireFileIndexingContext().prunePendingChanges();
 }
@@ -155,7 +140,6 @@ export function indexFileContentChunks(
   dbFilePath: string,
   absPath: string,
   content: string,
-  reason: IndexReason,
 ): number {
   const kind = getContentChunkKind(absPath);
   if (!kind) return 0;
@@ -173,7 +157,7 @@ export function indexFileContentChunks(
     for (const chunk of chunks) {
       const title = `${dbFilePath}#L${chunk.startLine}-L${chunk.endLine}`;
       const contentHash = sha256Hex(chunk.content);
-      const info = getInsertMemoryItemStatement().run(
+      getInsertMemoryItemStatement().run(
         kind,
         title,
         chunk.content,
@@ -184,10 +168,6 @@ export function indexFileContentChunks(
         metadata,
         contentHash,
       );
-      const memoryId = Number(info.lastInsertRowid);
-      if (shouldEmbedFileChunks(reason)) {
-        enqueueEmbedding(memoryId);
-      }
     }
   });
 
@@ -303,7 +283,7 @@ export function indexFile(absPath: string, reason: IndexReason): void {
     }
   }
   if (indexContent) {
-    chunkCount = indexFileContentChunks(filePath, absPath, content, reason);
+    chunkCount = indexFileContentChunks(filePath, absPath, content);
   }
 
   logActivity("index_file", {
@@ -332,11 +312,3 @@ export function removeFileIndexes(absPath: string): void {
 }
 
 export type IndexReason = "add" | "change" | "manual";
-
-export function shouldEmbedFileChunks(reason: IndexReason): boolean {
-  if (!getEmbeddingsEnabled()) return false;
-  if (getEmbedFilesMode() === "none" || getEmbedFilesMode() === "off" || getEmbedFilesMode() === "disabled")
-    return false;
-  if (getEmbedFilesMode() === "all") return true;
-  return reason !== "add";
-}

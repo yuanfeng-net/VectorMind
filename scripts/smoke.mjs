@@ -21,18 +21,12 @@ function hasFlag(name) {
 const rootsMode = (getFlag("roots") ?? "on").toLowerCase();
 const enableRoots = rootsMode !== "off";
 
-const embeddings = (getFlag("embeddings") ?? "off").toLowerCase();
-const enableEmbeddings = embeddings === "on" || embeddings === "true" || embeddings === "1";
-
-const allowRemoteModels = (getFlag("allow-remote-models") ?? "true").toLowerCase();
 const keepFiles = hasFlag("keep-files");
 const inPlace = hasFlag("in-place");
 const useToolProjectRoot = hasFlag("use-tool-project-root");
 
 const env = {
   ...process.env,
-  VECTORMIND_EMBEDDINGS: enableEmbeddings ? "on" : "off",
-  VECTORMIND_ALLOW_REMOTE_MODELS: allowRemoteModels,
 };
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
@@ -802,11 +796,6 @@ async function main() {
   console.log("\n--- add_note ---\n");
   console.log(readText(note));
 
-  if (enableEmbeddings) {
-    console.log("\n(waiting a bit for background embedding...)\n");
-    await new Promise((r) => setTimeout(r, 8000));
-  }
-
   const search = await client.callTool({
     name: "semantic_search",
     arguments: {
@@ -845,8 +834,8 @@ async function main() {
     if (!Array.isArray(matches) || matches.length === 0) {
       throw new Error("expected semantic_search to return at least 1 match");
     }
-    if (enableEmbeddings !== true && !["fts", "like", "token", "hybrid"].includes(parsed?.mode)) {
-      throw new Error(`expected mode to be fts/like/token/hybrid when embeddings are off (got ${parsed?.mode})`);
+    if (!["fts", "like", "token", "hybrid"].includes(parsed?.mode)) {
+      throw new Error(`expected mode to be fts/like/token/hybrid (got ${parsed?.mode})`);
     }
     const haystack = JSON.stringify(matches);
     if (!haystack.includes(token)) {
