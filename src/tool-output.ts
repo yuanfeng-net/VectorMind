@@ -1,0 +1,435 @@
+import type { PendingChangeRow, RootSource, SymbolRow } from "./types.js";
+import type { LargeFileSplitPlan } from "./large-file-split.js";
+import type { ProjectFileListEntry } from "./project-files.js";
+import type { GrepBackend, GrepMatch } from "./grep.js";
+import { prettyJsonOutput } from "./config.js";
+
+export type CompactDevelopmentWarning = {
+  code: string;
+  severity: string;
+  message: string;
+  files?: string[];
+};
+
+type CompactChangeMode = string;
+
+type CompactRequirementScopeContract = {
+  allow_terms: string[];
+  deny_terms: string[];
+  allowed_paths: string[];
+  denied_paths: string[];
+};
+
+type CompactMemoryItemPreview = {
+  id: number;
+  kind: string;
+  title?: string | null;
+  file_path?: string | null;
+  start_line?: number | null;
+  preview?: string | null;
+};
+
+type CompactRequirementPreview = {
+  id: number;
+  title: string;
+  status: string;
+  memory_item_id?: number | null;
+  context_preview?: string | null;
+};
+
+type CompactChangeLogPreview = {
+  id: number;
+  file_path: string;
+  intent_preview: string;
+};
+
+type CompactSemanticSearchResult = {
+  query: string;
+  top_k: number;
+  mode: string;
+  matches: Array<{ score: number; item: CompactMemoryItemPreview }>;
+};
+
+type CompactMaintenanceResult = {
+  dry_run: boolean;
+  trigger: string;
+  compacted_memory: {
+    candidates: number;
+    compacted: number;
+    archived: number;
+    summary_memory_id: number | null;
+    samples: Array<{ id: number; kind: string; title?: string | null; file_path?: string | null; updated_at: string }>;
+  };
+  pruned: {
+    ignored_paths: { chunks_deleted: number; symbols_deleted: number };
+    filename_noise: { chunks_deleted: number; symbols_deleted: number };
+    stale_files: { chunks_deleted: number; symbols_deleted: number; samples: string[] };
+    hidden_embeddings: { embeddings_deleted: number };
+  };
+};
+
+type CompactTokenSavingsSummary = {
+  summary: { calls: number; raw_tokens: number; output_tokens: number; saved_tokens: number; avg_savings_pct: number };
+  by_tool: Array<{ tool: string; calls: number; raw_tokens: number; output_tokens: number; saved_tokens: number; avg_savings_pct: number }>;
+  recent: Array<{ id: number; tool: string; raw_tokens: number; output_tokens: number; saved_tokens: number; savings_pct: number; created_at: string }>;
+};
+
+export function compactDevelopmentWarningsText(warnings: CompactDevelopmentWarning[]): string[] {
+  if (!warnings.length) return [];
+  const lines = ["development warnings:"];
+  for (const w of warnings.slice(0, 8)) {
+    const files = w.files?.length ? ` files=${w.files.slice(0, 5).join(",")}` : "";
+    lines.push(`- ${w.severity} ${w.code}: ${oneLine(w.message, 180)}${files}`);
+  }
+  return lines;
+}
+
+export function safeJson(value: unknown): string | null {
+  if (value === undefined) return null;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return null;
+  }
+}
+
+export function toolJson(value: unknown): string {
+  return JSON.stringify(value, null, prettyJsonOutput ? 2 : undefined);
+}
+
+export function estimateTokens(text: string): number {
+  if (!text) return 0;
+  return Math.ceil(text.length / 4);
+}
+
+export function oneLine(input: string | null | undefined, max = 120): string {
+  const text = (input ?? "").replace(/\s+/g, " ").trim();
+  if (text.length <= max) return text;
+  return `${text.slice(0, Math.max(0, max - 3))}...`;
+}
+
+export function compactMemoryLabel(item: CompactMemoryItemPreview, max = 120): string {
+  const title = item.title ? ` ${oneLine(item.title, 48)}` : "";
+  const loc = item.file_path ? ` ${item.file_path}${item.start_line != null ? `:${item.start_line}` : ""}` : "";
+  const body = item.preview ? ` — ${oneLine(item.preview, max)}` : "";
+  return `#${item.id} ${item.kind}${title}${loc}${body}`;
+}
+
+export function compactRequirementLabel(req: CompactRequirementPreview): string {
+  const ctx = req.context_preview ? ` — ${oneLine(req.context_preview, 100)}` : "";
+  const mem = req.memory_item_id ? ` mem#${req.memory_item_id}` : "";
+  return `req#${req.id}${mem} [${req.status}] ${oneLine(req.title, 80)}${ctx}`;
+}
+
+export function compactChangeLabel(change: CompactChangeLogPreview): string {
+  return `change#${change.id} ${change.file_path}: ${oneLine(change.intent_preview, 120)}`;
+}
+
+export function compactPendingLabel(p: { file_path: string; last_event: string; updated_at: string }): string {
+  const source = "source" in p && p.source === "git" ? " git" : "";
+  const status = "git_status" in p && p.git_status ? ` ${p.git_status}` : "";
+  return `${p.last_event}${source}${status} ${p.file_path}`;
+}
+
+export function compactSemanticSearchText(data: { ok?: boolean } & CompactSemanticSearchResult): string {
+  const lines: string[] = [
+    `semantic ${data.mode} ${data.matches.length}/${data.top_k} q="${oneLine(data.query, 100)}"`,
+  ];
+  for (const m of data.matches.slice(0, data.top_k)) {
+    lines.push(`- score=${m.score.toFixed(3)} ${compactMemoryLabel(m.item, 160)}`);
+  }
+  if (!data.matches.length) lines.push("- no matches");
+  lines.push("hint: use format=json for full metadata; read_memory_item(id) for full content");
+  return lines.join("\n");
+}
+
+export function compactGrepText(data: {
+  ok?: boolean;
+  backend: GrepBackend;
+  fallback_reason?: string;
+  ripgrep_error?: string;
+  query: string;
+  mode: "regex" | "literal";
+  matches: GrepMatch[];
+  total_matches?: number;
+  truncated: boolean;
+  development_warnings?: CompactDevelopmentWarning[];
+  candidates?: { total: number; scanned: number };
+}): string {
+  const total = data.total_matches ?? data.matches.length;
+  const fallback = data.fallback_reason ? ` fallback=${data.fallback_reason}` : "";
+  const candidateText = data.candidates ? ` candidates=${data.candidates.scanned}/${data.candidates.total}` : "";
+  const lines = [
+    `grep ${data.backend}${fallback} mode=${data.mode} matches=${data.matches.length}/${total} truncated=${data.truncated}${candidateText} q="${oneLine(data.query, 100)}"`,
+  ];
+  lines.push(...compactDevelopmentWarningsText(data.development_warnings ?? []));
+  if (data.ripgrep_error) lines.push(`ripgrep_error ${oneLine(data.ripgrep_error, 180)}`);
+  for (const m of data.matches.slice(0, 80)) {
+    lines.push(`${m.file_path}:${m.line}:${m.col}: ${oneLine(m.preview, 220)}`);
+  }
+  if (!data.matches.length) lines.push("- no matches");
+  if (data.truncated) lines.push("hint: refine query/include_paths or raise max_results; use format=json for full match objects");
+  return lines.join("\n");
+}
+
+export function compactListProjectFilesText(data: {
+  path: string;
+  path_kind: string;
+  recursive: boolean;
+  max_depth: number;
+  returned: number;
+  scanned: number;
+  truncated: boolean;
+  entries: ProjectFileListEntry[];
+}): string {
+  const lines = [
+    `files path=${data.path} kind=${data.path_kind} returned=${data.returned} scanned=${data.scanned} recursive=${data.recursive} depth=${data.max_depth} truncated=${data.truncated}`,
+  ];
+  for (const e of data.entries.slice(0, 200)) {
+    const stat = e.size != null ? ` ${e.size}B` : "";
+    lines.push(`${e.kind === "dir" ? "d" : "f"} ${e.path}${stat}`);
+  }
+  if (!data.entries.length) lines.push("- empty");
+  if (data.truncated) lines.push("hint: narrow path/filters or raise max_results; use format=json for full entry metadata");
+  return lines.join("\n");
+}
+
+export function compactReadTextFileText(data: {
+  file_path: string;
+  offset?: number;
+  returned_chars: number;
+  total_chars: number;
+  truncated: boolean;
+  development_warnings?: CompactDevelopmentWarning[];
+  text: string;
+}): string {
+  const offset = data.offset != null ? ` offset=${data.offset}` : "";
+  const header = `file ${data.file_path}${offset} chars=${data.returned_chars}/${data.total_chars} truncated=${data.truncated}`;
+  const hint = data.truncated ? "\nhint: continue with offset or read_file_lines; use format=json for metadata fields" : "";
+  const warnings = compactDevelopmentWarningsText(data.development_warnings ?? []).join("\n");
+  return `${header}${warnings ? `\n${warnings}` : ""}\n${data.text}${hint}`;
+}
+
+export function compactReadFileLinesText(data: {
+  file_path: string;
+  from_line: number;
+  to_line: number;
+  returned: number;
+  truncated: boolean;
+  development_warnings?: CompactDevelopmentWarning[];
+  text: string;
+}): string {
+  const header = `lines ${data.file_path}:${data.from_line}-${data.to_line} returned=${data.returned} truncated=${data.truncated}`;
+  const hint = data.truncated ? "\nhint: narrow range or raise max_lines/max_chars; use format=json for metadata fields" : "";
+  const warnings = compactDevelopmentWarningsText(data.development_warnings ?? []).join("\n");
+  return `${header}${warnings ? `\n${warnings}` : ""}\n${data.text}${hint}`;
+}
+
+export function compactQueryCodebaseText(data: {
+  query: string;
+  matches: SymbolRow[];
+  development_warnings?: CompactDevelopmentWarning[];
+}): string {
+  const lines = [`query_codebase matches=${data.matches.length} q="${oneLine(data.query, 100)}"`];
+  lines.push(...compactDevelopmentWarningsText(data.development_warnings ?? []));
+  for (const m of data.matches.slice(0, 50)) {
+    lines.push(`${m.file_path}: ${m.type} ${m.name}${m.signature ? ` — ${oneLine(m.signature, 160)}` : ""}`);
+  }
+  if (!data.matches.length) lines.push("- no matches");
+  return lines.join("\n");
+}
+
+export function compactMaintenanceText(data: CompactMaintenanceResult): string {
+  const prunedChunks =
+    data.pruned.ignored_paths.chunks_deleted +
+    data.pruned.filename_noise.chunks_deleted +
+    data.pruned.stale_files.chunks_deleted;
+  const prunedSymbols =
+    data.pruned.ignored_paths.symbols_deleted +
+    data.pruned.filename_noise.symbols_deleted +
+    data.pruned.stale_files.symbols_deleted;
+  const lines = [
+    `maintain_memory ok dry_run=${data.dry_run} trigger=${data.trigger} compacted=${data.compacted_memory.compacted}/${data.compacted_memory.candidates} archived=${data.compacted_memory.archived} pruned_chunks=${prunedChunks} pruned_symbols=${prunedSymbols} hidden_embeddings=${data.pruned.hidden_embeddings.embeddings_deleted}`,
+  ];
+  if (data.compacted_memory.summary_memory_id) {
+    lines.push(`summary memory_compaction #${data.compacted_memory.summary_memory_id}`);
+  }
+  if (data.compacted_memory.samples.length) {
+    lines.push("memory candidates:");
+    for (const s of data.compacted_memory.samples.slice(0, 8)) {
+      lines.push(`- #${s.id} ${s.kind} ${s.file_path ?? ""} ${oneLine(s.title ?? "", 80)} ${s.updated_at}`);
+    }
+  }
+  if (data.pruned.stale_files.samples.length) {
+    lines.push("stale index samples:");
+    for (const s of data.pruned.stale_files.samples.slice(0, 8)) lines.push(`- ${s}`);
+  }
+  lines.push("hint: dry_run=false applies changes; vacuum=true reclaims sqlite file space after pruning");
+  return lines.join("\n");
+}
+
+export function compactPreflightChangeScopeText(data: {
+  ok: boolean;
+  safe_to_edit: boolean;
+  recommended_action: string;
+  change_mode: CompactChangeMode;
+  required_action?: string;
+  allowed_change_modes?: CompactChangeMode[];
+  active_requirement: { id: number; title: string } | null;
+  intent: string;
+  files: string[];
+  scope_contract: CompactRequirementScopeContract | null;
+  development_warnings: CompactDevelopmentWarning[];
+}): string {
+  const req = data.active_requirement ? `#${data.active_requirement.id} ${data.active_requirement.title}` : "none";
+  const lines = [
+    `preflight_change_scope ok=${data.ok} safe_to_edit=${data.safe_to_edit} mode=${data.change_mode} requirement=${req} files=${data.files.length} intent="${oneLine(data.intent, 120)}"`,
+    `action: ${oneLine(data.recommended_action, 180)}`,
+  ];
+  if (data.required_action) lines.push(`required_action=${data.required_action}`);
+  if (data.allowed_change_modes?.length) lines.push(`allowed_change_modes=${data.allowed_change_modes.join(",")}`);
+  if (data.scope_contract) {
+    lines.push(
+      `scope allow_terms=${data.scope_contract.allow_terms.length} deny_terms=${data.scope_contract.deny_terms.length} allowed_paths=${data.scope_contract.allowed_paths.length} denied_paths=${data.scope_contract.denied_paths.length}`,
+    );
+  }
+  lines.push(...compactDevelopmentWarningsText(data.development_warnings));
+  if (!data.development_warnings.length) lines.push("- no development warnings");
+  return lines.join("\n");
+}
+
+export function compactLargeFileSplitPlanText(data: LargeFileSplitPlan): string {
+  const lines = [
+    `large_file_split ok=${data.ok} file=${data.file_path} lines=${data.line_count} threshold=${data.huge_threshold_lines} action=${data.required_action}`,
+    `target_dir=${data.target_dir}`,
+    `forbidden=${data.forbidden_patterns.join(",")}`,
+  ];
+  lines.push("modules:");
+  for (const m of data.modules.slice(0, 20)) {
+    const decls = m.declarations.length ? ` decls=${m.declarations.slice(0, 8).join("; ")}` : " decls=(manual sections)";
+    lines.push(`- ${m.module} -> ${m.target_path}${decls}`);
+  }
+  lines.push("steps:");
+  for (const step of data.steps.slice(0, 8)) lines.push(`- ${step}`);
+  lines.push("validation:");
+  for (const v of data.validation.slice(0, 8)) lines.push(`- ${v}`);
+  lines.push("hint: use format=json for full declarations/rules");
+  return lines.join("\n");
+}
+
+export function compactBootstrapText(data: {
+  generated_at: string;
+  project_root: string;
+  root_source: RootSource;
+  watcher_enabled: boolean;
+  watcher_ready: boolean;
+  project_summary: CompactMemoryItemPreview | null;
+  decisions: Array<CompactMemoryItemPreview>;
+  conventions: Array<CompactMemoryItemPreview>;
+  current_context: Array<CompactMemoryItemPreview>;
+  recent_notes: Array<CompactMemoryItemPreview>;
+  pending_total: number;
+  pending_offset: number;
+  pending_limit: number;
+  pending_truncated: boolean;
+  pending_changes: PendingChangeRow[];
+  development_warnings?: CompactDevelopmentWarning[];
+  items: Array<{
+    requirement: CompactRequirementPreview;
+    recent_changes: Array<CompactChangeLogPreview>;
+  }>;
+  semantic?: CompactSemanticSearchResult | null;
+}): string {
+  const lines: string[] = [];
+  lines.push(
+    `ok ctx ${data.root_source} watcher=${data.watcher_enabled ? (data.watcher_ready ? "ready" : "starting") : "off"} root=${data.project_root}`,
+  );
+  if (data.project_summary) lines.push(`summary ${compactMemoryLabel(data.project_summary, 140)}`);
+  if (data.decisions.length) {
+    lines.push("current decisions:");
+    for (const d of data.decisions.slice(0, 5)) lines.push(`- ${compactMemoryLabel(d, 160)}`);
+  }
+  if (data.current_context.length) {
+    lines.push("current context:");
+    for (const c of data.current_context.slice(0, 8)) lines.push(`- ${compactMemoryLabel(c, 160)}`);
+  }
+  if (data.pending_total) {
+    lines.push(
+      `pending ${data.pending_changes.length}/${data.pending_total}${data.pending_truncated ? " truncated" : ""}: ${data.pending_changes
+        .slice(0, 8)
+        .map(compactPendingLabel)
+        .join("; ")}`,
+    );
+  } else {
+    lines.push("pending 0");
+  }
+  lines.push(...compactDevelopmentWarningsText(data.development_warnings ?? []));
+  if (data.items.length) {
+    lines.push("requirements:");
+    for (const item of data.items) {
+      lines.push(`- ${compactRequirementLabel(item.requirement)}`);
+      for (const c of item.recent_changes.slice(0, 3)) lines.push(`  - ${compactChangeLabel(c)}`);
+    }
+  } else {
+    lines.push("requirements: none");
+  }
+  if (data.recent_notes.length) {
+    lines.push("notes:");
+    for (const n of data.recent_notes.slice(0, 3)) lines.push(`- ${compactMemoryLabel(n, 120)}`);
+  }
+  if (data.conventions.length) {
+    lines.push(
+      `conventions ${data.conventions.length}: ${data.conventions
+        .slice(0, 5)
+        .map((c) => c.title ?? `#${c.id}`)
+        .join(", ")}`,
+    );
+  }
+  if (data.semantic) {
+    lines.push(`semantic ${data.semantic.mode} ${data.semantic.matches.length}/${data.semantic.top_k} for "${oneLine(data.semantic.query, 80)}":`);
+    for (const m of data.semantic.matches.slice(0, 5)) {
+      lines.push(`- score=${m.score.toFixed(3)} ${compactMemoryLabel(m.item, 120)}`);
+    }
+  }
+  lines.push("hint: use format=json for full structured output; read_memory_item(id) for full content");
+  return lines.join("\n");
+}
+
+export function compactBrainDumpText(data: Parameters<typeof compactBootstrapText>[0]): string {
+  return compactBootstrapText(data);
+}
+
+export function compactTokenSavingsText(data: CompactTokenSavingsSummary): string {
+  const s = data.summary;
+  const pct = Number(s.raw_tokens) > 0 ? (Number(s.saved_tokens) / Number(s.raw_tokens)) * 100 : 0;
+  const lines = [
+    `token_savings calls=${s.calls} raw=${s.raw_tokens} out=${s.output_tokens} saved=${s.saved_tokens} (${pct.toFixed(1)}%)`,
+  ];
+  if (data.by_tool.length) {
+    lines.push("by_tool:");
+    for (const t of data.by_tool.slice(0, 10)) {
+      lines.push(
+        `- ${t.tool}: calls=${t.calls} saved=${t.saved_tokens} raw=${t.raw_tokens} out=${t.output_tokens} avg=${Number(
+          t.avg_savings_pct,
+        ).toFixed(1)}%`,
+      );
+    }
+  }
+  if (data.recent.length) {
+    lines.push("recent:");
+    for (const r of data.recent.slice(0, 10)) {
+      lines.push(`- #${r.id} ${r.tool}: ${r.raw_tokens}->${r.output_tokens} saved=${r.saved_tokens}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+export function sliceTextForOutput(
+  input: string,
+  maxChars: number,
+): { text: string; truncated: boolean; total_chars: number } {
+  const total = input.length;
+  if (maxChars <= 0) return { text: input, truncated: false, total_chars: total };
+  if (total <= maxChars) return { text: input, truncated: false, total_chars: total };
+  return { text: input.slice(0, maxChars), truncated: true, total_chars: total };
+}
