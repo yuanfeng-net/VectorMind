@@ -1,9 +1,5 @@
 # VectorMind runtime artifacts
 .vectormind/
-.vectormind.db
-.vectormind.db-wal
-.vectormind.db-shm
-.vectormind.db-journal
 
 # Node / TypeScript
 node_modules/

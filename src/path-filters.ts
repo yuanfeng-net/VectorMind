@@ -1,4 +1,4 @@
-export function normalizePathNeedle(s: string): string {
+function normalizePathNeedle(s: string): string {
   return s.replace(/\\/g, "/").toLowerCase();
 }
 

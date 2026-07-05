@@ -96,10 +96,8 @@ function sha256Hex(input: string): string {
 function prunePendingChanges(): void {
   requireFileIndexingContext().prunePendingChanges();
 }
-
-export type TextChunk = { startLine: number; endLine: number; content: string };
-
-export function chunkTextByLines(
+type TextChunk = { startLine: number; endLine: number; content: string };
+function chunkTextByLines(
   content: string,
   opts: { maxChars: number; maxLines: number },
 ): TextChunk[] {
@@ -135,8 +133,7 @@ export function chunkTextByLines(
 
   return chunks;
 }
-
-export function indexFileContentChunks(
+function indexFileContentChunks(
   dbFilePath: string,
   absPath: string,
   content: string,
@@ -178,8 +175,7 @@ export function indexFileContentChunks(
   }
   return chunks.length;
 }
-
-export type PendingChangeEvent = "add" | "change" | "unlink";
+type PendingChangeEvent = "add" | "change" | "unlink";
 
 export function flushPendingChangeBuffer(): void {
   if (!hasDb()) return;
@@ -310,5 +306,4 @@ export function removeFileIndexes(absPath: string): void {
   }
   logActivity("remove_file", { file_path: filePath });
 }
-
-export type IndexReason = "add" | "change" | "manual";
+type IndexReason = "add" | "change" | "manual";

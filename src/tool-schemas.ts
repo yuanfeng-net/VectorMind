@@ -5,12 +5,10 @@ import {
   MAINTENANCE_MAX_INDEX_FILES,
   MAINTENANCE_MAX_MEMORY_ITEMS,
 } from "./config.js";
-
-export const ProjectRootArgSchema = z.object({
+const ProjectRootArgSchema = z.object({
   project_root: z.string().optional(),
 });
-
-export const OutputFormatSchema = z.object({
+const OutputFormatSchema = z.object({
   format: z.enum(["compact", "json"]).optional().default("compact"),
 });
 
@@ -220,35 +218,30 @@ export const MaintainMemoryArgsSchema = ProjectRootArgSchema.merge(OutputFormatS
     vacuum: z.boolean().optional().default(false),
   }),
 );
-
-export const DEFAULT_PENDING_LIMIT = 10;
+const DEFAULT_PENDING_LIMIT = 10;
 export const MAX_PENDING_LIMIT = 2000;
-
-export const PendingPagingSchema = z.object({
+const PendingPagingSchema = z.object({
   pending_offset: z.number().int().min(0).optional().default(0),
   pending_limit: z.number().int().min(1).max(MAX_PENDING_LIMIT).optional().default(DEFAULT_PENDING_LIMIT),
 });
 
 export const DEFAULT_PREVIEW_CHARS = 120;
-export const PreviewSchema = z.object({
+const PreviewSchema = z.object({
   preview_chars: z.number().int().min(50).max(10_000).optional().default(DEFAULT_PREVIEW_CHARS),
 });
-
-export const DEFAULT_CONTENT_MAX_CHARS = 1200;
-export const ContentMaxSchema = z.object({
+const DEFAULT_CONTENT_MAX_CHARS = 1200;
+const ContentMaxSchema = z.object({
   content_max_chars: z.number().int().min(0).max(200_000).optional().default(DEFAULT_CONTENT_MAX_CHARS),
 });
-
-export const DEFAULT_RECENT_REQUIREMENTS = 2;
-export const DEFAULT_RECENT_CHANGES_PER_REQ = 3;
-export const DEFAULT_RECENT_NOTES = 3;
-export const DEFAULT_CONVENTIONS_LIMIT = 0;
-export const DEFAULT_DECISIONS_LIMIT = 5;
-export const DEFAULT_CURRENT_CONTEXT_LIMIT = 8;
+const DEFAULT_RECENT_REQUIREMENTS = 2;
+const DEFAULT_RECENT_CHANGES_PER_REQ = 3;
+const DEFAULT_RECENT_NOTES = 3;
+const DEFAULT_CONVENTIONS_LIMIT = 0;
+const DEFAULT_DECISIONS_LIMIT = 5;
+const DEFAULT_CURRENT_CONTEXT_LIMIT = 8;
 export const MAX_DECISIONS_LIMIT = 50;
-export const MAX_CURRENT_CONTEXT_LIMIT = 50;
-
-export const BrainDumpLimitsSchema = z.object({
+const MAX_CURRENT_CONTEXT_LIMIT = 50;
+const BrainDumpLimitsSchema = z.object({
   requirements_limit: z.number().int().min(1).max(20).optional().default(DEFAULT_RECENT_REQUIREMENTS),
   changes_limit: z.number().int().min(1).max(100).optional().default(DEFAULT_RECENT_CHANGES_PER_REQ),
   notes_limit: z.number().int().min(0).max(50).optional().default(DEFAULT_RECENT_NOTES),

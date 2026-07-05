@@ -198,8 +198,7 @@ export function pruneFilenameNoiseIndexes(): { chunks_deleted: number; symbols_d
     return { chunks_deleted: 0, symbols_deleted: 0 };
   }
 }
-
-export type MaintenanceIndexPruneResult = {
+type MaintenanceIndexPruneResult = {
   ignored_paths: { chunks_deleted: number; symbols_deleted: number };
   filename_noise: { chunks_deleted: number; symbols_deleted: number };
   stale_files: {
@@ -210,8 +209,7 @@ export type MaintenanceIndexPruneResult = {
     samples: string[];
   };
 };
-
-export type MaintenanceCompactionResult = {
+type MaintenanceCompactionResult = {
   cutoff: string;
   candidates: number;
   compacted: number;
@@ -219,8 +217,7 @@ export type MaintenanceCompactionResult = {
   archived: number;
   samples: Array<{ id: number; kind: string; title: string | null; file_path: string | null; updated_at: string }>;
 };
-
-export type MaintenanceResult = {
+type MaintenanceResult = {
   ok: true;
   dry_run: boolean;
   trigger: "manual" | "auto";
@@ -237,8 +234,7 @@ export type MaintenanceResult = {
   pruned: MaintenanceIndexPruneResult;
   vacuumed: boolean;
 };
-
-export function kvGet(key: string): string | null {
+function kvGet(key: string): string | null {
   try {
     const row = getKvStatement()?.get(key) as { value: string } | undefined;
     return row?.value ?? null;
@@ -246,16 +242,14 @@ export function kvGet(key: string): string | null {
     return null;
   }
 }
-
-export function kvSet(key: string, value: string): void {
+function kvSet(key: string, value: string): void {
   try {
     getSetKvStatement()?.run(key, value);
   } catch (err) {
     console.error("[vectormind] kv set failed:", err);
   }
 }
-
-export function distinctChunkAndSymbolFilePaths(limit: number): string[] {
+function distinctChunkAndSymbolFilePaths(limit: number): string[] {
   const rows = getDb()
     .prepare(
       `SELECT file_path
@@ -278,8 +272,7 @@ export function distinctChunkAndSymbolFilePaths(limit: number): string[] {
     .all(limit) as Array<{ file_path: string }>;
   return Array.from(new Set(rows.map((r) => r.file_path).filter(Boolean)));
 }
-
-export function classifyStaleIndexFile(filePath: string): string | null {
+function classifyStaleIndexFile(filePath: string): string | null {
   if (!filePath) return "empty_path";
   if (shouldIgnoreDbFilePath(filePath)) return "ignored_path";
   if (shouldIgnoreContentFile(filePath)) return "filename_noise";
@@ -297,8 +290,7 @@ export function classifyStaleIndexFile(filePath: string): string | null {
   if (!isContentIndexableFile(absPath) && !isSymbolIndexableFile(absPath)) return "not_indexable";
   return null;
 }
-
-export function pruneStaleFileIndexes(opts: {
+function pruneStaleFileIndexes(opts: {
   dryRun: boolean;
   maxIndexFiles: number;
 }): MaintenanceIndexPruneResult["stale_files"] {
@@ -358,8 +350,7 @@ export function pruneStaleFileIndexes(opts: {
     samples,
   };
 }
-
-export function countIgnoredIndexDeletes(): { chunks_deleted: number; symbols_deleted: number } {
+function countIgnoredIndexDeletes(): { chunks_deleted: number; symbols_deleted: number } {
   if (!IGNORED_LIKE_PATTERNS.length) return { chunks_deleted: 0, symbols_deleted: 0 };
   const where = IGNORED_LIKE_PATTERNS
     .map(() => "LOWER(REPLACE(file_path, '\\\\', '/')) LIKE ?")
@@ -391,8 +382,7 @@ export function countIgnoredIndexDeletes(): { chunks_deleted: number; symbols_de
   );
   return { chunks_deleted: chunksDeleted, symbols_deleted: symbolsDeleted };
 }
-
-export function countFilenameNoiseIndexDeletes(): { chunks_deleted: number; symbols_deleted: number } {
+function countFilenameNoiseIndexDeletes(): { chunks_deleted: number; symbols_deleted: number } {
   const suffixWhere = NOISE_FILE_SUFFIXES.map(() => "LOWER(file_path) LIKE ?").join(" OR ");
   const baseWhere = NOISE_FILE_BASENAMES.map(() => "(LOWER(file_path) = ? OR LOWER(file_path) LIKE ?)").join(" OR ");
   const suffixArgs = NOISE_FILE_SUFFIXES.map((s) => `%${s}`);
@@ -436,8 +426,7 @@ export function countFilenameNoiseIndexDeletes(): { chunks_deleted: number; symb
   );
   return { chunks_deleted: chunksDeleted, symbols_deleted: symbolsDeleted };
 }
-
-export function selectCompactionCandidates(opts: {
+function selectCompactionCandidates(opts: {
   compactAfterDays: number;
   maxMemoryItems: number;
   compactNotes: boolean;
@@ -470,16 +459,14 @@ export function selectCompactionCandidates(opts: {
     .filter((row) => row.kind !== "note" || opts.compactNotes)
     .slice(0, opts.maxMemoryItems);
 }
-
-export function compactionLine(row: MemoryItemRow): string {
+function compactionLine(row: MemoryItemRow): string {
   const date = oneLine(row.updated_at || row.created_at, 19);
   const title = row.title ? ` ${oneLine(row.title, 80)}` : "";
   const file = row.file_path ? ` file=${row.file_path}${row.start_line != null ? `:${row.start_line}` : ""}` : "";
   const req = row.req_id != null ? ` req#${row.req_id}` : "";
   return `- ${date} #${row.id} ${row.kind}${req}${file}${title}: ${oneLine(row.content, 220)}`;
 }
-
-export function compactOldMemoryItems(opts: {
+function compactOldMemoryItems(opts: {
   dryRun: boolean;
   compactAfterDays: number;
   maxMemoryItems: number;

@@ -83,8 +83,7 @@ export const IGNORED_LIKE_PATTERNS = (() => {
   }
   return patterns;
 })();
-
-export function pathHasIgnoredSegments(posixPath: string): boolean {
+function pathHasIgnoredSegments(posixPath: string): boolean {
   const segments = posixPath
     .replace(/\\/g, "/")
     .split("/")
@@ -108,15 +107,6 @@ export function shouldIgnorePath(inputPath: string, projectRoot: string): boolea
 
   const relPosix = rel.replace(/\\/g, "/");
   if (pathHasIgnoredSegments(relPosix)) return true;
-
-  // Backward-compat ignore (pre-1.0.2 stored the DB in repo root)
-  if (
-    relPosix === ".vectormind.db" ||
-    relPosix.startsWith(".vectormind.db-") ||
-    relPosix === ".vectormind.db-journal"
-  ) {
-    return true;
-  }
 
   return false;
 }

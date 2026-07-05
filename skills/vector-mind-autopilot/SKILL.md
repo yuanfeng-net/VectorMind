@@ -72,7 +72,7 @@ If you still cannot determine it confidently, ask the user for the project root 
 - Avoid whole-file dumps, full-repo recursive listings, or broad raw match echo in normal flow; narrow the scope first and only surface the minimum needed lines/paths.
 - Avoid editing completed or merely related features while working on a new requirement unless the current user request explicitly requires it.
 - If you need to recall prior context/notes/decisions/code/docs: call `semantic_search({ project_root: <PROJECT_ROOT>, query, top_k, kinds? })` instead of guessing.
-  - Note: `semantic_search` works even when embeddings are off (uses local lexical/FTS/LIKE recall). Enable `VECTORMIND_EMBEDDINGS=on` if you want vector semantic recall too.
+  - Note: `semantic_search` uses local lexical/FTS/LIKE recall; no extra vectorization service or env switch is required.
 - If you truly need full text for a specific match/note/summary, call `read_memory_item({ project_root: <PROJECT_ROOT>, id, offset, limit })` to fetch it in chunks instead of setting `include_content: true`.
 - If a large/long-lived project feels slow, call `maintain_memory({ project_root: <PROJECT_ROOT>, dry_run: true })` first, then apply with `dry_run: false` only when the plan looks safe.
 

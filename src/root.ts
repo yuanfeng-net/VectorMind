@@ -6,14 +6,12 @@ import { fileURLToPath } from "node:url";
 import type { RootSource } from "./types.js";
 
 const rootFromEnv = process.env.VECTORMIND_ROOT?.trim() ?? "";
-
-export function getCodexHomeDir(): string {
+function getCodexHomeDir(): string {
   const raw = process.env.CODEX_HOME?.trim();
   if (raw) return path.resolve(raw);
   return path.join(os.homedir(), ".codex");
 }
-
-export function getAgentsHomeDir(): string {
+function getAgentsHomeDir(): string {
   const raw = process.env.AGENTS_HOME?.trim();
   if (raw) return path.resolve(raw);
   return path.join(os.homedir(), ".agents");
@@ -63,8 +61,7 @@ export function isProbablySystemDir(dir: string): boolean {
   }
   return false;
 }
-
-export function getVsCodeUserDirCandidate(): string | null {
+function getVsCodeUserDirCandidate(): string | null {
   try {
     const appData = process.env.APPDATA?.trim();
     if (process.platform === "win32") {
@@ -100,8 +97,7 @@ export function parseFileUriToPath(uri: string): string | null {
     return null;
   }
 }
-
-export function isProjectRootMarkerPresent(dir: string): boolean {
+function isProjectRootMarkerPresent(dir: string): boolean {
   const markers = [
     ".git",
     "package.json",
@@ -128,8 +124,7 @@ export function isProjectRootMarkerPresent(dir: string): boolean {
   }
   return false;
 }
-
-export function findNearestProjectRoot(startDir: string): string {
+function findNearestProjectRoot(startDir: string): string {
   let current = fs.existsSync(startDir) && fs.statSync(startDir).isFile()
     ? path.dirname(startDir)
     : startDir;

@@ -1,4 +1,4 @@
-export type BuiltinConventionSpec = {
+type BuiltinConventionSpec = {
   key: string;
   content: string;
   tags?: string[];

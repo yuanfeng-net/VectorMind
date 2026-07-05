@@ -41,8 +41,7 @@ function normalizeToDbPath(inputPath: string): string {
 function escapeRegExp(literal: string): string {
   return literal.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
 }
-
-export type DevelopmentWarning = {
+type DevelopmentWarning = {
   code:
     | "large_file"
     | "very_large_file"
@@ -68,22 +67,19 @@ export type ChangeMode =
   | "refactor"
   | "mechanical_modularization"
   | "emergency_hotfix";
-
-export type DevelopmentWarningFileInput = {
+type DevelopmentWarningFileInput = {
   file_path: string;
   last_event?: string;
   event?: string;
   updated_at?: string;
 };
-
-export type PathScopeCheck = {
+type PathScopeCheck = {
   input_path: string;
   abs_path: string;
   in_project: boolean;
   project_root: string;
 };
-
-export type RequirementScopeContract = {
+type RequirementScopeContract = {
   allow_terms: string[];
   deny_terms: string[];
   allowed_paths: string[];
@@ -138,14 +134,12 @@ export function countFileLinesBounded(absPath: string, maxBytes: number): { line
     fs.closeSync(fd);
   }
 }
-
-export function isPathInsideProjectRoot(absPath: string): boolean {
+function isPathInsideProjectRoot(absPath: string): boolean {
   const root = path.resolve(getProjectRoot());
   const rel = path.relative(root, path.resolve(absPath));
   return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
-
-export function checkPathScope(inputPath: string): PathScopeCheck {
+function checkPathScope(inputPath: string): PathScopeCheck {
   const normalizedInput = inputPath.trim() || ".";
   const absPath = path.resolve(path.isAbsolute(normalizedInput) ? normalizedInput : path.join(getProjectRoot(), normalizedInput));
   return {
@@ -174,8 +168,7 @@ export function buildCrossProjectPathWarnings(paths: string[] | null | undefined
     },
   ];
 }
-
-export function buildLargeImplementationFileWarning(args: {
+function buildLargeImplementationFileWarning(args: {
   code: "large_file" | "very_large_file" | "large_file_read" | "huge_file_modularization_required";
   filePath: string;
   lineCount: number;
@@ -333,8 +326,7 @@ export function buildRequirementStartWarnings(args: {
 
   return warnings;
 }
-
-export function normalizeScopeTerms(values: string[] | undefined): string[] {
+function normalizeScopeTerms(values: string[] | undefined): string[] {
   return Array.from(new Set((values ?? []).map((v) => v.trim()).filter(Boolean)));
 }
 
@@ -376,18 +368,15 @@ export function getRequirementScopeContract(reqId: number): RequirementScopeCont
     inferred_from: Array.isArray(obj.inferred_from) ? obj.inferred_from.filter((v): v is string => typeof v === "string") : [],
   };
 }
-
-export function wildcardToRegex(pattern: string): RegExp {
+function wildcardToRegex(pattern: string): RegExp {
   const source = escapeRegExp(pattern).replace(/\\\*/g, ".*");
   return new RegExp(source, "i");
 }
-
-export function pathMatchesAnyPattern(filePath: string, patterns: string[]): string[] {
+function pathMatchesAnyPattern(filePath: string, patterns: string[]): string[] {
   const normalized = filePath.replace(/\\/g, "/");
   return patterns.filter((p) => wildcardToRegex(p.replace(/\\/g, "/")).test(normalized));
 }
-
-export function fileContentHasDeniedTerms(filePath: string, terms: string[]): string[] {
+function fileContentHasDeniedTerms(filePath: string, terms: string[]): string[] {
   if (!terms.length || filePath === "(unspecified)") return [];
   const abs = path.isAbsolute(filePath) ? path.resolve(filePath) : path.join(getProjectRoot(), filePath);
   let st: fs.Stats;
@@ -592,8 +581,7 @@ export function buildDevelopmentWarnings(
 
   return warnings;
 }
-
-export function isLargeFileWarningCode(code: DevelopmentWarning["code"]): boolean {
+function isLargeFileWarningCode(code: DevelopmentWarning["code"]): boolean {
   return (
     code === "large_file" ||
     code === "very_large_file" ||

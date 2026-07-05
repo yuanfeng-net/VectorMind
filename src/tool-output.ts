@@ -3,8 +3,7 @@ import type { LargeFileSplitPlan } from "./large-file-split.js";
 import type { ProjectFileListEntry } from "./project-files.js";
 import type { GrepBackend, GrepMatch } from "./grep.js";
 import { prettyJsonOutput } from "./config.js";
-
-export type CompactDevelopmentWarning = {
+type CompactDevelopmentWarning = {
   code: string;
   severity: string;
   message: string;
@@ -72,8 +71,7 @@ type CompactTokenSavingsSummary = {
   by_tool: Array<{ tool: string; calls: number; raw_tokens: number; output_tokens: number; saved_tokens: number; avg_savings_pct: number }>;
   recent: Array<{ id: number; tool: string; raw_tokens: number; output_tokens: number; saved_tokens: number; savings_pct: number; created_at: string }>;
 };
-
-export function compactDevelopmentWarningsText(warnings: CompactDevelopmentWarning[]): string[] {
+function compactDevelopmentWarningsText(warnings: CompactDevelopmentWarning[]): string[] {
   if (!warnings.length) return [];
   const lines = ["development warnings:"];
   for (const w of warnings.slice(0, 8)) {
@@ -106,25 +104,21 @@ export function oneLine(input: string | null | undefined, max = 120): string {
   if (text.length <= max) return text;
   return `${text.slice(0, Math.max(0, max - 3))}...`;
 }
-
-export function compactMemoryLabel(item: CompactMemoryItemPreview, max = 120): string {
+function compactMemoryLabel(item: CompactMemoryItemPreview, max = 120): string {
   const title = item.title ? ` ${oneLine(item.title, 48)}` : "";
   const loc = item.file_path ? ` ${item.file_path}${item.start_line != null ? `:${item.start_line}` : ""}` : "";
   const body = item.preview ? ` — ${oneLine(item.preview, max)}` : "";
   return `#${item.id} ${item.kind}${title}${loc}${body}`;
 }
-
-export function compactRequirementLabel(req: CompactRequirementPreview): string {
+function compactRequirementLabel(req: CompactRequirementPreview): string {
   const ctx = req.context_preview ? ` — ${oneLine(req.context_preview, 100)}` : "";
   const mem = req.memory_item_id ? ` mem#${req.memory_item_id}` : "";
   return `req#${req.id}${mem} [${req.status}] ${oneLine(req.title, 80)}${ctx}`;
 }
-
-export function compactChangeLabel(change: CompactChangeLogPreview): string {
+function compactChangeLabel(change: CompactChangeLogPreview): string {
   return `change#${change.id} ${change.file_path}: ${oneLine(change.intent_preview, 120)}`;
 }
-
-export function compactPendingLabel(p: { file_path: string; last_event: string; updated_at: string }): string {
+function compactPendingLabel(p: { file_path: string; last_event: string; updated_at: string }): string {
   const source = "source" in p && p.source === "git" ? " git" : "";
   const status = "git_status" in p && p.git_status ? ` ${p.git_status}` : "";
   return `${p.last_event}${source}${status} ${p.file_path}`;

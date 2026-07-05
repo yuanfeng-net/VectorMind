@@ -5,8 +5,7 @@ let getProjectRoot = (): string => "";
 export function configureActivityLogProjectRoot(fn: () => string): void {
   getProjectRoot = fn;
 }
-
-export type ActivityEvent = {
+type ActivityEvent = {
   id: number;
   ts: string;
   type: string;

@@ -113,7 +113,7 @@ args = ["-y", "@coreyuan/vector-mind"]
 | 恢复上下文 | `bootstrap_context`, `get_brain_dump` |
 | 需求管理 | `start_requirement`, `complete_requirement` |
 | 改动记录 | `sync_change_intent`, `get_pending_changes` |
-| 开发边界检查 | `preflight_change_scope`, `development_warnings` |
+| 开发边界检查 | `preflight_change_scope` |
 | 巨量文件拆分 | `plan_large_file_split`, `record_large_file_split` |
 | 最新决策 | `upsert_decision`, `supersede_memory` |
 | 项目知识 | `upsert_project_summary`, `add_note`, `upsert_convention` |

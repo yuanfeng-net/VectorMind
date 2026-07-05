@@ -1494,37 +1494,7 @@ function initDatabase(): void {
     // ignore
   }
 
-  const legacyDbPath = path.join(projectRoot, ".vectormind.db");
-  const nextDbPath = path.join(vmDir, "vectormind.db");
-  dbPath = nextDbPath;
-
-  // One-time migration: move legacy root DB into .vectormind/ if the new DB doesn't exist yet.
-  if (!fs.existsSync(nextDbPath) && fs.existsSync(legacyDbPath)) {
-    const legacyWal = `${legacyDbPath}-wal`;
-    const legacyShm = `${legacyDbPath}-shm`;
-    const legacyJournal = `${legacyDbPath}-journal`;
-    const nextWal = `${nextDbPath}-wal`;
-    const nextShm = `${nextDbPath}-shm`;
-    const nextJournal = `${nextDbPath}-journal`;
-
-    try {
-      fs.renameSync(legacyDbPath, nextDbPath);
-      try {
-        if (fs.existsSync(legacyWal) && !fs.existsSync(nextWal)) fs.renameSync(legacyWal, nextWal);
-      } catch {}
-      try {
-        if (fs.existsSync(legacyShm) && !fs.existsSync(nextShm)) fs.renameSync(legacyShm, nextShm);
-      } catch {}
-      try {
-        if (fs.existsSync(legacyJournal) && !fs.existsSync(nextJournal)) {
-          fs.renameSync(legacyJournal, nextJournal);
-        }
-      } catch {}
-    } catch {
-      // If migration fails, fall back to opening the legacy DB in-place.
-      dbPath = legacyDbPath;
-    }
-  }
+  dbPath = path.join(vmDir, "vectormind.db");
   db = new Database(dbPath);
 
   db.pragma("journal_mode = WAL");
