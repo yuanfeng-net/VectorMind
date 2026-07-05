@@ -1,0 +1,223 @@
+import path from "node:path";
+
+export const IGNORED_PATH_SEGMENTS = new Set(
+  [
+    // VCS / tooling
+    ".git",
+    ".hg",
+    ".svn",
+    ".idea",
+    ".vscode",
+
+    // VectorMind artifacts
+    ".vectormind",
+
+    // Node ecosystem
+    "node_modules",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".turbo",
+    ".nx",
+    ".cache",
+    ".parcel-cache",
+
+    // .NET / VS build artifacts
+    "bin",
+    "obj",
+    ".vs",
+    "testresults",
+
+    // General build outputs
+    "dist",
+    "build",
+    "buildfiles",
+    "out",
+    "target",
+    "coverage",
+    "artifacts",
+
+    // Python caches/venvs
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".venv",
+    "venv",
+    "env",
+    ".tox",
+    ".nox",
+
+    // C/C++ common build dirs
+    "cmakefiles",
+    "debug",
+    "release",
+    "x64",
+    "x86",
+  ].map((s) => s.toLowerCase()),
+);
+
+export const NOISE_FILE_SUFFIXES = [
+  ".min.js",
+  ".min.css",
+  ".bundle.js",
+  ".bundle.css",
+  ".chunk.js",
+  ".chunk.css",
+];
+
+export const NOISE_FILE_BASENAMES = [
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "bun.lockb",
+  "cargo.lock",
+  "composer.lock",
+];
+
+export const IGNORED_LIKE_PATTERNS = (() => {
+  const patterns: string[] = [];
+  for (const seg of IGNORED_PATH_SEGMENTS) {
+    patterns.push(`${seg}/%`);
+    patterns.push(`%/${seg}/%`);
+  }
+  return patterns;
+})();
+
+export function pathHasIgnoredSegments(posixPath: string): boolean {
+  const segments = posixPath
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter(Boolean)
+    .map((s) => s.toLowerCase());
+  for (const seg of segments) {
+    if (IGNORED_PATH_SEGMENTS.has(seg)) return true;
+  }
+  return false;
+}
+
+export function shouldIgnoreDbFilePath(filePath: string | null): boolean {
+  if (!filePath) return false;
+  return pathHasIgnoredSegments(filePath);
+}
+
+export function shouldIgnorePath(inputPath: string, projectRoot: string): boolean {
+  const normalizedAbs = path.resolve(inputPath);
+  const rel = path.relative(projectRoot, normalizedAbs);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) return true;
+
+  const relPosix = rel.replace(/\\/g, "/");
+  if (pathHasIgnoredSegments(relPosix)) return true;
+
+  // Backward-compat ignore (pre-1.0.2 stored the DB in repo root)
+  if (
+    relPosix === ".vectormind.db" ||
+    relPosix.startsWith(".vectormind.db-") ||
+    relPosix === ".vectormind.db-journal"
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+export function isSymbolIndexableFile(filePath: string): boolean {
+  if (shouldIgnoreContentFile(filePath)) return false;
+  const ext = path.extname(filePath).toLowerCase();
+  const allowed = new Set([
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".py",
+    ".go",
+    ".rs",
+    ".java",
+    ".kt",
+    ".cs",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".h",
+    ".hpp",
+  ]);
+  return allowed.has(ext);
+}
+
+export function shouldIgnoreContentFile(filePath: string): boolean {
+  const base = path.basename(filePath).toLowerCase();
+  if (NOISE_FILE_BASENAMES.includes(base)) return true;
+  if (NOISE_FILE_SUFFIXES.some((suffix) => base.endsWith(suffix))) return true;
+  return false;
+}
+
+export function looksLikeGeneratedFile(content: string): boolean {
+  const head = content.slice(0, 4000).toLowerCase();
+  if (head.includes("@generated")) return true;
+  if (head.includes("do not edit") && (head.includes("generated") || head.includes("auto-generated"))) {
+    return true;
+  }
+  if (head.includes("this file was generated") && head.includes("do not edit")) return true;
+  return false;
+}
+
+export function looksLikeMinifiedBundle(content: string): boolean {
+  if (content.length < 30_000) return false;
+
+  let lines = 1;
+  let currentLen = 0;
+  let maxLineLen = 0;
+  let longLines = 0;
+
+  for (let i = 0; i < content.length; i++) {
+    const code = content.charCodeAt(i);
+    if (code === 10 /* \n */) {
+      if (currentLen > maxLineLen) maxLineLen = currentLen;
+      if (currentLen >= 800) longLines += 1;
+      currentLen = 0;
+      lines += 1;
+      continue;
+    }
+    currentLen += 1;
+  }
+  if (currentLen > maxLineLen) maxLineLen = currentLen;
+  if (currentLen >= 800) longLines += 1;
+
+  const avgLineLen = content.length / Math.max(1, lines);
+
+  if (lines <= 2 && maxLineLen >= 2000) return true;
+  if (maxLineLen >= 6000) return true;
+  if (avgLineLen >= 900) return true;
+  if (lines <= 10 && longLines >= Math.ceil(lines * 0.6)) return true;
+
+  return false;
+}
+
+export function getContentChunkKind(filePath: string): "code_chunk" | "doc_chunk" | null {
+  const ext = path.extname(filePath).toLowerCase();
+  const docExt = new Set([
+    ".md",
+    ".mdx",
+    ".txt",
+    ".rst",
+    ".adoc",
+    ".org",
+    ".json",
+    ".yml",
+    ".yaml",
+    ".toml",
+    ".ini",
+    ".env",
+    ".sql",
+  ]);
+  if (docExt.has(ext)) return "doc_chunk";
+  if (isSymbolIndexableFile(filePath)) return "code_chunk";
+  return null;
+}
+
+export function isContentIndexableFile(filePath: string): boolean {
+  if (shouldIgnoreContentFile(filePath)) return false;
+  return getContentChunkKind(filePath) !== null;
+}

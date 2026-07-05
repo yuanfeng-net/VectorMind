@@ -5,11 +5,9 @@ import * as readline from "node:readline";
 import crypto from "node:crypto";
 import os from "node:os";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
 
 import chokidar, { type FSWatcher } from "chokidar";
 import Database from "better-sqlite3";
-import { z } from "zod";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -31,293 +29,117 @@ import {
   BUILTIN_THREAD_HANDOFF_SWITCH_INSTRUCTIONS,
   BUILTIN_WRITE_POLICY_INSTRUCTIONS,
 } from "./builtin-instructions.js";
+import type {
+  ChangeLogRow,
+  ExtractedSymbol,
+  MemoryItemRow,
+  PendingChangeRow,
+  RequirementRow,
+  RootSource,
+  SymbolRow,
+} from "./types.js";
+import {
+  getAllowedCodexTextRoots,
+  isProbablySystemDir,
+  isProbablyVscodeInstallDir,
+  normalizeToDbPath as normalizePathText,
+  parseFileUriToPath,
+  resolveRootFromEnvOrThrow,
+  resolveRootFromToolArgOrThrow,
+  resolveSafeFallbackRootDir,
+} from "./root.js";
+import { buildLargeFileSplitPlan, type LargeFileSplitPlan } from "./large-file-split.js";
+import {
+  IGNORED_LIKE_PATTERNS,
+  IGNORED_PATH_SEGMENTS,
+  NOISE_FILE_BASENAMES,
+  NOISE_FILE_SUFFIXES,
+  getContentChunkKind,
+  isContentIndexableFile,
+  isSymbolIndexableFile,
+  looksLikeGeneratedFile,
+  looksLikeMinifiedBundle,
+  shouldIgnoreContentFile,
+  shouldIgnoreDbFilePath,
+  shouldIgnorePath,
+} from "./path-rules.js";
+import { extractSymbols } from "./symbols.js";
+import { compactInstallRtkText, detectRtk, installRtk } from "./rtk-tools.js";
+import {
+  AddNoteArgsSchema,
+  BootstrapContextArgsSchema,
+  ClearActivityLogArgsSchema,
+  CompleteRequirementArgsSchema,
+  DEFAULT_PREVIEW_CHARS,
+  DetectRtkArgsSchema,
+  GetActivityLogArgsSchema,
+  GetActivitySummaryArgsSchema,
+  GetBrainDumpArgsSchema,
+  GetPendingChangesArgsSchema,
+  GetTokenSavingsArgsSchema,
+  GrepArgsSchema,
+  InstallRtkArgsSchema,
+  ListProjectFilesArgsSchema,
+  MaintainMemoryArgsSchema,
+  MAX_DECISIONS_LIMIT,
+  MAX_PENDING_LIMIT,
+  PlanLargeFileSplitArgsSchema,
+  PreflightChangeScopeArgsSchema,
+  PruneIndexArgsSchema,
+  QueryCodebaseArgsSchema,
+  ReadCodexTextFileArgsSchema,
+  ReadFileLinesArgsSchema,
+  ReadFileTextArgsSchema,
+  ReadMemoryItemArgsSchema,
+  RecordLargeFileSplitArgsSchema,
+  SemanticSearchArgsSchema,
+  StartRequirementArgsSchema,
+  SupersedeMemoryArgsSchema,
+  SyncChangeIntentArgsSchema,
+  UpsertConventionArgsSchema,
+  UpsertDecisionArgsSchema,
+  UpsertProjectSummaryArgsSchema,
+  type MaintainMemoryArgs,
+  type OutputFormat,
+} from "./tool-schemas.js";
+import {
+  BOOTSTRAP_SEMANTIC_TIMEOUT_MS,
+  DEVELOPMENT_BLOCK_FILE_LINES,
+  DEVELOPMENT_HUGE_FILE_LINES,
+  DEVELOPMENT_WARN_FILE_BYTES,
+  DEVELOPMENT_WARN_FILE_LINES,
+  DEVELOPMENT_WARN_PENDING_FILES,
+  INDEX_AUTO_PRUNE_IGNORED,
+  INDEX_MAX_CODE_BYTES,
+  INDEX_MAX_DOC_BYTES,
+  INDEX_SKIP_MINIFIED,
+  MAINTENANCE_AUTO_ENABLED,
+  MAINTENANCE_COMPACT_AFTER_DAYS,
+  MAINTENANCE_INTERVAL_HOURS,
+  MAINTENANCE_MAX_INDEX_FILES,
+  MAINTENANCE_MAX_MEMORY_ITEMS,
+  PENDING_FLUSH_MS,
+  PENDING_MAX_ENTRIES,
+  PENDING_PRUNE_EVERY,
+  PENDING_TTL_DAYS,
+  RIPGREP_MAX_BUFFER_BYTES,
+  RIPGREP_RESOLVE_TIMEOUT_MS,
+  RIPGREP_SEARCH_TIMEOUT_MS,
+  ROOTS_LIST_TIMEOUT_MS,
+  SEMANTIC_EMBEDDINGS_TIMEOUT_MS,
+  SERVER_NAME,
+  SERVER_VERSION,
+  debugLogEnabled,
+  debugLogMaxEntries,
+  prettyJsonOutput,
+} from "./config.js";
 
-type RequirementRow = {
-  id: number;
-  title: string;
-  status: string;
-  context_data: string | null;
-  created_at: string;
-};
 
-type ChangeLogRow = {
-  id: number;
-  req_id: number;
-  file_path: string;
-  intent_summary: string;
-  timestamp: string;
-};
-
-type SymbolRow = {
-  name: string;
-  type: string;
-  file_path: string;
-  signature: string | null;
-};
-
-type MemoryItemRow = {
-  id: number;
-  kind: string;
-  title: string | null;
-  content: string;
-  file_path: string | null;
-  start_line: number | null;
-  end_line: number | null;
-  req_id: number | null;
-  metadata_json: string | null;
-  content_hash: string | null;
-  created_at: string;
-  updated_at: string;
-};
-
-type PendingChangeRow = {
-  file_path: string;
-  last_event: string;
-  updated_at: string;
-  source?: "watcher" | "git";
-  git_status?: string;
-  file_state_hash?: string;
-};
-
-type ExtractedSymbol = {
-  name: string;
-  type: string;
-  signature: string;
-};
-
-type RtkDetection = {
-  available: boolean;
-  version?: string;
-  command: string;
-  note: string;
-  gain_ok?: boolean;
-  gain_preview?: string;
-  path?: string;
-  source?: "path" | "package_shim";
-  exec_command?: string;
-  exec_args_prefix?: string[];
-  exec_shell?: boolean;
-};
-
-const SERVER_NAME = "vector-mind";
-const SERVER_VERSION = "1.0.49";
-
-type RootSource = "tool_arg" | "env" | "mcp_roots" | "cwd" | "fallback";
-
-const rootFromEnv = process.env.VECTORMIND_ROOT?.trim() ?? "";
-
-const prettyJsonOutput = ["1", "true", "on", "yes"].includes(
-  (process.env.VECTORMIND_PRETTY_JSON ?? "").trim().toLowerCase(),
-);
-
-const debugLogEnabled = ["1", "true", "on", "yes"].includes(
-  (process.env.VECTORMIND_DEBUG_LOG ?? "").trim().toLowerCase(),
-);
-const debugLogMaxEntries = (() => {
-  const raw = process.env.VECTORMIND_DEBUG_LOG_MAX?.trim();
-  if (!raw) return 200;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n <= 0) return 200;
-  return Math.min(5000, n);
-})();
-
-const PENDING_FLUSH_MS = (() => {
-  const raw = process.env.VECTORMIND_PENDING_FLUSH_MS?.trim();
-  if (!raw) return 200;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < 0) return 200;
-  return n;
-})();
-
-const PENDING_TTL_DAYS = (() => {
-  const raw = process.env.VECTORMIND_PENDING_TTL_DAYS?.trim();
-  if (!raw) return 30;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < 0) return 30;
-  return n;
-})();
-
-const PENDING_MAX_ENTRIES = (() => {
-  const raw = process.env.VECTORMIND_PENDING_MAX?.trim();
-  if (!raw) return 5000;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n <= 0) return 5000;
-  return n;
-})();
-
-const PENDING_PRUNE_EVERY = (() => {
-  const raw = process.env.VECTORMIND_PENDING_PRUNE_EVERY?.trim();
-  if (!raw) return 500;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n <= 0) return 500;
-  return n;
-})();
-
-const DEVELOPMENT_WARN_FILE_LINES = (() => {
-  const raw = process.env.VECTORMIND_WARN_FILE_LINES?.trim();
-  if (!raw) return 800;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < 100) return 800;
-  return Math.min(50_000, n);
-})();
-
-const DEVELOPMENT_BLOCK_FILE_LINES = (() => {
-  const raw = process.env.VECTORMIND_BLOCK_FILE_LINES?.trim();
-  if (!raw) return 1200;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < DEVELOPMENT_WARN_FILE_LINES) return Math.max(1200, DEVELOPMENT_WARN_FILE_LINES);
-  return Math.min(100_000, n);
-})();
-
-const DEVELOPMENT_HUGE_FILE_LINES = (() => {
-  const raw = process.env.VECTORMIND_HUGE_FILE_LINES?.trim();
-  if (!raw) return 3000;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < DEVELOPMENT_BLOCK_FILE_LINES) {
-    return Math.max(3000, DEVELOPMENT_BLOCK_FILE_LINES);
-  }
-  return Math.min(200_000, n);
-})();
-
-const DEVELOPMENT_WARN_FILE_BYTES = (() => {
-  const raw = process.env.VECTORMIND_WARN_FILE_BYTES?.trim();
-  if (!raw) return 120_000;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < 10_000) return 120_000;
-  return Math.min(20_000_000, n);
-})();
-
-const DEVELOPMENT_WARN_PENDING_FILES = (() => {
-  const raw = process.env.VECTORMIND_WARN_PENDING_FILES?.trim();
-  if (!raw) return 12;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < 1) return 12;
-  return Math.min(500, n);
-})();
-
-const RIPGREP_RESOLVE_TIMEOUT_MS = 5_000;
-const RIPGREP_SEARCH_TIMEOUT_MS = 30_000;
-const RIPGREP_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
 
 let cachedRipgrepCommand: string | null | undefined;
 let cachedRipgrepResolveError: string | null = null;
 
-function getCodexHomeDir(): string {
-  const raw = process.env.CODEX_HOME?.trim();
-  if (raw) return path.resolve(raw);
-  return path.join(os.homedir(), ".codex");
-}
 
-function getAgentsHomeDir(): string {
-  const raw = process.env.AGENTS_HOME?.trim();
-  if (raw) return path.resolve(raw);
-  return path.join(os.homedir(), ".agents");
-}
-
-function getAllowedCodexTextRoots(): string[] {
-  const codexHome = getCodexHomeDir();
-  const agentsHome = getAgentsHomeDir();
-  return Array.from(
-    new Set(
-      [
-        path.join(codexHome, "skills"),
-        path.join(codexHome, "prompts"),
-        path.join(codexHome, "rules"),
-        path.join(agentsHome, "skills"),
-      ].map((p) => path.resolve(p)),
-    ),
-  );
-}
-
-const INDEX_MAX_CODE_BYTES = (() => {
-  const raw = process.env.VECTORMIND_INDEX_MAX_CODE_BYTES?.trim();
-  if (!raw) return 400_000;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n <= 0) return 400_000;
-  return n;
-})();
-
-const INDEX_MAX_DOC_BYTES = (() => {
-  const raw = process.env.VECTORMIND_INDEX_MAX_DOC_BYTES?.trim();
-  if (!raw) return 600_000;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n <= 0) return 600_000;
-  return n;
-})();
-
-const INDEX_SKIP_MINIFIED = (() => {
-  const raw = (process.env.VECTORMIND_INDEX_SKIP_MINIFIED ?? "").trim().toLowerCase();
-  if (!raw) return true;
-  return ["1", "true", "on", "yes"].includes(raw);
-})();
-
-const INDEX_AUTO_PRUNE_IGNORED = (() => {
-  const raw = (process.env.VECTORMIND_INDEX_AUTO_PRUNE_IGNORED ?? "").trim().toLowerCase();
-  if (!raw) return true;
-  return ["1", "true", "on", "yes"].includes(raw);
-})();
-
-const MAINTENANCE_AUTO_ENABLED = (() => {
-  const raw = (process.env.VECTORMIND_MAINTENANCE_AUTO ?? "").trim().toLowerCase();
-  if (!raw) return true;
-  return ["1", "true", "on", "yes"].includes(raw);
-})();
-
-const MAINTENANCE_INTERVAL_HOURS = (() => {
-  const raw = process.env.VECTORMIND_MAINTENANCE_INTERVAL_HOURS?.trim();
-  if (!raw) return 24;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < 1) return 24;
-  return Math.min(24 * 30, n);
-})();
-
-const MAINTENANCE_COMPACT_AFTER_DAYS = (() => {
-  const raw = process.env.VECTORMIND_COMPACT_AFTER_DAYS?.trim();
-  if (!raw) return 45;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < 1) return 45;
-  return Math.min(3650, n);
-})();
-
-const MAINTENANCE_MAX_MEMORY_ITEMS = (() => {
-  const raw = process.env.VECTORMIND_MAINTENANCE_MAX_MEMORY_ITEMS?.trim();
-  if (!raw) return 250;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < 1) return 250;
-  return Math.min(5000, n);
-})();
-
-const MAINTENANCE_MAX_INDEX_FILES = (() => {
-  const raw = process.env.VECTORMIND_MAINTENANCE_MAX_INDEX_FILES?.trim();
-  if (!raw) return 1500;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < 1) return 1500;
-  return Math.min(50_000, n);
-})();
-
-const ROOTS_LIST_TIMEOUT_MS = (() => {
-  const raw = process.env.VECTORMIND_ROOTS_TIMEOUT_MS?.trim();
-  if (!raw) return 750;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n <= 0) return 750;
-  return n;
-})();
-
-const BOOTSTRAP_SEMANTIC_TIMEOUT_MS = (() => {
-  const raw = process.env.VECTORMIND_SEMANTIC_TIMEOUT_MS?.trim();
-  if (!raw) return 2500;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n <= 0) return 2500;
-  return n;
-})();
-
-const SEMANTIC_EMBEDDINGS_TIMEOUT_MS = (() => {
-  const raw = process.env.VECTORMIND_EMBEDDINGS_TIMEOUT_MS?.trim();
-  if (!raw) return 1500;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n <= 0) return 1500;
-  return n;
-})();
 
 let initialized = false;
 let rootSource: RootSource = "cwd";
@@ -509,281 +331,14 @@ function summarizeActivityEvent(e: ActivityEvent): string {
 const FTS_TABLE_NAME = "memory_items_fts";
 let ftsAvailable = false;
 
-function isProbablyVscodeInstallDir(dir: string): boolean {
-  const lower = dir.replace(/\\/g, "/").toLowerCase();
-  return lower.includes("/microsoft vs code");
-}
-
-function isProbablySystemDir(dir: string): boolean {
-  if (process.platform !== "win32") return false;
-  const candidate = path.resolve(dir);
-  const sysRootRaw = process.env.SystemRoot?.trim();
-  const sysRoot = sysRootRaw ? path.resolve(sysRootRaw) : null;
-  if (sysRoot) {
-    const rel = path.relative(sysRoot, candidate);
-    if (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel)) return true;
-  }
-  const windowsFallback = path.resolve("C:\\Windows");
-  {
-    const rel = path.relative(windowsFallback, candidate);
-    if (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel)) return true;
-  }
-  const programFiles = [
-    process.env["ProgramFiles"],
-    process.env["ProgramFiles(x86)"],
-    process.env["ProgramW6432"],
-  ].filter(Boolean) as string[];
-  for (const pf of programFiles) {
-    const rel = path.relative(path.resolve(pf), candidate);
-    if (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel)) return true;
-  }
-  return false;
-}
-
-function getVsCodeUserDirCandidate(): string | null {
-  const platform = process.platform;
-  if (platform === "win32") {
-    const appData = process.env.APPDATA?.trim();
-    const roaming = appData || path.join(os.homedir(), "AppData", "Roaming");
-    return path.join(roaming, "Code", "User");
-  }
-  if (platform === "darwin") {
-    return path.join(os.homedir(), "Library", "Application Support", "Code", "User");
-  }
-  return path.join(os.homedir(), ".config", "Code", "User");
-}
-
-function resolveSafeFallbackRootDir(): string {
-  const candidate = getVsCodeUserDirCandidate();
-  if (candidate) {
-    try {
-      fs.mkdirSync(candidate, { recursive: true });
-      const st = fs.statSync(candidate);
-      if (st.isDirectory()) return candidate;
-    } catch {
-      // ignore
-    }
-  }
-  return os.homedir();
-}
-
-function parseFileUriToPath(uri: string): string | null {
-  try {
-    return fileURLToPath(new URL(uri));
-  } catch {
-    return null;
-  }
-}
-
-function isProjectRootMarkerPresent(dir: string): boolean {
-  const markers = [
-    ".git",
-    ".hg",
-    ".svn",
-    "package.json",
-    "pnpm-workspace.yaml",
-    "pnpm-lock.yaml",
-    "yarn.lock",
-    "package-lock.json",
-    "tsconfig.json",
-    "pyproject.toml",
-    "requirements.txt",
-    "Pipfile",
-    "poetry.lock",
-    "go.mod",
-    "Cargo.toml",
-    "Cargo.lock",
-    "pom.xml",
-    "build.gradle",
-    "build.gradle.kts",
-  ];
-
-  for (const m of markers) {
-    try {
-      if (fs.existsSync(path.join(dir, m))) return true;
-    } catch {
-      // ignore
-    }
-  }
-
-  // Visual Studio solutions: check for any *.sln at this level.
-  try {
-    for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (ent.isFile() && ent.name.toLowerCase().endsWith(".sln")) return true;
-    }
-  } catch {
-    // ignore
-  }
-
-  return false;
-}
-
-function findNearestProjectRoot(startDir: string): string {
-  let dir = path.resolve(startDir);
-  for (let i = 0; i < 50; i++) {
-    if (isProjectRootMarkerPresent(dir)) return dir;
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return path.resolve(startDir);
-}
-
-function resolveRootFromToolArgOrThrow(raw: unknown): { root: string; source: RootSource } | null {
-  if (typeof raw !== "string") return null;
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-
-  const uriPath = trimmed.startsWith("file:") ? parseFileUriToPath(trimmed) : null;
-  const abs = path.resolve(uriPath ?? trimmed);
-  const parent = path.dirname(abs);
-  let startDir: string;
-  try {
-    const st = fs.statSync(abs);
-    startDir = st.isDirectory() ? abs : parent;
-  } catch {
-    // If the user provided a file path that doesn't exist yet, accept its parent directory.
-    try {
-      const st2 = fs.statSync(parent);
-      if (!st2.isDirectory()) throw new Error("parent is not a directory");
-      startDir = parent;
-    } catch (err) {
-      throw new Error(`[VectorMind] Invalid project_root: ${abs}. (${String(err)})`);
-    }
-  }
-
-  const root = findNearestProjectRoot(startDir);
-  try {
-    const st = fs.statSync(root);
-    if (!st.isDirectory()) throw new Error("not a directory");
-  } catch (err) {
-    throw new Error(`[VectorMind] Invalid project_root: ${root}. (${String(err)})`);
-  }
-
-  return { root, source: "tool_arg" };
-}
-
-function resolveRootFromEnvOrThrow(): { root: string; source: RootSource } | null {
-  if (!rootFromEnv) return null;
-  const abs = path.resolve(rootFromEnv);
-  try {
-    const st = fs.statSync(abs);
-    if (!st.isDirectory()) throw new Error("not a directory");
-  } catch (err) {
-    throw new Error(
-      `[VectorMind] Invalid VECTORMIND_ROOT: ${abs}. Set it to an existing project directory. (${String(err)})`,
-    );
-  }
-  return { root: abs, source: "env" };
-}
-
 function normalizeToDbPath(inputPath: string): string {
+  const normalized = normalizePathText(inputPath);
+  if (!normalized || normalized === ".") return ".";
   const abs = path.isAbsolute(inputPath) ? inputPath : path.join(projectRoot, inputPath);
   const rel = path.relative(projectRoot, abs);
   const inCwd = !!rel && !rel.startsWith("..") && !path.isAbsolute(rel);
   const candidate = inCwd ? rel : abs;
   return candidate.replace(/\\/g, "/");
-}
-
-const IGNORED_PATH_SEGMENTS = new Set(
-  [
-    // VCS / tooling
-    ".git",
-    ".hg",
-    ".svn",
-    ".idea",
-    ".vscode",
-
-    // VectorMind artifacts
-    ".vectormind",
-
-    // Node ecosystem
-    "node_modules",
-    ".next",
-    ".nuxt",
-    ".svelte-kit",
-    ".turbo",
-    ".nx",
-    ".cache",
-    ".parcel-cache",
-
-    // .NET / VS build artifacts
-    "bin",
-    "obj",
-    ".vs",
-    "testresults",
-
-    // General build outputs
-    "dist",
-    "build",
-    "buildfiles",
-    "out",
-    "target",
-    "coverage",
-    "artifacts",
-
-    // Python caches/venvs
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".venv",
-    "venv",
-    "env",
-    ".tox",
-    ".nox",
-
-    // C/C++ common build dirs
-    "cmakefiles",
-    "debug",
-    "release",
-    "x64",
-    "x86",
-  ].map((s) => s.toLowerCase()),
-);
-
-const NOISE_FILE_SUFFIXES = [
-  ".min.js",
-  ".min.css",
-  ".bundle.js",
-  ".bundle.css",
-  ".chunk.js",
-  ".chunk.css",
-];
-
-const NOISE_FILE_BASENAMES = [
-  "package-lock.json",
-  "pnpm-lock.yaml",
-  "yarn.lock",
-  "bun.lockb",
-  "cargo.lock",
-  "composer.lock",
-];
-
-const IGNORED_LIKE_PATTERNS = (() => {
-  const patterns: string[] = [];
-  for (const seg of IGNORED_PATH_SEGMENTS) {
-    patterns.push(`${seg}/%`);
-    patterns.push(`%/${seg}/%`);
-  }
-  return patterns;
-})();
-
-function pathHasIgnoredSegments(posixPath: string): boolean {
-  const segments = posixPath
-    .replace(/\\/g, "/")
-    .split("/")
-    .filter(Boolean)
-    .map((s) => s.toLowerCase());
-  for (const seg of segments) {
-    if (IGNORED_PATH_SEGMENTS.has(seg)) return true;
-  }
-  return false;
-}
-
-function shouldIgnoreDbFilePath(filePath: string | null): boolean {
-  if (!filePath) return false;
-  return pathHasIgnoredSegments(filePath);
 }
 
 function isProbablyGitRepository(): boolean {
@@ -1466,7 +1021,7 @@ function compactOldMemoryItems(opts: {
 }
 
 function runMemoryMaintenance(
-  args: z.infer<typeof MaintainMemoryArgsSchema>,
+  args: MaintainMemoryArgs,
   trigger: "manual" | "auto" = "manual",
 ): MaintenanceResult {
   const compactedMemory = args.compact_old_memories
@@ -1584,126 +1139,6 @@ function runAutoMaintenanceIfDue(): void {
   }
 }
 
-function shouldIgnorePath(inputPath: string): boolean {
-  const normalizedAbs = path.resolve(inputPath);
-  const rel = path.relative(projectRoot, normalizedAbs);
-  if (rel.startsWith("..") || path.isAbsolute(rel)) return true;
-
-  const relPosix = rel.replace(/\\/g, "/");
-  if (pathHasIgnoredSegments(relPosix)) return true;
-
-  // Backward-compat ignore (pre-1.0.2 stored the DB in repo root)
-  if (
-    relPosix === ".vectormind.db" ||
-    relPosix.startsWith(".vectormind.db-") ||
-    relPosix === ".vectormind.db-journal"
-  ) {
-    return true;
-  }
-
-  return false;
-}
-
-function isSymbolIndexableFile(filePath: string): boolean {
-  if (shouldIgnoreContentFile(filePath)) return false;
-  const ext = path.extname(filePath).toLowerCase();
-  const allowed = new Set([
-    ".ts",
-    ".tsx",
-    ".js",
-    ".jsx",
-    ".mjs",
-    ".cjs",
-    ".py",
-    ".go",
-    ".rs",
-    ".java",
-    ".kt",
-    ".cs",
-    ".c",
-    ".cc",
-    ".cpp",
-    ".h",
-    ".hpp",
-  ]);
-  return allowed.has(ext);
-}
-
-function shouldIgnoreContentFile(filePath: string): boolean {
-  const base = path.basename(filePath).toLowerCase();
-  if (NOISE_FILE_BASENAMES.includes(base)) return true;
-  if (NOISE_FILE_SUFFIXES.some((suffix) => base.endsWith(suffix))) return true;
-  return false;
-}
-
-function looksLikeGeneratedFile(content: string): boolean {
-  const head = content.slice(0, 4000).toLowerCase();
-  if (head.includes("@generated")) return true;
-  if (head.includes("do not edit") && (head.includes("generated") || head.includes("auto-generated"))) {
-    return true;
-  }
-  if (head.includes("this file was generated") && head.includes("do not edit")) return true;
-  return false;
-}
-
-function looksLikeMinifiedBundle(content: string): boolean {
-  if (content.length < 30_000) return false;
-
-  let lines = 1;
-  let currentLen = 0;
-  let maxLineLen = 0;
-  let longLines = 0;
-
-  for (let i = 0; i < content.length; i++) {
-    const code = content.charCodeAt(i);
-    if (code === 10 /* \\n */) {
-      if (currentLen > maxLineLen) maxLineLen = currentLen;
-      if (currentLen >= 800) longLines += 1;
-      currentLen = 0;
-      lines += 1;
-      continue;
-    }
-    currentLen += 1;
-  }
-  if (currentLen > maxLineLen) maxLineLen = currentLen;
-  if (currentLen >= 800) longLines += 1;
-
-  const avgLineLen = content.length / Math.max(1, lines);
-
-  if (lines <= 2 && maxLineLen >= 2000) return true;
-  if (maxLineLen >= 6000) return true;
-  if (avgLineLen >= 900) return true;
-  if (lines <= 10 && longLines >= Math.ceil(lines * 0.6)) return true;
-
-  return false;
-}
-
-function getContentChunkKind(filePath: string): "code_chunk" | "doc_chunk" | null {
-  const ext = path.extname(filePath).toLowerCase();
-  const docExt = new Set([
-    ".md",
-    ".mdx",
-    ".txt",
-    ".rst",
-    ".adoc",
-    ".org",
-    ".json",
-    ".yml",
-    ".yaml",
-    ".toml",
-    ".ini",
-    ".env",
-    ".sql",
-  ]);
-  if (docExt.has(ext)) return "doc_chunk";
-  if (isSymbolIndexableFile(filePath)) return "code_chunk";
-  return null;
-}
-
-function isContentIndexableFile(filePath: string): boolean {
-  if (shouldIgnoreContentFile(filePath)) return false;
-  return getContentChunkKind(filePath) !== null;
-}
 
 type DevelopmentWarning = {
   code:
@@ -2287,354 +1722,6 @@ function compactDevelopmentWarningsText(warnings: DevelopmentWarning[]): string[
   return lines;
 }
 
-function extractSymbols(filePath: string, content: string): ExtractedSymbol[] {
-  const ext = path.extname(filePath).toLowerCase();
-  if (ext === ".py") return extractPythonSymbols(content);
-  if (ext === ".rs") return extractRustSymbols(content);
-  if (ext === ".go") return extractGoSymbols(content);
-  if (
-    ext === ".ts" ||
-    ext === ".tsx" ||
-    ext === ".js" ||
-    ext === ".jsx" ||
-    ext === ".mjs" ||
-    ext === ".cjs"
-  ) {
-    return extractJsTsSymbols(content);
-  }
-  return extractCLikeSymbols(content);
-}
-
-function extractJsTsSymbols(content: string): ExtractedSymbol[] {
-  const symbols: ExtractedSymbol[] = [];
-  const lines = content.split(/\r?\n/);
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    if (trimmed.startsWith("//")) continue;
-
-    let match: RegExpMatchArray | null;
-
-    match = trimmed.match(/^(export\s+)?(default\s+)?class\s+([A-Za-z_$][\w$]*)/);
-    if (match) {
-      symbols.push({ name: match[3], type: "class", signature: trimmed });
-      continue;
-    }
-
-    match = trimmed.match(
-      /^(export\s+)?(async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/,
-    );
-    if (match) {
-      symbols.push({ name: match[3], type: "function", signature: trimmed });
-      continue;
-    }
-
-    match = trimmed.match(/^(export\s+)?interface\s+([A-Za-z_$][\w$]*)\b/);
-    if (match) {
-      symbols.push({ name: match[2], type: "interface", signature: trimmed });
-      continue;
-    }
-
-    match = trimmed.match(/^(export\s+)?type\s+([A-Za-z_$][\w$]*)\s*=/);
-    if (match) {
-      symbols.push({ name: match[2], type: "type", signature: trimmed });
-      continue;
-    }
-
-    match = trimmed.match(/^(export\s+)?enum\s+([A-Za-z_$][\w$]*)\b/);
-    if (match) {
-      symbols.push({ name: match[2], type: "enum", signature: trimmed });
-      continue;
-    }
-
-    match = trimmed.match(
-      /^(export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*(async\s*)?\(.*=>/,
-    );
-    if (match) {
-      symbols.push({ name: match[2], type: "function", signature: trimmed });
-      continue;
-    }
-
-    match = trimmed.match(
-      /^(export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*(async\s*)?function\s*\(/,
-    );
-    if (match) {
-      symbols.push({ name: match[2], type: "function", signature: trimmed });
-      continue;
-    }
-  }
-  return symbols;
-}
-
-function extractPythonSymbols(content: string): ExtractedSymbol[] {
-  const symbols: ExtractedSymbol[] = [];
-  const lines = content.split(/\r?\n/);
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-
-    let match: RegExpMatchArray | null;
-    match = trimmed.match(/^class\s+([A-Za-z_][\w]*)\b/);
-    if (match) {
-      symbols.push({ name: match[1], type: "class", signature: trimmed });
-      continue;
-    }
-    match = trimmed.match(/^(async\s+)?def\s+([A-Za-z_][\w]*)\s*\(/);
-    if (match) {
-      symbols.push({ name: match[2], type: "function", signature: trimmed });
-      continue;
-    }
-  }
-  return symbols;
-}
-
-function extractRustSymbols(content: string): ExtractedSymbol[] {
-  const symbols: ExtractedSymbol[] = [];
-  const lines = content.split(/\r?\n/);
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("//")) continue;
-
-    let match: RegExpMatchArray | null;
-    match = trimmed.match(/^(pub\s+)?(struct|enum|trait)\s+([A-Za-z_][\w]*)\b/);
-    if (match) {
-      symbols.push({ name: match[3], type: match[2], signature: trimmed });
-      continue;
-    }
-    match = trimmed.match(/^(pub\s+)?fn\s+([A-Za-z_][\w]*)\s*\(/);
-    if (match) {
-      symbols.push({ name: match[2], type: "function", signature: trimmed });
-      continue;
-    }
-  }
-  return symbols;
-}
-
-function extractGoSymbols(content: string): ExtractedSymbol[] {
-  const symbols: ExtractedSymbol[] = [];
-  const lines = content.split(/\r?\n/);
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("//")) continue;
-
-    let match: RegExpMatchArray | null;
-    match = trimmed.match(/^type\s+([A-Za-z_][\w]*)\s+(struct|interface)\b/);
-    if (match) {
-      symbols.push({ name: match[1], type: match[2], signature: trimmed });
-      continue;
-    }
-    match = trimmed.match(/^func\s+([A-Za-z_][\w]*)\s*\(/);
-    if (match) {
-      symbols.push({ name: match[1], type: "function", signature: trimmed });
-      continue;
-    }
-    match = trimmed.match(/^func\s+\([^)]*\)\s+([A-Za-z_][\w]*)\s*\(/);
-    if (match) {
-      symbols.push({ name: match[1], type: "method", signature: trimmed });
-      continue;
-    }
-  }
-  return symbols;
-}
-
-function extractCLikeSymbols(content: string): ExtractedSymbol[] {
-  const symbols: ExtractedSymbol[] = [];
-  const lines = content.split(/\r?\n/);
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    if (trimmed.startsWith("//") || trimmed.startsWith("/*") || trimmed.startsWith("*"))
-      continue;
-
-    let match: RegExpMatchArray | null;
-    match = trimmed.match(
-      /^(class|struct|interface|enum)\s+([A-Za-z_][\w]*)\b/,
-    );
-    if (match) {
-      symbols.push({ name: match[2], type: match[1], signature: trimmed });
-      continue;
-    }
-
-    match = trimmed.match(/^[A-Za-z_][\w:<>,\s\*&]*\s+([A-Za-z_][\w]*)\s*\(/);
-    if (match) {
-      symbols.push({ name: match[1], type: "function", signature: trimmed });
-      continue;
-    }
-  }
-  return symbols;
-}
-
-type TopLevelDeclaration = {
-  line: number;
-  kind: string;
-  name: string;
-  signature: string;
-  suggested_module: string;
-};
-
-type LargeFileSplitPlan = {
-  ok: true;
-  file_path: string;
-  line_count: number;
-  bytes: number;
-  huge_threshold_lines: number;
-  required_action: "mechanical_modularization";
-  intent: string;
-  target_dir: string;
-  forbidden_patterns: string[];
-  mechanical_rules: string[];
-  modules: Array<{ module: string; target_path: string; declarations: string[]; reason: string }>;
-  steps: string[];
-  validation: string[];
-  notes: string[];
-};
-
-function declarationRegexForExtension(ext: string): RegExp {
-  switch (ext) {
-    case ".rs":
-      return /^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:fn|struct|enum|trait|impl|mod|type|const|static)\s+([A-Za-z_][\w]*)?/;
-    case ".go":
-      return /^\s*(?:func|type|const|var)\s+(?:\([^)]*\)\s*)?([A-Za-z_][\w]*)?/;
-    case ".py":
-      return /^(?:class|async\s+def|def)\s+([A-Za-z_][\w]*)/;
-    case ".ts":
-    case ".tsx":
-    case ".js":
-    case ".jsx":
-    case ".mjs":
-    case ".cjs":
-      return /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|class|interface|type|enum|const|let|var)\s+([A-Za-z_$][\w$]*)?/;
-    default:
-      return /^\s*(?:pub\s+)?(?:async\s+)?(?:fn|function|class|struct|enum|interface|type|const|static)\s+([A-Za-z_][\w]*)?/;
-  }
-}
-
-function moduleNameFromDeclaration(name: string, signature: string): string {
-  const text = `${name} ${signature}`.toLowerCase();
-  const rules: Array<[RegExp, string]> = [
-    [/(config|setting|env)/, "config"],
-    [/(state|store|persist)/, "state"],
-    [/(api|client|request|response|heartbeat|activate|sync)/, "api"],
-    [/(service|daemon|install|start|stop)/, "service"],
-    [/(log|logger|redact)/, "logging"],
-    [/(gui|window|dialog|form|view|button|list)/, "ui"],
-    [/(share|disk|smb|unc|folder|directory)/, "share"],
-    [/(repair|cleanup|probe|health)/, "maintenance"],
-    [/(path|sanitize|normalize|host|ip|util|helper)/, "util"],
-    [/(test|mock|fixture)/, "tests"],
-  ];
-  for (const [pattern, moduleName] of rules) {
-    if (pattern.test(text)) return moduleName;
-  }
-  return "core";
-}
-
-function topLevelDeclarationsForPlan(content: string, ext: string, maxDecls = 160): TopLevelDeclaration[] {
-  const decls: TopLevelDeclaration[] = [];
-  const lines = content.split(/\r?\n/);
-  const regex = declarationRegexForExtension(ext);
-  for (let i = 0; i < lines.length && decls.length < maxDecls; i++) {
-    const raw = lines[i];
-    const trimmed = raw.trim();
-    if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("#")) continue;
-    const m = raw.match(regex);
-    if (!m) continue;
-    const fallback = trimmed.split(/\s+/).slice(0, 3).join("_").replace(/[^\w$]+/g, "_");
-    const name = (m[1] || fallback || `declaration_${i + 1}`).replace(/^[^A-Za-z_]+/, "") || `declaration_${i + 1}`;
-    const kind = trimmed.split(/\s+/).find((part) =>
-      ["fn", "function", "class", "struct", "enum", "trait", "impl", "mod", "type", "const", "static", "interface"].includes(
-        part.replace(/[({].*$/, ""),
-      ),
-    ) ?? "declaration";
-    decls.push({
-      line: i + 1,
-      kind,
-      name,
-      signature: oneLine(trimmed, 180),
-      suggested_module: moduleNameFromDeclaration(name, trimmed),
-    });
-  }
-  return decls;
-}
-
-function targetPathForModule(originalFilePath: string, targetDir: string, moduleName: string): string {
-  const ext = path.extname(originalFilePath) || ".txt";
-  const normalizedTargetDir = targetDir.replace(/\\/g, "/").replace(/\/+$/, "");
-  if (!normalizedTargetDir || normalizedTargetDir === ".") return `${moduleName}${ext}`;
-  return `${normalizedTargetDir}/${moduleName}${ext}`;
-}
-
-function buildLargeFileSplitPlan(args: {
-  filePath: string;
-  absPath: string;
-  intent: string;
-  targetDir?: string;
-  maxModules: number;
-}): LargeFileSplitPlan {
-  const content = fs.readFileSync(args.absPath, "utf8");
-  const st = fs.statSync(args.absPath);
-  const lines = content.split(/\r?\n/).length;
-  const ext = path.extname(args.absPath).toLowerCase();
-  const baseName = path.basename(args.filePath, path.extname(args.filePath));
-  const parentDir = path.dirname(args.filePath).replace(/\\/g, "/");
-  const defaultTargetDir = parentDir === "." ? baseName : `${parentDir}/${baseName}`;
-  const targetDir = normalizeToDbPath(args.targetDir ?? defaultTargetDir);
-  const declarations = topLevelDeclarationsForPlan(content, ext);
-  const grouped = new Map<string, TopLevelDeclaration[]>();
-  for (const decl of declarations) {
-    const key = grouped.size >= args.maxModules && !grouped.has(decl.suggested_module) ? "core" : decl.suggested_module;
-    const list = grouped.get(key) ?? [];
-    list.push(decl);
-    grouped.set(key, list);
-  }
-  if (!grouped.size) grouped.set("core", []);
-  const modules = Array.from(grouped.entries())
-    .slice(0, args.maxModules)
-    .map(([moduleName, decls]) => ({
-      module: moduleName,
-      target_path: targetPathForModule(args.filePath, targetDir, moduleName),
-      declarations: decls.slice(0, 24).map((d) => `${d.kind} ${d.name} @L${d.line}`),
-      reason: `Move whole ${moduleName}-related declarations together without changing behavior.`,
-    }));
-
-  return {
-    ok: true,
-    file_path: args.filePath,
-    line_count: lines,
-    bytes: st.size,
-    huge_threshold_lines: DEVELOPMENT_HUGE_FILE_LINES,
-    required_action: "mechanical_modularization",
-    intent: args.intent,
-    target_dir: targetDir,
-    forbidden_patterns: ["*.generated.*", "*.parts", "*.rs.parts", "*_part*", "*Part*"],
-    mechanical_rules: [
-      "Move only complete declarations/impl blocks/functions/classes/types; do not split a declaration body.",
-      "Use real module names and clear directory boundaries; do not create generated/parts/partN files.",
-      "Preserve behavior, names, API semantics, data formats, side effects, and test expectations.",
-      "Only add necessary module declarations, imports, pub(crate), and re-exports to make moved code compile.",
-      "Run formatter, build/check, and relevant tests after each small phase.",
-    ],
-    modules,
-    steps: [
-      "Create a dedicated mechanical modularization requirement before touching the huge file.",
-      "Add the target module directory and move one cohesive declaration group at a time.",
-      "Keep the original file as a thin entry/mod orchestration file where possible.",
-      "After each group, run formatter and the smallest available compile/test command.",
-      "Record the split with record_large_file_split(status='partial' or 'resolved').",
-      "Resume the original feature only after the target huge file is no longer the default place for new code.",
-    ],
-    validation: [
-      "No *.generated.*, *.parts, *.rs.parts, or numbered part files were created.",
-      "The original file line count decreased or contains only thin orchestration glue.",
-      "Formatter passes.",
-      "Build/check passes.",
-      "Relevant tests pass.",
-    ],
-    notes: declarations.length
-      ? [`Detected ${declarations.length} top-level declarations for mechanical grouping.`]
-      : ["No top-level declarations were detected by lightweight scanning; split by obvious cohesive sections and verify after each move."],
-  };
-}
 
 type TextChunk = { startLine: number; endLine: number; content: string };
 
@@ -2762,7 +1849,7 @@ function flushPendingChangeBuffer(): void {
 }
 
 function recordPendingChange(absPath: string, event: PendingChangeEvent): void {
-  if (shouldIgnorePath(absPath)) return;
+  if (shouldIgnorePath(absPath, projectRoot)) return;
   const track = isSymbolIndexableFile(absPath) || isContentIndexableFile(absPath);
   if (!track) return;
   const filePath = normalizeToDbPath(absPath);
@@ -2776,7 +1863,7 @@ function recordPendingChange(absPath: string, event: PendingChangeEvent): void {
 }
 
 function indexFile(absPath: string, reason: IndexReason): void {
-  if (shouldIgnorePath(absPath)) return;
+  if (shouldIgnorePath(absPath, projectRoot)) return;
   const indexSymbols = isSymbolIndexableFile(absPath);
   const indexContent = isContentIndexableFile(absPath);
   if (!indexSymbols && !indexContent) return;
@@ -2843,7 +1930,7 @@ function indexFile(absPath: string, reason: IndexReason): void {
 }
 
 function removeFileIndexes(absPath: string): void {
-  if (shouldIgnorePath(absPath)) return;
+  if (shouldIgnorePath(absPath, projectRoot)) return;
   const filePath = normalizeToDbPath(absPath);
   try {
     deleteSymbolsForFileStmt.run(filePath);
@@ -2858,361 +1945,6 @@ function removeFileIndexes(absPath: string): void {
   logActivity("remove_file", { file_path: filePath });
 }
 
-const ProjectRootArgSchema = z.object({
-  project_root: z.string().optional(),
-});
-
-const OutputFormatSchema = z.object({
-  format: z.enum(["compact", "json"]).optional().default("compact"),
-});
-
-type OutputFormat = z.infer<typeof OutputFormatSchema>["format"];
-
-const StartRequirementArgsSchema = ProjectRootArgSchema.merge(
-  z.object({
-    title: z.string().min(1),
-    background: z.string().optional().default(""),
-    close_previous: z.boolean().optional().default(true),
-    scope_allow: z.array(z.string().min(1)).optional(),
-    scope_deny: z.array(z.string().min(1)).optional(),
-    allowed_paths: z.array(z.string().min(1)).optional(),
-    denied_paths: z.array(z.string().min(1)).optional(),
-  }),
-);
-
-const SyncChangeIntentArgsSchema = ProjectRootArgSchema.merge(
-  z.object({
-    intent: z.string().min(1),
-    files: z.array(z.string().min(1)).optional(),
-    affected_files: z.array(z.string().min(1)).optional(),
-  }),
-);
-
-const PreflightChangeScopeArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
-  z.object({
-    intent: z.string().optional().default(""),
-    files: z.array(z.string().min(1)).optional(),
-    planned_files: z.array(z.string().min(1)).optional(),
-    change_mode: z
-      .enum(["feature", "bugfix", "refactor", "mechanical_modularization", "emergency_hotfix"])
-      .optional()
-      .default("feature"),
-    scope_allow: z.array(z.string().min(1)).optional(),
-    scope_deny: z.array(z.string().min(1)).optional(),
-    allowed_paths: z.array(z.string().min(1)).optional(),
-    denied_paths: z.array(z.string().min(1)).optional(),
-  }),
-);
-
-const PlanLargeFileSplitArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
-  z.object({
-    file: z.string().min(1),
-    intent: z.string().optional().default("mechanical modularization"),
-    target_dir: z.string().optional(),
-    max_modules: z.number().int().min(2).max(30).optional().default(12),
-  }),
-);
-
-const RecordLargeFileSplitArgsSchema = ProjectRootArgSchema.merge(
-  z.object({
-    file: z.string().min(1),
-    status: z.enum(["planned", "in_progress", "partial", "resolved"]),
-    summary: z.string().min(1),
-    modules: z.array(z.string().min(1)).optional(),
-    remaining_lines: z.number().int().min(0).optional(),
-  }),
-);
-
-const QueryCodebaseArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
-  z.object({
-    query: z.string().min(1),
-  }),
-);
-
-const GrepArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
-  z.object({
-    // Pattern to search for. Defaults to regex mode for parity with tools like ripgrep.
-    query: z.string().min(1),
-    mode: z.enum(["regex", "literal"]).optional().default("regex"),
-    // If case_sensitive is omitted and smart_case=true, uppercase => case-sensitive, otherwise case-insensitive.
-    smart_case: z.boolean().optional().default(true),
-    case_sensitive: z.boolean().optional(),
-    // Compatibility knob for the indexed fallback when ripgrep is unavailable.
-    literal_hint: z.string().optional().default(""),
-    // Compatibility knob for the indexed fallback when ripgrep is unavailable.
-    kinds: z.array(z.string().min(1)).optional(),
-    include_paths: z.array(z.string().min(1)).optional(),
-    exclude_paths: z.array(z.string().min(1)).optional(),
-    max_results: z.number().int().min(1).max(5000).optional().default(200),
-    // Compatibility knob for the indexed fallback when ripgrep is unavailable.
-    max_candidates: z.number().int().min(1).max(50_000).optional(),
-  }),
-);
-
-const ReadFileLinesArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
-  z.object({
-    // Relative to project_root, or an absolute path under project_root.
-    path: z.string().min(1),
-    from_line: z.number().int().min(1).optional().default(1),
-    to_line: z.number().int().min(1).optional(),
-    // Convenience for "head": if set, reads from_line..(from_line+total_count-1) unless to_line is provided.
-    total_count: z.number().int().min(1).optional(),
-    // Hard limits to avoid huge token blow-ups.
-    max_lines: z.number().int().min(1).max(2000).optional().default(400),
-    max_chars: z.number().int().min(200).max(200_000).optional().default(20_000),
-  }),
-);
-
-const ReadFileTextArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
-  z.object({
-    // Relative to project_root, or an absolute path under project_root.
-    path: z.string().min(1),
-    // Character offset in the decoded UTF-8 text.
-    offset: z.number().int().min(0).optional().default(0),
-    // Hard limit on returned text to avoid huge outputs.
-    max_chars: z.number().int().min(1).max(200_000).optional().default(20_000),
-    // Safety guard for raw reads; use read_file_lines on larger files.
-    max_file_bytes: z.number().int().min(1_000).max(5_000_000).optional().default(1_000_000),
-  }),
-);
-
-const ReadCodexTextFileArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
-  z.object({
-    // Absolute path, file:// URI, or a path under CODEX_HOME / AGENTS_HOME allowed roots.
-    path: z.string().min(1),
-    offset: z.number().int().min(0).optional().default(0),
-    max_chars: z.number().int().min(1).max(200_000).optional().default(20_000),
-    max_file_bytes: z.number().int().min(1_000).max(5_000_000).optional().default(1_000_000),
-  }),
-);
-
-const ListProjectFilesArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
-  z.object({
-    // Relative directory/file path under project_root. "." means the project root.
-    path: z.string().optional().default("."),
-    recursive: z.boolean().optional().default(false),
-    max_depth: z.number().int().min(1).max(20).optional().default(4),
-    include_files: z.boolean().optional().default(true),
-    include_dirs: z.boolean().optional().default(true),
-    include_hidden: z.boolean().optional().default(false),
-    respect_ignore: z.boolean().optional().default(true),
-    include_paths: z.array(z.string().min(1)).optional(),
-    exclude_paths: z.array(z.string().min(1)).optional(),
-    extensions: z.array(z.string().min(1)).optional(),
-    max_results: z.number().int().min(1).max(5000).optional().default(200),
-    include_stats: z.boolean().optional().default(false),
-  }),
-);
-
-const UpsertProjectSummaryArgsSchema = ProjectRootArgSchema.merge(
-  z.object({
-    summary: z.string().min(1),
-  }),
-);
-
-const AddNoteArgsSchema = ProjectRootArgSchema.merge(
-  z.object({
-    title: z.string().optional().default(""),
-    content: z.string().min(1),
-    tags: z.array(z.string().min(1)).optional(),
-  }),
-);
-
-const PruneIndexArgsSchema = ProjectRootArgSchema.merge(
-  z.object({
-    dry_run: z.boolean().optional().default(true),
-    prune_ignored_paths: z.boolean().optional().default(true),
-    prune_minified_bundles: z.boolean().optional().default(false),
-    max_files: z.number().int().min(1).max(50_000).optional().default(2000),
-    vacuum: z.boolean().optional().default(false),
-  }),
-);
-
-const UpsertConventionArgsSchema = ProjectRootArgSchema.merge(
-  z.object({
-    key: z.string().min(1),
-    content: z.string().min(1),
-    tags: z.array(z.string().min(1)).optional(),
-  }),
-);
-
-const UpsertDecisionArgsSchema = ProjectRootArgSchema.merge(
-  z.object({
-    key: z.string().min(1),
-    title: z.string().optional().default(""),
-    content: z.string().min(1),
-    tags: z.array(z.string().min(1)).optional(),
-    supersedes_req_ids: z.array(z.number().int().positive()).optional(),
-    supersedes_memory_ids: z.array(z.number().int().positive()).optional(),
-    related_files: z.array(z.string().min(1)).optional(),
-  }),
-);
-
-const SupersedeMemoryArgsSchema = ProjectRootArgSchema.merge(
-  z.object({
-    superseded_req_ids: z.array(z.number().int().positive()).optional(),
-    superseded_memory_ids: z.array(z.number().int().positive()).optional(),
-    replacement_req_id: z.number().int().positive().optional(),
-    replacement_memory_id: z.number().int().positive().optional(),
-    reason: z.string().min(1),
-  }),
-);
-
-const MaintainMemoryArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
-  z.object({
-    dry_run: z.boolean().optional().default(true),
-    compact_old_memories: z.boolean().optional().default(true),
-    compact_notes: z.boolean().optional().default(false),
-    prune_stale_indexes: z.boolean().optional().default(true),
-    prune_ignored_paths: z.boolean().optional().default(true),
-    prune_filename_noise: z.boolean().optional().default(true),
-    prune_hidden_embeddings: z.boolean().optional().default(true),
-    compact_after_days: z.number().int().min(1).max(3650).optional().default(MAINTENANCE_COMPACT_AFTER_DAYS),
-    max_memory_items: z.number().int().min(1).max(5000).optional().default(MAINTENANCE_MAX_MEMORY_ITEMS),
-    max_index_files: z.number().int().min(1).max(50_000).optional().default(MAINTENANCE_MAX_INDEX_FILES),
-    vacuum: z.boolean().optional().default(false),
-  }),
-);
-
-const DEFAULT_PENDING_LIMIT = 10;
-const MAX_PENDING_LIMIT = 2000;
-
-const PendingPagingSchema = z.object({
-  pending_offset: z.number().int().min(0).optional().default(0),
-  pending_limit: z.number().int().min(1).max(MAX_PENDING_LIMIT).optional().default(DEFAULT_PENDING_LIMIT),
-});
-
-const DEFAULT_PREVIEW_CHARS = 120;
-const PreviewSchema = z.object({
-  preview_chars: z.number().int().min(50).max(10_000).optional().default(DEFAULT_PREVIEW_CHARS),
-});
-
-const DEFAULT_CONTENT_MAX_CHARS = 1200;
-const ContentMaxSchema = z.object({
-  content_max_chars: z.number().int().min(0).max(200_000).optional().default(DEFAULT_CONTENT_MAX_CHARS),
-});
-
-const DEFAULT_RECENT_REQUIREMENTS = 2;
-const DEFAULT_RECENT_CHANGES_PER_REQ = 3;
-const DEFAULT_RECENT_NOTES = 3;
-const DEFAULT_CONVENTIONS_LIMIT = 0;
-const DEFAULT_DECISIONS_LIMIT = 5;
-const DEFAULT_CURRENT_CONTEXT_LIMIT = 8;
-const MAX_DECISIONS_LIMIT = 50;
-const MAX_CURRENT_CONTEXT_LIMIT = 50;
-
-const BrainDumpLimitsSchema = z.object({
-  requirements_limit: z.number().int().min(1).max(20).optional().default(DEFAULT_RECENT_REQUIREMENTS),
-  changes_limit: z.number().int().min(1).max(100).optional().default(DEFAULT_RECENT_CHANGES_PER_REQ),
-  notes_limit: z.number().int().min(0).max(50).optional().default(DEFAULT_RECENT_NOTES),
-  conventions_limit: z.number().int().min(0).max(200).optional().default(DEFAULT_CONVENTIONS_LIMIT),
-  decisions_limit: z.number().int().min(0).max(MAX_DECISIONS_LIMIT).optional().default(DEFAULT_DECISIONS_LIMIT),
-  current_context_limit: z
-    .number()
-    .int()
-    .min(0)
-    .max(MAX_CURRENT_CONTEXT_LIMIT)
-    .optional()
-    .default(DEFAULT_CURRENT_CONTEXT_LIMIT),
-});
-
-const GetPendingChangesArgsSchema = ProjectRootArgSchema.merge(
-  z.object({
-    offset: z.number().int().min(0).optional().default(0),
-    limit: z.number().int().min(1).max(MAX_PENDING_LIMIT).optional().default(DEFAULT_PENDING_LIMIT),
-  }),
-);
-
-const CompleteRequirementArgsSchema = ProjectRootArgSchema.merge(
-  z.object({
-    req_id: z.number().int().positive().optional(),
-    all_active: z.boolean().optional().default(false),
-  }),
-);
-
-const GetActivityLogArgsSchema = ProjectRootArgSchema.merge(
-  z.object({
-    since_id: z.number().int().min(0).optional().default(0),
-    limit: z.number().int().min(1).max(500).optional().default(30),
-    verbose: z.boolean().optional().default(false),
-  }),
-);
-
-const GetActivitySummaryArgsSchema = ProjectRootArgSchema.merge(
-  z.object({
-    since_id: z.number().int().min(0).optional().default(0),
-    max_files: z.number().int().min(0).max(200).optional().default(20),
-  }),
-);
-
-const ClearActivityLogArgsSchema = ProjectRootArgSchema;
-
-const GetBrainDumpArgsSchema = ProjectRootArgSchema.merge(PendingPagingSchema)
-  .merge(OutputFormatSchema)
-  .merge(PreviewSchema)
-  .merge(ContentMaxSchema)
-  .merge(BrainDumpLimitsSchema)
-  .merge(
-    z.object({
-      include_content: z.boolean().optional().default(false),
-    }),
-  );
-
-const BootstrapContextArgsSchema = ProjectRootArgSchema.merge(
-  z.object({
-    query: z.string().optional(),
-    top_k: z.number().int().min(1).max(50).optional().default(3),
-    kinds: z.array(z.string().min(1)).optional(),
-    include_content: z.boolean().optional().default(false),
-    pending_offset: z.number().int().min(0).optional().default(0),
-    pending_limit: z.number().int().min(1).max(MAX_PENDING_LIMIT).optional().default(DEFAULT_PENDING_LIMIT),
-  })
-    .merge(OutputFormatSchema)
-    .merge(PreviewSchema)
-    .merge(ContentMaxSchema)
-    .merge(BrainDumpLimitsSchema),
-);
-
-const SemanticSearchArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
-  z.object({
-    query: z.string().min(1),
-    top_k: z.number().int().min(1).max(50).optional().default(8),
-    kinds: z.array(z.string().min(1)).optional(),
-    include_content: z.boolean().optional().default(false),
-    preview_chars: z.number().int().min(50).max(10_000).optional().default(DEFAULT_PREVIEW_CHARS),
-    content_max_chars: z.number().int().min(0).max(200_000).optional().default(DEFAULT_CONTENT_MAX_CHARS),
-  }),
-);
-
-const GetTokenSavingsArgsSchema = ProjectRootArgSchema.merge(
-  z.object({
-    limit: z.number().int().min(1).max(100).optional().default(10),
-    format: z.enum(["compact", "json"]).optional().default("compact"),
-  }),
-);
-
-const DetectRtkArgsSchema = ProjectRootArgSchema;
-
-const InstallRtkArgsSchema = ProjectRootArgSchema.merge(
-  z.object({
-    dry_run: z.boolean().optional().default(true),
-    method: z.enum(["auto", "cargo", "brew", "shell_script"]).optional().default("auto"),
-    init: z
-      .enum(["none", "global_no_patch", "global_auto_patch", "global_hook_only", "local", "codex_global", "codex_local"])
-      .optional()
-      .default("none"),
-    uninstall_wrong_cargo_rtk: z.boolean().optional().default(false),
-    timeout_ms: z.number().int().min(10_000).max(1_800_000).optional().default(600_000),
-  }),
-);
-
-const ReadMemoryItemArgsSchema = ProjectRootArgSchema.merge(
-  z.object({
-    id: z.number().int().positive(),
-    offset: z.number().int().min(0).optional().default(0),
-    limit: z.number().int().min(1).max(200_000).optional().default(DEFAULT_CONTENT_MAX_CHARS),
-  }),
-);
 
 function escapeLike(pattern: string): string {
   return pattern.replace(/[\\\\%_]/g, (m) => `\\${m}`);
@@ -3580,349 +2312,6 @@ function compactBootstrapText(data: {
 
 function compactBrainDumpText(data: Parameters<typeof compactBootstrapText>[0]): string {
   return compactBootstrapText(data);
-}
-
-function shellQuoteArg(arg: string): string {
-  if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(arg)) return arg;
-  if (process.platform === "win32") return `"${arg.replace(/"/g, '\\"')}"`;
-  return `'${arg.replace(/'/g, "'\\''")}'`;
-}
-
-function getPackageRtkShimPath(): string | null {
-  try {
-    const currentDir = path.dirname(fileURLToPath(import.meta.url));
-    const candidate = path.join(currentDir, "rtk-shim.js");
-    if (fs.existsSync(candidate)) return candidate;
-  } catch {
-    // import.meta.url may be unavailable only in unexpected runtimes.
-  }
-  return null;
-}
-
-function runRtkProbe(spec: {
-  source: "path" | "package_shim";
-  displayCommand: string;
-  execCommand: string;
-  execArgsPrefix?: string[];
-  execShell?: boolean;
-  path?: string;
-}): RtkDetection | null {
-  const argsPrefix = spec.execArgsPrefix ?? [];
-  const result = spawnSync(spec.execCommand, [...argsPrefix, "--version"], {
-    encoding: "utf8",
-    timeout: 120_000,
-    windowsHide: true,
-    shell: spec.execShell ?? false,
-  });
-  if (result.status === 0) {
-    const gain = spawnSync(spec.execCommand, [...argsPrefix, "gain"], {
-      encoding: "utf8",
-      timeout: 120_000,
-      windowsHide: true,
-      shell: spec.execShell ?? false,
-    });
-    let resolvedPath = spec.path;
-    if (spec.source === "path") {
-      const whereCommand = process.platform === "win32" ? "where.exe" : "which";
-      const whereResult = spawnSync(whereCommand, ["rtk"], {
-        encoding: "utf8",
-        timeout: 2000,
-        windowsHide: true,
-      });
-      resolvedPath = whereResult.status === 0 ? oneLine(whereResult.stdout, 240) : resolvedPath;
-    }
-    const gainText = `${gain.stdout}${gain.stderr}`.trim();
-    return {
-      available: gain.status === 0,
-      command: spec.displayCommand,
-      version: `${result.stdout}${result.stderr}`.trim(),
-      gain_ok: gain.status === 0,
-      gain_preview: oneLine(gainText, 240),
-      path: resolvedPath,
-      source: spec.source,
-      exec_command: spec.execCommand,
-      exec_args_prefix: argsPrefix,
-      exec_shell: spec.execShell ?? false,
-      note:
-        gain.status === 0
-          ? spec.source === "package_shim"
-            ? `Prefer prefixing shell commands with ${spec.displayCommand} for compact outputs. This is VectorMind's bundled RTK shim; first run auto-installs/caches rtk-ai/rtk if needed.`
-            : "Prefer prefixing shell commands with rtk for compact outputs, e.g. rtk git status / rtk npm run build / rtk rg pattern ."
-          : spec.source === "package_shim"
-            ? "VectorMind's bundled RTK shim exists, but `gain` failed. Check npm/cache or set VECTORMIND_RTK_REAL to an existing rtk-ai/rtk binary."
-            : "An rtk binary exists, but `rtk gain` failed. This may be the wrong rtk project. Use install_rtk with uninstall_wrong_cargo_rtk=true only when you intentionally want to replace it.",
-    };
-  }
-  return null;
-}
-
-function detectRtk(): RtkDetection {
-  const pathProbe = runRtkProbe({
-    source: "path",
-    displayCommand: "rtk",
-    execCommand: "rtk",
-    execShell: process.platform === "win32",
-  });
-  if (pathProbe?.available) return pathProbe;
-
-  const shimPath = getPackageRtkShimPath();
-  if (shimPath) {
-    const displayCommand = `node ${shellQuoteArg(shimPath)}`;
-    const shimProbe = runRtkProbe({
-      source: "package_shim",
-      displayCommand,
-      execCommand: process.execPath,
-      execArgsPrefix: [shimPath],
-      path: shimPath,
-    });
-    if (shimProbe) return shimProbe;
-  }
-
-  if (pathProbe) return pathProbe;
-
-  return {
-    available: false,
-    command: shimPath ? `node ${shellQuoteArg(shimPath)}` : "rtk",
-    path: shimPath ?? undefined,
-    source: shimPath ? "package_shim" : undefined,
-    note: shimPath
-      ? "rtk was not found on PATH, and VectorMind's bundled RTK shim could not verify rtk gain. VectorMind compact MCP output still works; check npm/cache or set VECTORMIND_RTK_REAL."
-      : "rtk was not found on PATH and the package RTK shim is unavailable. VectorMind compact MCP output still works; install rtk to compact shell command output too.",
-  };
-}
-
-function commandExists(command: string): boolean {
-  const probe = process.platform === "win32" ? "where.exe" : "which";
-  const result = spawnSync(probe, [command], { encoding: "utf8", timeout: 2000, windowsHide: true });
-  return result.status === 0;
-}
-
-function runInstallStep(command: string, args: string[], timeoutMs: number): {
-  command: string;
-  status: number | null;
-  ok: boolean;
-  output: string;
-} {
-  const result = spawnSync(command, args, {
-    encoding: "utf8",
-    timeout: timeoutMs,
-    windowsHide: true,
-    shell: false,
-  });
-  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
-  return {
-    command: [command, ...args].join(" "),
-    status: result.status,
-    ok: result.status === 0,
-    output: oneLine(output, 1200),
-  };
-}
-
-function runDetectedRtkStep(detected: RtkDetection, args: string[], timeoutMs: number): {
-  command: string;
-  status: number | null;
-  ok: boolean;
-  output: string;
-} {
-  const execCommand = detected.exec_command ?? "rtk";
-  const argsPrefix = detected.exec_args_prefix ?? [];
-  const result = spawnSync(execCommand, [...argsPrefix, ...args], {
-    encoding: "utf8",
-    timeout: timeoutMs,
-    windowsHide: true,
-    shell: detected.exec_shell ?? (execCommand === "rtk" && process.platform === "win32"),
-  });
-  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
-  return {
-    command: [detected.command, ...args].join(" "),
-    status: result.status,
-    ok: result.status === 0,
-    output: oneLine(output, 1200),
-  };
-}
-
-function appendRtkInitStep(
-  steps: Array<{ command: string; status: number | null; ok: boolean; output: string }>,
-  detected: RtkDetection,
-  init: z.infer<typeof InstallRtkArgsSchema>["init"],
-  timeoutMs: number,
-): void {
-  if (init === "none") return;
-  if (init === "global_no_patch") steps.push(runDetectedRtkStep(detected, ["init", "-g", "--no-patch"], timeoutMs));
-  if (init === "global_auto_patch") steps.push(runDetectedRtkStep(detected, ["init", "-g", "--auto-patch"], timeoutMs));
-  if (init === "global_hook_only") {
-    steps.push(runDetectedRtkStep(detected, ["init", "-g", "--hook-only", "--no-patch"], timeoutMs));
-  }
-  if (init === "local") steps.push(runDetectedRtkStep(detected, ["init"], timeoutMs));
-  if (init === "codex_global") steps.push(runDetectedRtkStep(detected, ["init", "-g", "--codex"], timeoutMs));
-  if (init === "codex_local") steps.push(runDetectedRtkStep(detected, ["init", "--codex"], timeoutMs));
-}
-
-function chooseRtkInstallMethod(method: "auto" | "cargo" | "brew" | "shell_script"): "cargo" | "brew" | "shell_script" {
-  if (method !== "auto") return method;
-  if (process.platform === "darwin" && commandExists("brew")) return "brew";
-  if (commandExists("cargo")) return "cargo";
-  return "shell_script";
-}
-
-function buildRtkInstallPlan(args: z.infer<typeof InstallRtkArgsSchema>): {
-  method: "cargo" | "brew" | "shell_script";
-  commands: string[];
-  notes: string[];
-} {
-  const method = chooseRtkInstallMethod(args.method);
-  const commands: string[] = [];
-  const notes: string[] = [];
-
-  if (args.uninstall_wrong_cargo_rtk) {
-    commands.push("cargo uninstall rtk");
-    notes.push("Only use uninstall_wrong_cargo_rtk after verifying the existing rtk is the wrong Cargo package.");
-  }
-
-  if (method === "brew") {
-    commands.push("brew install rtk");
-  } else if (method === "cargo") {
-    commands.push("cargo install --git https://github.com/rtk-ai/rtk");
-  } else {
-    if (process.platform === "win32") {
-      notes.push("shell_script install is Linux/macOS-oriented; on Windows prefer method=cargo after installing Rust/Cargo.");
-      commands.push("cargo install --git https://github.com/rtk-ai/rtk");
-    } else {
-      commands.push("curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/master/install.sh | sh");
-    }
-  }
-
-  commands.push("rtk --version");
-  commands.push("rtk gain");
-
-  if (args.init === "global_no_patch") commands.push("rtk init -g --no-patch");
-  if (args.init === "global_auto_patch") commands.push("rtk init -g --auto-patch");
-  if (args.init === "global_hook_only") commands.push("rtk init -g --hook-only --no-patch");
-  if (args.init === "local") commands.push("rtk init");
-  if (args.init === "codex_global") commands.push("rtk init -g --codex");
-  if (args.init === "codex_local") commands.push("rtk init --codex");
-
-  if (args.init !== "none") {
-    notes.push("rtk init may modify Claude/RTK configuration. Use init=none for binary-only installation.");
-  }
-
-  return { method, commands, notes };
-}
-
-function installRtk(args: z.infer<typeof InstallRtkArgsSchema>): {
-  ok: boolean;
-  dry_run: boolean;
-  already_available: boolean;
-  method: string;
-  commands: string[];
-  notes: string[];
-  steps: Array<{ command: string; status: number | null; ok: boolean; output: string }>;
-  detected_before: ReturnType<typeof detectRtk>;
-  detected_after?: ReturnType<typeof detectRtk>;
-} {
-  const detectedBefore = detectRtk();
-  const plan = buildRtkInstallPlan(args);
-  const steps: Array<{ command: string; status: number | null; ok: boolean; output: string }> = [];
-  const notes = [...plan.notes];
-
-  if (detectedBefore.available) {
-    notes.push("rtk is already installed and verified with `rtk gain`; installation skipped.");
-    if (!args.dry_run && args.init !== "none") {
-      appendRtkInitStep(steps, detectedBefore, args.init, args.timeout_ms);
-    }
-    return {
-      ok: true,
-      dry_run: args.dry_run,
-      already_available: true,
-      method: plan.method,
-      commands: plan.commands,
-      notes,
-      steps,
-      detected_before: detectedBefore,
-      detected_after: detectedBefore,
-    };
-  }
-
-  if (args.dry_run) {
-    notes.push("dry_run=true: no command was executed. Call install_rtk with dry_run=false to install.");
-    return {
-      ok: true,
-      dry_run: true,
-      already_available: false,
-      method: plan.method,
-      commands: plan.commands,
-      notes,
-      steps,
-      detected_before: detectedBefore,
-    };
-  }
-
-  if (plan.method === "brew") {
-    steps.push(runInstallStep("brew", ["install", "rtk"], args.timeout_ms));
-  } else if (plan.method === "cargo") {
-    if (args.uninstall_wrong_cargo_rtk) {
-      steps.push(runInstallStep("cargo", ["uninstall", "rtk"], args.timeout_ms));
-    }
-    steps.push(runInstallStep("cargo", ["install", "--git", "https://github.com/rtk-ai/rtk"], args.timeout_ms));
-  } else if (process.platform === "win32") {
-    notes.push("Windows fallback uses Cargo because the upstream shell installer targets POSIX shells.");
-    if (args.uninstall_wrong_cargo_rtk) {
-      steps.push(runInstallStep("cargo", ["uninstall", "rtk"], args.timeout_ms));
-    }
-    steps.push(runInstallStep("cargo", ["install", "--git", "https://github.com/rtk-ai/rtk"], args.timeout_ms));
-  } else {
-    const script =
-      "curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/master/install.sh | sh";
-    steps.push(runInstallStep("sh", ["-c", script], args.timeout_ms));
-  }
-
-  const detectedAfterInstall = detectRtk();
-  if (detectedAfterInstall.available && args.init !== "none") {
-    appendRtkInitStep(steps, detectedAfterInstall, args.init, args.timeout_ms);
-  }
-
-  const detectedAfter = detectRtk();
-  return {
-    ok: detectedAfter.available,
-    dry_run: false,
-    already_available: false,
-    method: plan.method,
-    commands: plan.commands,
-    notes,
-    steps,
-    detected_before: detectedBefore,
-    detected_after: detectedAfter,
-  };
-}
-
-function compactInstallRtkText(data: ReturnType<typeof installRtk>): string {
-  const lines: string[] = [];
-  lines.push(
-    `install_rtk ok=${data.ok} dry_run=${data.dry_run} already_available=${data.already_available} method=${data.method}`,
-  );
-  lines.push(
-    `before available=${data.detected_before.available} version=${data.detected_before.version ?? "none"} gain_ok=${data.detected_before.gain_ok ?? false}`,
-  );
-  if (data.detected_after) {
-    lines.push(
-      `after available=${data.detected_after.available} version=${data.detected_after.version ?? "none"} gain_ok=${data.detected_after.gain_ok ?? false}`,
-    );
-  }
-  if (data.commands.length) {
-    lines.push("commands:");
-    for (const command of data.commands) lines.push(`- ${command}`);
-  }
-  if (data.steps.length) {
-    lines.push("steps:");
-    for (const step of data.steps) {
-      lines.push(`- ${step.ok ? "ok" : "fail"} [${step.status ?? "null"}] ${step.command}: ${oneLine(step.output, 240)}`);
-    }
-  }
-  if (data.notes.length) {
-    lines.push("notes:");
-    for (const note of data.notes) lines.push(`- ${note}`);
-  }
-  return lines.join("\n");
 }
 
 function tokenSavingsSummary(limit: number) {
@@ -6774,7 +5163,7 @@ function initDatabase(): void {
 function initWatcher(): void {
   watcherReady = false;
   watcher = chokidar.watch(projectRoot, {
-    ignored: (p) => shouldIgnorePath(p),
+    ignored: (p) => shouldIgnorePath(p, projectRoot),
     // Avoid indexing the entire tree on startup; track changes after the server is running.
     ignoreInitial: true,
     persistent: true,
@@ -7487,6 +5876,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         intent: args.intent,
         targetDir,
         maxModules: args.max_modules,
+        hugeThresholdLines: DEVELOPMENT_HUGE_FILE_LINES,
       });
 
       logActivity("plan_large_file_split", {
