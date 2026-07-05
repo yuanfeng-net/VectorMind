@@ -221,7 +221,7 @@ export async function handleSyncChangeIntent(
           text: toolJson({
             ok: false,
             error:
-              "No active requirement. Call start_requirement(title, background) before syncing change intent.",
+              "No active requirement. Call start_requirement({ project_root, title, background }) before syncing change intent.",
           }),
         },
       ],

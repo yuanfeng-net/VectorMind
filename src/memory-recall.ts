@@ -15,7 +15,6 @@ type MemoryRecallContext = {
   getListActiveRequirementsStatement: () => Database.Statement;
   getRequirementMemoryItemIdStatement: () => Database.Statement;
   getMemoryItemByIdStatement: () => Database.Statement;
-  getListRecentContextItemsStatement: () => Database.Statement;
   isFtsAvailable: () => boolean;
   sha256Hex: (input: string) => string;
 };
@@ -55,10 +54,6 @@ function getRequirementMemoryItemIdStatement(): Database.Statement {
 
 function getMemoryItemByIdStatement(): Database.Statement {
   return requireMemoryRecallContext().getMemoryItemByIdStatement();
-}
-
-function getListRecentContextItemsStatement(): Database.Statement {
-  return requireMemoryRecallContext().getListRecentContextItemsStatement();
 }
 
 function isFtsAvailable(): boolean {
@@ -541,13 +536,28 @@ export function getCurrentContextPreviews(
     if (memId != null) addRow(getMemoryItemByIdStatement().get(memId) as MemoryItemRow | undefined);
   }
 
-  const recentRows = getListRecentContextItemsStatement().all(Math.max(currentContextLimit * 8, 40)) as MemoryItemRow[];
-  for (const row of recentRows) {
-    if (picked.size >= currentContextLimit) break;
-    if (row.kind === "requirement" || row.kind === "change_intent") {
-      if (!looksLikeDecisionContent(`${row.title ?? ""}\n${row.content}`)) continue;
+  const recentContextPageStmt = getDb().prepare(
+    `SELECT id, kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at
+     FROM memory_items
+     WHERE kind IN ('note', 'requirement', 'change_intent')
+     ORDER BY updated_at DESC, id DESC
+     LIMIT ? OFFSET ?`,
+  );
+  const pageSize = 200;
+  const scanCap = 10_000;
+  let offset = 0;
+  while (picked.size < currentContextLimit && offset < scanCap) {
+    const recentRows = recentContextPageStmt.all(pageSize, offset) as MemoryItemRow[];
+    if (!recentRows.length) break;
+    for (const row of recentRows) {
+      if (picked.size >= currentContextLimit) break;
+      if (row.kind === "requirement" || row.kind === "change_intent") {
+        if (!looksLikeDecisionContent(`${row.title ?? ""}\n${row.content}`)) continue;
+      }
+      addRow(row);
     }
-    addRow(row);
+    offset += recentRows.length;
+    if (recentRows.length < pageSize) break;
   }
 
   return Array.from(picked.values()).slice(0, currentContextLimit);

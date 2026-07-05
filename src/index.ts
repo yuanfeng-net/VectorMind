@@ -155,7 +155,6 @@ configureMemoryRecall({
   getListActiveRequirementsStatement: () => statements.listActiveRequirementsStmt,
   getRequirementMemoryItemIdStatement: () => statements.getRequirementMemoryItemIdStmt,
   getMemoryItemByIdStatement: () => statements.getMemoryItemByIdStmt,
-  getListRecentContextItemsStatement: () => statements.listRecentContextItemsStmt,
   isFtsAvailable: () => ftsAvailable,
   sha256Hex,
 });

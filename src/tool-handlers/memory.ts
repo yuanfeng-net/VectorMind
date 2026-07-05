@@ -13,21 +13,33 @@ import { BOOTSTRAP_DEFAULT_CONTEXT_KINDS, getConventionPreviews, getCurrentConte
 import { logActivity } from "../activity-log.js";
 import { compactBootstrapText, compactBrainDumpText, compactSemanticSearchText, toolJson } from "../tool-output.js";
 function getVisibleRecentNotePreviews(
-  listRecentNotesStmt: Database.Statement,
+  db: Database.Database,
   limit: number,
   includeContent: boolean,
   previewChars: number,
   contentMaxChars: number,
 ) {
   if (limit <= 0) return [];
-  const hardCap = Math.max(limit, Math.min(5_000, limit * 64));
-  let fetchLimit = Math.min(hardCap, Math.max(limit, limit * 4, 20));
+  const pageSize = 200;
+  const scanCap = 10_000;
+  const listVisibleNotesPageStmt = db.prepare(
+    `SELECT id, kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at
+     FROM memory_items
+     WHERE kind = 'note'
+     ORDER BY updated_at DESC, id DESC
+     LIMIT ? OFFSET ?`,
+  );
   let visible: MemoryItemRow[] = [];
+  let offset = 0;
   while (true) {
-    const rows = listRecentNotesStmt.all(fetchLimit) as MemoryItemRow[];
-    visible = rows.filter((n) => !isHiddenFromDefaultRecall(n));
-    if (visible.length >= limit || rows.length < fetchLimit || fetchLimit >= hardCap) break;
-    fetchLimit = Math.min(hardCap, fetchLimit * 2);
+    const rows = listVisibleNotesPageStmt.all(pageSize, offset) as MemoryItemRow[];
+    if (!rows.length) break;
+    for (const n of rows) {
+      if (!isHiddenFromDefaultRecall(n)) visible.push(n);
+      if (visible.length >= limit) break;
+    }
+    offset += rows.length;
+    if (visible.length >= limit || rows.length < pageSize || offset >= scanCap) break;
   }
   return visible
     .slice(0, limit)
@@ -41,6 +53,7 @@ export async function handleBootstrapContext(
   const projectRoot = context.getProjectRoot();
   const rootSource = context.getRootSource();
   const dbPath = context.getDbPath();
+  const db = context.getDb();
   const watcherEnabled = context.isWatcherEnabled();
   const watcherReady = context.isWatcherReady();
   const {
@@ -49,7 +62,6 @@ export async function handleBootstrapContext(
     getProjectSummaryStmt,
     listRecentRequirementsStmt,
     listChangeLogsForRequirementStmt,
-    listRecentNotesStmt,
   } = context.getStatements();
 
   const args = BootstrapContextArgsSchema.parse(rawArgs);
@@ -78,7 +90,7 @@ export async function handleBootstrapContext(
     ? toMemoryItemPreview(projectSummaryRow, includeContent, previewChars, contentMaxChars)
     : null;
   const recent_notes = getVisibleRecentNotePreviews(
-    listRecentNotesStmt,
+    db,
     notesLimit,
     includeContent,
     previewChars,
@@ -189,6 +201,7 @@ export async function handleGetBrainDump(
   const projectRoot = context.getProjectRoot();
   const rootSource = context.getRootSource();
   const dbPath = context.getDbPath();
+  const db = context.getDb();
   const watcherEnabled = context.isWatcherEnabled();
   const watcherReady = context.isWatcherReady();
   const {
@@ -197,7 +210,6 @@ export async function handleGetBrainDump(
     getProjectSummaryStmt,
     listRecentRequirementsStmt,
     listChangeLogsForRequirementStmt,
-    listRecentNotesStmt,
   } = context.getStatements();
 
   const args = GetBrainDumpArgsSchema.parse(rawArgs);
@@ -225,7 +237,7 @@ export async function handleGetBrainDump(
     ? toMemoryItemPreview(projectSummaryRow, includeContent, previewChars, contentMaxChars)
     : null;
   const recent_notes = getVisibleRecentNotePreviews(
-    listRecentNotesStmt,
+    db,
     notesLimit,
     includeContent,
     previewChars,
