@@ -20,9 +20,16 @@ function getVisibleRecentNotePreviews(
   contentMaxChars: number,
 ) {
   if (limit <= 0) return [];
-  const fetchLimit = Math.max(limit, Math.min(200, limit * 4));
-  return (listRecentNotesStmt.all(fetchLimit) as MemoryItemRow[])
-    .filter((n) => !isHiddenFromDefaultRecall(n))
+  const hardCap = Math.max(limit, Math.min(5_000, limit * 64));
+  let fetchLimit = Math.min(hardCap, Math.max(limit, limit * 4, 20));
+  let visible: MemoryItemRow[] = [];
+  while (true) {
+    const rows = listRecentNotesStmt.all(fetchLimit) as MemoryItemRow[];
+    visible = rows.filter((n) => !isHiddenFromDefaultRecall(n));
+    if (visible.length >= limit || rows.length < fetchLimit || fetchLimit >= hardCap) break;
+    fetchLimit = Math.min(hardCap, fetchLimit * 2);
+  }
+  return visible
     .slice(0, limit)
     .map((n) => toMemoryItemPreview(n, includeContent, previewChars, contentMaxChars));
 }

@@ -9,7 +9,8 @@
   },
   "files": [
     "dist",
-    "docs"
+    "docs",
+    "skills"
   ],
   "scripts": {
     "build": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\" && tsc && node --input-type=module -e \"import { chmodSync } from 'node:fs'; for (const f of ['dist/index.js','dist/rtk-shim.js']) try { chmodSync(f, 0o755); } catch {}\"",

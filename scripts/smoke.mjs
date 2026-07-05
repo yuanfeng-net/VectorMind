@@ -32,6 +32,7 @@ const env = {
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const serverEntry = path.resolve(scriptDir, "..", "dist", "index.js");
 const rtkShimEntry = path.resolve(scriptDir, "..", "dist", "rtk-shim.js");
+const packageJsonPath = path.resolve(scriptDir, "..", "package.json");
 
 if (!fs.existsSync(rtkShimEntry)) {
   console.error(`\n[smoke] expected RTK shim build output at ${rtkShimEntry}`);
@@ -78,6 +79,20 @@ function readText(result) {
 }
 
 async function main() {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+    const packageFiles = Array.isArray(pkg?.files) ? pkg.files : [];
+    for (const expectedPackageFile of ["dist", "docs", "skills"]) {
+      if (!packageFiles.includes(expectedPackageFile)) {
+        throw new Error(`expected package.json files to include ${expectedPackageFile}`);
+      }
+    }
+  } catch (err) {
+    console.error("\n[smoke] package files check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
   if (rootsMode === "on") {
     client.setRequestHandler(ListRootsRequestSchema, async () => ({
       roots: [{ uri: pathToFileURL(runDir).toString(), name: "vectormind-smoke" }],
@@ -235,6 +250,37 @@ async function main() {
         throw new Error(`expected server instructions call chain to include: ${chainTerm}`);
       }
     }
+    for (const projectRootExample of [
+      "bootstrap_context({ project_root",
+      "get_brain_dump({ project_root",
+      "start_requirement({ project_root",
+      "preflight_change_scope({ project_root",
+      "get_pending_changes({ project_root",
+      "sync_change_intent({ project_root",
+      "upsert_decision({ project_root",
+      "supersede_memory({ project_root",
+      "query_codebase({ project_root",
+      "semantic_search({ project_root",
+      "maintain_memory({ project_root",
+    ]) {
+      if (!serverInstructions?.includes(projectRootExample)) {
+        throw new Error(`expected server instructions to include project_root example: ${projectRootExample}`);
+      }
+    }
+    for (const staleExample of [
+      "bootstrap_context({ query:",
+      "start_requirement(title",
+      "preflight_change_scope(intent",
+      "get_pending_changes()",
+      "sync_change_intent(intent",
+      "query_codebase(query",
+      "semantic_search(query",
+      "maintain_memory({ dry_run",
+    ]) {
+      if (serverInstructions?.includes(staleExample)) {
+        throw new Error(`expected server instructions to avoid project_root-less example: ${staleExample}`);
+      }
+    }
     if (!serverInstructions?.includes("Built-in task-list / Plan-Lite quality policy:")) {
       throw new Error("expected server instructions to include Plan-Lite quality section");
     }
@@ -290,10 +336,10 @@ async function main() {
     if (serverInstructions?.includes("THREAD_HANDOFF_PACK")) {
       throw new Error("expected server instructions to stop using the old THREAD_HANDOFF_PACK template");
     }
-    if (!serverInstructions?.includes("list_project_files({ path, recursive?, max_depth? })")) {
+    if (!serverInstructions?.includes("list_project_files({ project_root, path, recursive?, max_depth? })")) {
       throw new Error("expected server instructions to recommend list_project_files");
     }
-    if (!serverInstructions?.includes("read_file_text({ path, offset?, max_chars? })")) {
+    if (!serverInstructions?.includes("read_file_text({ project_root, path, offset?, max_chars? })")) {
       throw new Error("expected server instructions to recommend read_file_text");
     }
     if (!serverInstructions?.includes("read_codex_text_file({ path })")) {
@@ -922,6 +968,52 @@ async function main() {
     return;
   }
 
+  const bulkStaleNoteIds = [];
+  for (let i = 0; i < 18; i += 1) {
+    const bulkNote = await client.callTool({
+      name: "add_note",
+      arguments: {
+        ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+        title: `bulk-stale-note-${i}`,
+        content: `Bulk hidden smoke note ${i} should not appear in default recall: ${Date.now()}`,
+        tags: ["smoke", "stale", "bulk"],
+      },
+    });
+    const bulkText = readText(bulkNote);
+    try {
+      const id = Number(JSON.parse(bulkText)?.note?.id ?? 0);
+      if (id <= 0) throw new Error("expected bulk stale note id");
+      bulkStaleNoteIds.push(id);
+    } catch (err) {
+      console.error("\n[smoke] bulk stale note id check failed:", err);
+      process.exitCode = 1;
+      return;
+    }
+  }
+  const supersedeBulk = await client.callTool({
+    name: "supersede_memory",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      superseded_memory_ids: bulkStaleNoteIds,
+      replacement_memory_id: currentDecisionId,
+      reason: "Smoke current decision supersedes bulk old notes",
+    },
+  });
+  console.log("\n--- supersede_memory (bulk recent notes) ---\n");
+  const supersedeBulkText = readText(supersedeBulk);
+  console.log(supersedeBulkText);
+  try {
+    const parsed = JSON.parse(supersedeBulkText);
+    const superseded = parsed?.superseded_memory_items;
+    if (parsed?.ok !== true || !Array.isArray(superseded) || superseded.length !== bulkStaleNoteIds.length) {
+      throw new Error("expected supersede_memory to supersede all bulk stale notes");
+    }
+  } catch (err) {
+    console.error("\n[smoke] bulk supersede_memory check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
   const supersededRecall = await client.callTool({
     name: "semantic_search",
     arguments: {
@@ -1025,10 +1117,15 @@ async function main() {
     if (!haystack.includes(token)) {
       throw new Error("expected current_context to include recent synced/note context token");
     }
+    const recentNotes = Array.isArray(parsed?.recent_notes) ? parsed.recent_notes : [];
+    if (!recentNotes.some((n) => n?.id === noteId)) {
+      throw new Error("expected recent_notes to page past hidden stale notes and include visible smoke note");
+    }
     const fullPayload = JSON.stringify(parsed);
     for (const stalePhrase of [
       "Old smoke rule should disappear from default recall",
       "Old smoke note should be explicitly superseded",
+      "Bulk hidden smoke note",
     ]) {
       if (fullPayload.includes(stalePhrase)) {
         throw new Error(`expected bootstrap_context to hide superseded recent note: ${stalePhrase}`);
