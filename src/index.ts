@@ -49,15 +49,10 @@ import {
 import { buildLargeFileSplitPlan } from "./large-file-split.js";
 import {
   IGNORED_LIKE_PATTERNS,
-  getContentChunkKind,
-  isContentIndexableFile,
-  isSymbolIndexableFile,
-  looksLikeGeneratedFile,
   looksLikeMinifiedBundle,
   shouldIgnoreDbFilePath,
   shouldIgnorePath,
 } from "./path-rules.js";
-import { extractSymbols } from "./symbols.js";
 import {
   listProjectFilesInternal,
   normalizeExtensionsFilter,
@@ -69,6 +64,13 @@ import {
 } from "./project-files.js";
 import { hasUppercaseAscii, runIndexedGrepSearch, runRipgrepSearch } from "./grep.js";
 import { compactInstallRtkText, detectRtk, installRtk } from "./rtk-tools.js";
+import {
+  configureFileIndexing,
+  flushPendingChangeBuffer,
+  indexFile,
+  recordPendingChange,
+  removeFileIndexes,
+} from "./file-indexing.js";
 import {
   configureMemoryMaintenance,
   pruneFilenameNoiseIndexes,
@@ -160,9 +162,7 @@ import {
   INDEX_MAX_CODE_BYTES,
   INDEX_MAX_DOC_BYTES,
   INDEX_SKIP_MINIFIED,
-  PENDING_FLUSH_MS,
   PENDING_MAX_ENTRIES,
-  PENDING_PRUNE_EVERY,
   PENDING_TTL_DAYS,
   ROOTS_LIST_TIMEOUT_MS,
   SEMANTIC_EMBEDDINGS_TIMEOUT_MS,
@@ -276,6 +276,22 @@ configureMemoryMaintenance({
   enqueueEmbedding,
 });
 
+configureFileIndexing({
+  getDb: () => db,
+  getProjectRoot: () => projectRoot,
+  normalizeToDbPath,
+  getIndexFileSymbolsTx: () => indexFileSymbolsTx,
+  getDeleteFileChunkItemsStatement: () => deleteFileChunkItemsStmt,
+  getInsertMemoryItemStatement: () => insertMemoryItemStmt,
+  getUpsertPendingChangeStatement: () => upsertPendingChangeStmt,
+  getDeleteSymbolsForFileStatement: () => deleteSymbolsForFileStmt,
+  sha256Hex,
+  enqueueEmbedding,
+  getEmbeddingsEnabled: () => embeddingsEnabled,
+  getEmbedFilesMode: () => embedFilesMode,
+  prunePendingChanges,
+});
+
 function isProbablyGitRepository(): boolean {
   try {
     return fs.existsSync(path.join(projectRoot, ".git"));
@@ -375,8 +391,6 @@ function pruneIgnoredPendingChanges(): void {
   }
 }
 
-let pendingEventsSincePrune = 0;
-
 function prunePendingChanges(): void {
   if (!db) return;
   try {
@@ -402,229 +416,6 @@ function prunePendingChanges(): void {
   } catch (err) {
     console.error("[vectormind] prune pending_changes failed:", err);
   }
-}
-
-
-type TextChunk = { startLine: number; endLine: number; content: string };
-
-function chunkTextByLines(
-  content: string,
-  opts: { maxChars: number; maxLines: number },
-): TextChunk[] {
-  const lines = content.split(/\r?\n/);
-  if (lines.length === 0) return [];
-
-  const chunks: TextChunk[] = [];
-  let startLine = 1;
-  let currentLines: string[] = [];
-  let currentChars = 0;
-
-  for (let idx = 0; idx < lines.length; idx++) {
-    const line = lines[idx];
-    const nextChars = currentChars + line.length + 1;
-    const nextLines = currentLines.length + 1;
-
-    if (currentLines.length > 0 && (nextChars > opts.maxChars || nextLines > opts.maxLines)) {
-      const endLine = startLine + currentLines.length - 1;
-      chunks.push({ startLine, endLine, content: currentLines.join("\n") });
-      startLine = idx + 1;
-      currentLines = [];
-      currentChars = 0;
-    }
-
-    currentLines.push(line);
-    currentChars += line.length + 1;
-  }
-
-  if (currentLines.length > 0) {
-    const endLine = startLine + currentLines.length - 1;
-    chunks.push({ startLine, endLine, content: currentLines.join("\n") });
-  }
-
-  return chunks;
-}
-
-function indexFileContentChunks(
-  dbFilePath: string,
-  absPath: string,
-  content: string,
-  reason: IndexReason,
-): number {
-  const kind = getContentChunkKind(absPath);
-  if (!kind) return 0;
-
-  const opts =
-    kind === "code_chunk"
-      ? { maxChars: 10_000, maxLines: 200 }
-      : { maxChars: 14_000, maxLines: 260 };
-  const chunks = chunkTextByLines(content, opts);
-  const ext = path.extname(absPath).toLowerCase();
-  const metadata = safeJson({ ext });
-
-  const tx = db.transaction(() => {
-    deleteFileChunkItemsStmt.run(dbFilePath);
-    for (const chunk of chunks) {
-      const title = `${dbFilePath}#L${chunk.startLine}-L${chunk.endLine}`;
-      const contentHash = sha256Hex(chunk.content);
-      const info = insertMemoryItemStmt.run(
-        kind,
-        title,
-        chunk.content,
-        dbFilePath,
-        chunk.startLine,
-        chunk.endLine,
-        null,
-        metadata,
-        contentHash,
-      );
-      const memoryId = Number(info.lastInsertRowid);
-      if (shouldEmbedFileChunks(reason)) {
-        enqueueEmbedding(memoryId);
-      }
-    }
-  });
-
-  try {
-    tx();
-  } catch (err) {
-    console.error("[vectormind] failed to index file chunks:", dbFilePath, err);
-  }
-  return chunks.length;
-}
-
-type PendingChangeEvent = "add" | "change" | "unlink";
-
-const pendingChangeBuffer = new Map<string, PendingChangeEvent>();
-let pendingChangeFlushTimer: NodeJS.Timeout | null = null;
-
-function flushPendingChangeBuffer(): void {
-  if (!db) return;
-  if (pendingChangeFlushTimer) {
-    clearTimeout(pendingChangeFlushTimer);
-    pendingChangeFlushTimer = null;
-  }
-  if (!pendingChangeBuffer.size) return;
-  const entries = Array.from(pendingChangeBuffer.entries());
-  pendingChangeBuffer.clear();
-
-  try {
-    const tx = db.transaction(() => {
-      for (const [filePath, event] of entries) {
-        upsertPendingChangeStmt.run(filePath, event);
-      }
-    });
-    tx();
-  } catch (err) {
-    console.error("[vectormind] failed to flush pending change buffer:", err);
-  }
-
-  logActivity("pending_flush", {
-    entries: entries.length,
-    sample: entries.slice(0, 10).map(([file_path, last_event]) => ({ file_path, last_event })),
-  });
-
-  pendingEventsSincePrune += entries.length;
-  if (pendingEventsSincePrune >= PENDING_PRUNE_EVERY) {
-    pendingEventsSincePrune = 0;
-    prunePendingChanges();
-  }
-}
-
-function recordPendingChange(absPath: string, event: PendingChangeEvent): void {
-  if (shouldIgnorePath(absPath, projectRoot)) return;
-  const track = isSymbolIndexableFile(absPath) || isContentIndexableFile(absPath);
-  if (!track) return;
-  const filePath = normalizeToDbPath(absPath);
-  pendingChangeBuffer.set(filePath, event);
-  if (pendingChangeFlushTimer) return;
-  if (PENDING_FLUSH_MS === 0) {
-    flushPendingChangeBuffer();
-    return;
-  }
-  pendingChangeFlushTimer = setTimeout(flushPendingChangeBuffer, PENDING_FLUSH_MS);
-}
-
-function indexFile(absPath: string, reason: IndexReason): void {
-  if (shouldIgnorePath(absPath, projectRoot)) return;
-  const indexSymbols = isSymbolIndexableFile(absPath);
-  const indexContent = isContentIndexableFile(absPath);
-  if (!indexSymbols && !indexContent) return;
-
-  const kind = getContentChunkKind(absPath);
-  if (!kind) return;
-
-  let stat: fs.Stats;
-  try {
-    stat = fs.statSync(absPath);
-  } catch {
-    return;
-  }
-  if (!stat.isFile()) return;
-  const maxBytes = kind === "code_chunk" ? INDEX_MAX_CODE_BYTES : INDEX_MAX_DOC_BYTES;
-  if (maxBytes > 0 && stat.size > maxBytes) return;
-
-  let content: string;
-  try {
-    content = fs.readFileSync(absPath, "utf8");
-  } catch {
-    return;
-  }
-  if (content.includes("\u0000")) return;
-
-  const ext = path.extname(absPath).toLowerCase();
-  const filePath = normalizeToDbPath(absPath);
-  if (
-    INDEX_SKIP_MINIFIED &&
-    kind === "code_chunk" &&
-    (ext === ".js" || ext === ".mjs" || ext === ".cjs" || ext === ".css") &&
-    looksLikeMinifiedBundle(content)
-  ) {
-    logActivity("index_skip", { file_path: filePath, reason: "minified_bundle", bytes: stat.size });
-    return;
-  }
-  if (kind === "code_chunk" && stat.size >= 20_000 && looksLikeGeneratedFile(content)) {
-    logActivity("index_skip", { file_path: filePath, reason: "generated_file", bytes: stat.size });
-    return;
-  }
-
-  let symbolCount = 0;
-  let chunkCount = 0;
-  if (indexSymbols) {
-    const symbols = extractSymbols(absPath, content);
-    symbolCount = symbols.length;
-    try {
-      indexFileSymbolsTx?.(filePath, symbols);
-    } catch (err) {
-      console.error("[vectormind] failed to index symbols:", filePath, err);
-    }
-  }
-  if (indexContent) {
-    chunkCount = indexFileContentChunks(filePath, absPath, content, reason);
-  }
-
-  logActivity("index_file", {
-    file_path: filePath,
-    reason,
-    symbols: symbolCount,
-    chunks: chunkCount,
-    bytes: stat.size,
-  });
-}
-
-function removeFileIndexes(absPath: string): void {
-  if (shouldIgnorePath(absPath, projectRoot)) return;
-  const filePath = normalizeToDbPath(absPath);
-  try {
-    deleteSymbolsForFileStmt.run(filePath);
-  } catch (err) {
-    console.error("[vectormind] failed to remove symbols:", filePath, err);
-  }
-  try {
-    deleteFileChunkItemsStmt.run(filePath);
-  } catch (err) {
-    console.error("[vectormind] failed to remove file chunks:", filePath, err);
-  }
-  logActivity("remove_file", { file_path: filePath });
 }
 
 
@@ -727,16 +518,6 @@ const embedCacheDir =
 const allowRemoteModels = !["0", "false", "off"].includes(
   (process.env.VECTORMIND_ALLOW_REMOTE_MODELS ?? "true").toLowerCase(),
 );
-
-type IndexReason = "add" | "change" | "manual";
-
-function shouldEmbedFileChunks(reason: IndexReason): boolean {
-  if (!embeddingsEnabled) return false;
-  if (embedFilesMode === "none" || embedFilesMode === "off" || embedFilesMode === "disabled")
-    return false;
-  if (embedFilesMode === "all") return true;
-  return reason !== "add";
-}
 
 let embedderPromise:
   | Promise<(text: string) => Promise<Float32Array>>
