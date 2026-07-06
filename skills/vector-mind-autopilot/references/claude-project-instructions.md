@@ -33,9 +33,12 @@ Always pass `project_root` on every VectorMind tool call.
 6. At milestones:
    - Call `upsert_project_summary(...)`, `add_note(...)`, `upsert_convention(...)` as needed.
    - Call `complete_requirement(...)` when done.
+   - Use `analyze_memory_conflicts(...)`, `memory_quality_report(...)`, or `compare_checkpoint_context(...)` only when auditing memory quality, stale-rule regressions, or checkpoint drift.
 
 Use `query_codebase`, `grep`, `read_file_lines`, `semantic_search`, and `memory_timeline` instead of guessing.
 
 Do not dump raw JSON unless asked.
 
 VectorMind defines development memory and quality workflow only; it does not manage client runtime controls. Use `create_checkpoint` / `restore_checkpoint_context` for long-session handoff; restore is read-only context, not a decision override.
+
+Low-risk diagnostics are read-only evidence. Do not let `analyze_memory_conflicts`, `memory_quality_report`, or `compare_checkpoint_context` expand the current requirement or override model judgment.

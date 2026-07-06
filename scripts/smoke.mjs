@@ -130,6 +130,9 @@ async function main() {
     "create_checkpoint",
     "list_checkpoints",
     "restore_checkpoint_context",
+    "analyze_memory_conflicts",
+    "memory_quality_report",
+    "compare_checkpoint_context",
   ]) {
     if (!toolList.tools.some((t) => t.name === toolName)) {
       console.error(`\n[smoke] expected tool list to include ${toolName}`);
@@ -142,6 +145,9 @@ async function main() {
     const timelineTool = byName.get("memory_timeline");
     const checkpointTool = byName.get("create_checkpoint");
     const restoreTool = byName.get("restore_checkpoint_context");
+    const conflictsTool = byName.get("analyze_memory_conflicts");
+    const qualityTool = byName.get("memory_quality_report");
+    const checkpointDiffTool = byName.get("compare_checkpoint_context");
     if (timelineTool?.annotations?.readOnlyHint !== true) {
       throw new Error("expected memory_timeline to be annotated readOnlyHint=true");
     }
@@ -151,8 +157,20 @@ async function main() {
     if (restoreTool?.annotations?.readOnlyHint !== true) {
       throw new Error("expected restore_checkpoint_context to be annotated readOnlyHint=true");
     }
+    if (conflictsTool?.annotations?.readOnlyHint !== true) {
+      throw new Error("expected analyze_memory_conflicts to be annotated readOnlyHint=true");
+    }
+    if (qualityTool?.annotations?.readOnlyHint !== true) {
+      throw new Error("expected memory_quality_report to be annotated readOnlyHint=true");
+    }
+    if (checkpointDiffTool?.annotations?.readOnlyHint !== true) {
+      throw new Error("expected compare_checkpoint_context to be annotated readOnlyHint=true");
+    }
     if (!timelineTool?._meta?.["vectormind/behavior"]?.advisory_only) {
       throw new Error("expected tool behavior metadata to mark tools advisory_only");
+    }
+    if (!checkpointDiffTool?._meta?.["vectormind/behavior"]?.does_not_control_model_reasoning) {
+      throw new Error("expected diagnostic tools to avoid model-reasoning control");
     }
   } catch (err) {
     console.error("\n[smoke] tool behavior annotations check failed:", err);
@@ -302,6 +320,9 @@ async function main() {
       "memory_timeline({ project_root",
       "create_checkpoint({ project_root",
       "restore_checkpoint_context({ project_root",
+      "analyze_memory_conflicts({ project_root",
+      "memory_quality_report({ project_root",
+      "compare_checkpoint_context({ project_root",
       "maintain_memory({ project_root",
     ]) {
       if (!serverInstructions?.includes(projectRootExample)) {
@@ -413,6 +434,12 @@ async function main() {
     }
     if (!serverInstructions?.includes("get_token_savings")) {
       throw new Error("expected server instructions to mention get_token_savings");
+    }
+    if (!serverInstructions?.includes("Optional low-risk diagnostics")) {
+      throw new Error("expected server instructions to mention optional low-risk diagnostics");
+    }
+    if (!serverInstructions?.includes("must not expand the current requirement or replace model judgment")) {
+      throw new Error("expected diagnostic instructions to preserve model autonomy and requirement boundary");
     }
   } catch (err) {
     console.error("\n[smoke] server instructions check failed:", err);
@@ -847,7 +874,8 @@ async function main() {
     },
   });
   console.log("\n--- start_requirement (scope contract) ---\n");
-  console.log(readText(scopeReq));
+  const scopeReqText = readText(scopeReq);
+  console.log(scopeReqText);
 
   const preflightScopeDrift = await client.callTool({
     name: "preflight_change_scope",
@@ -906,6 +934,50 @@ async function main() {
     console.error("\n[smoke] scope drift development warning check failed:", err);
     process.exitCode = 1;
     return;
+  }
+
+  const scopedRequirementMemoryId = (() => {
+    try {
+      return JSON.parse(scopeReqText)?.memory_item?.id;
+    } catch {
+      return null;
+    }
+  })();
+  const closeScopedReq = await client.callTool({
+    name: "start_requirement",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      title: "Close scoped smoke requirement",
+      background: "Close previous scoped requirement to verify requirement metadata status patching.",
+    },
+  });
+  console.log("\n--- start_requirement (close scoped previous) ---\n");
+  console.log(readText(closeScopedReq));
+  if (scopedRequirementMemoryId) {
+    const scopedRequirementMemory = await client.callTool({
+      name: "read_memory_item",
+      arguments: {
+        ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+        id: scopedRequirementMemoryId,
+      },
+    });
+    console.log("\n--- read_memory_item (closed scoped requirement metadata) ---\n");
+    const scopedRequirementMemoryText = readText(scopedRequirementMemory);
+    console.log(scopedRequirementMemoryText);
+    try {
+      const parsed = JSON.parse(scopedRequirementMemoryText);
+      const meta = JSON.parse(parsed?.item?.metadata_json ?? "{}");
+      if (meta.status !== "completed") {
+        throw new Error(`expected completed metadata status, got ${meta.status}`);
+      }
+      if (!Array.isArray(meta.scope_contract?.allowed_paths) || !meta.scope_contract.allowed_paths.includes("src/billing/**")) {
+        throw new Error("expected completed requirement memory to preserve scope_contract.allowed_paths");
+      }
+    } catch (err) {
+      console.error("\n[smoke] completed requirement metadata preservation check failed:", err);
+      process.exitCode = 1;
+      return;
+    }
   }
 
   if (!(await runMemoryRecallCases({ client, useToolProjectRoot, toolProjectRoot, testPath, token, readText }))) return;

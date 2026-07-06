@@ -423,6 +423,98 @@ export async function runMemoryRecallCases(ctx) {
     return;
   }
 
+  const duplicateTitle = "smoke-duplicate-diagnostic";
+  for (const suffix of ["A", "B"]) {
+    const duplicateNote = await client.callTool({
+      name: "add_note",
+      arguments: {
+        ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+        title: duplicateTitle,
+        content: `Duplicate diagnostic note ${suffix} token=${token}`,
+        tags: ["smoke", "diagnostic"],
+      },
+    });
+    console.log(`\n--- add_note (${duplicateTitle} ${suffix}) ---\n`);
+    console.log(readText(duplicateNote));
+  }
+
+  const conflicts = await client.callTool({
+    name: "analyze_memory_conflicts",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      query: duplicateTitle,
+      format: "json",
+    },
+  });
+  console.log("\n--- analyze_memory_conflicts ---\n");
+  const conflictsText = readText(conflicts);
+  console.log(conflictsText);
+  try {
+    const parsed = JSON.parse(conflictsText);
+    if (parsed?.ok !== true || parsed?.read_only !== true || parsed?.advisory_only !== true) {
+      throw new Error("expected analyze_memory_conflicts to be read-only advisory output");
+    }
+    const conflictList = Array.isArray(parsed?.conflicts) ? parsed.conflicts : [];
+    if (!conflictList.some((c) => c?.code === "duplicate_visible_title")) {
+      throw new Error("expected duplicate_visible_title conflict for duplicate diagnostic notes");
+    }
+  } catch (err) {
+    console.error("\n[smoke] analyze_memory_conflicts check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const quality = await client.callTool({
+    name: "memory_quality_report",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      format: "json",
+    },
+  });
+  console.log("\n--- memory_quality_report ---\n");
+  const qualityText = readText(quality);
+  console.log(qualityText);
+  try {
+    const parsed = JSON.parse(qualityText);
+    if (parsed?.ok !== true || parsed?.read_only !== true || parsed?.advisory_only !== true) {
+      throw new Error("expected memory_quality_report to be read-only advisory output");
+    }
+    const duplicates = Array.isArray(parsed?.duplicate_titles) ? parsed.duplicate_titles : [];
+    if (!duplicates.some((d) => d?.title === duplicateTitle)) {
+      throw new Error("expected memory_quality_report to include duplicate diagnostic title");
+    }
+  } catch (err) {
+    console.error("\n[smoke] memory_quality_report check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const checkpointDiff = await client.callTool({
+    name: "compare_checkpoint_context",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      checkpoint_id: checkpointId,
+      format: "json",
+    },
+  });
+  console.log("\n--- compare_checkpoint_context ---\n");
+  const checkpointDiffText = readText(checkpointDiff);
+  console.log(checkpointDiffText);
+  try {
+    const parsed = JSON.parse(checkpointDiffText);
+    if (parsed?.ok !== true || parsed?.read_only !== true || parsed?.advisory_only !== true) {
+      throw new Error("expected compare_checkpoint_context to be read-only advisory output");
+    }
+    const added = Array.isArray(parsed?.diff?.recent_memory_added) ? parsed.diff.recent_memory_added : [];
+    if (!JSON.stringify(added).includes(duplicateTitle)) {
+      throw new Error("expected checkpoint diff to include memory added after checkpoint");
+    }
+  } catch (err) {
+    console.error("\n[smoke] compare_checkpoint_context check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
   const completeActive = await client.callTool({
     name: "complete_requirement",
     arguments: {

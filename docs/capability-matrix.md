@@ -11,6 +11,7 @@ VectorMind 的目标不是替代 AI，也不是接管客户端权限，而是让
 | 项目知识沉淀 | 构建命令、约定、架构信息散在聊天里 | `upsert_project_summary`, `add_note`, `upsert_convention` | 内容质量取决于写入是否清晰 |
 | 上下文时间线 | 不知道某个需求/决策前后发生了什么 | `memory_timeline` | 只提供证据，不替模型判断因果 |
 | 会话检查点 | 长会话压缩、交接后难以恢复阶段状态 | `create_checkpoint`, `list_checkpoints`, `restore_checkpoint_context` | 恢复是只读上下文，不改变当前状态 |
+| 记忆诊断 | 怀疑旧记忆冲突、重复、checkpoint 漂移 | `analyze_memory_conflicts`, `memory_quality_report`, `compare_checkpoint_context` | 只读报告，不自动清理、不扩大需求范围 |
 | 代码定位 | AI 猜文件、全仓乱搜 | `query_codebase`, `grep` | 符号索引依赖文件变更和索引质量 |
 | 有界读文件 | 大文件一次性塞满上下文 | `list_project_files`, `read_file_lines`, `read_file_text`, `read_codex_text_file` | 只读文本，不替代编辑器 |
 | 巨量文件治理 | 几千/几万行文件继续堆功能 | `plan_large_file_split`, `record_large_file_split` | 给计划和约束，不自动改代码 |
@@ -31,7 +32,8 @@ VectorMind 的目标不是替代 AI，也不是接管客户端权限，而是让
 7. 需要时：`upsert_decision` / `supersede_memory`
 8. 需要追溯时：`memory_timeline`
 9. 长会话/交接时：`create_checkpoint` / `restore_checkpoint_context`
-10. 完成时：`upsert_project_summary` / `complete_requirement`
+10. 怀疑记忆异常时：`analyze_memory_conflicts` / `memory_quality_report` / `compare_checkpoint_context`
+11. 完成时：`upsert_project_summary` / `complete_requirement`
 
 ## 已知不足
 

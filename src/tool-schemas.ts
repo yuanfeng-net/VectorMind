@@ -368,6 +368,35 @@ export const RestoreCheckpointContextArgsSchema = ProjectRootArgSchema.merge(Out
   }),
 );
 
+export const AnalyzeMemoryConflictsArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
+  z.object({
+    query: z.string().min(1).optional(),
+    decision_key: z.string().min(1).optional(),
+    include_hidden: z.boolean().optional().default(false),
+    limit: z.number().int().min(1).max(100).optional().default(20),
+    scan_limit: z.number().int().min(20).max(10_000).optional().default(1000),
+  }),
+);
+
+export const MemoryQualityReportArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
+  z.object({
+    limit: z.number().int().min(1).max(100).optional().default(20),
+    scan_limit: z.number().int().min(50).max(50_000).optional().default(2000),
+    max_checkpoint_chars: z.number().int().min(1000).max(2_000_000).optional().default(50_000),
+  }),
+);
+
+export const CompareCheckpointContextArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
+  z.object({
+    checkpoint_id: z.number().int().positive().optional(),
+    title: z.string().min(1).optional(),
+    recent_limit: z.number().int().min(0).max(50).optional().default(20),
+    pending_limit: z.number().int().min(0).max(MAX_PENDING_LIMIT).optional().default(DEFAULT_PENDING_LIMIT),
+    preview_chars: z.number().int().min(50).max(10_000).optional().default(DEFAULT_PREVIEW_CHARS),
+    content_max_chars: z.number().int().min(0).max(200_000).optional().default(DEFAULT_CONTENT_MAX_CHARS),
+  }),
+);
+
 export const GetTokenSavingsArgsSchema = ProjectRootArgSchema.merge(
   z.object({
     limit: z.number().int().min(1).max(100).optional().default(10),

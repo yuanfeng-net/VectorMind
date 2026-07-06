@@ -374,13 +374,35 @@ export function openDatabaseRuntime(projectRoot: string): DatabaseRuntime {
   );
   completeAllActiveRequirementMemoryItemsStmt = db.prepare(
     `UPDATE memory_items
-     SET metadata_json = ?, updated_at = CURRENT_TIMESTAMP
+     SET metadata_json = json_set(
+         CASE
+           WHEN json_valid(COALESCE(metadata_json, '{}')) THEN COALESCE(metadata_json, '{}')
+           ELSE '{}'
+         END,
+         '$.status',
+         ?
+       ),
+       updated_at = CURRENT_TIMESTAMP
      WHERE kind = 'requirement'
-       AND metadata_json = ?`,
+       AND json_extract(
+         CASE
+           WHEN json_valid(COALESCE(metadata_json, '{}')) THEN COALESCE(metadata_json, '{}')
+           ELSE '{}'
+         END,
+         '$.status'
+       ) = ?`,
   );
   completeRequirementMemoryItemByReqIdStmt = db.prepare(
     `UPDATE memory_items
-     SET metadata_json = ?, updated_at = CURRENT_TIMESTAMP
+     SET metadata_json = json_set(
+         CASE
+           WHEN json_valid(COALESCE(metadata_json, '{}')) THEN COALESCE(metadata_json, '{}')
+           ELSE '{}'
+         END,
+         '$.status',
+         ?
+       ),
+       updated_at = CURRENT_TIMESTAMP
      WHERE kind = 'requirement'
        AND req_id = ?`,
   );

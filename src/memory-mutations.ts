@@ -41,7 +41,7 @@ function getCompleteAllActiveRequirementMemoryItemsStatement(): Database.Stateme
 }
 export function completeRequirementMemoryItemsByReqId(reqId: number): void {
   try {
-    getCompleteRequirementMemoryItemByReqIdStatement().run(safeJson({ status: "completed" }), reqId);
+    getCompleteRequirementMemoryItemByReqIdStatement().run("completed", reqId);
   } catch (err) {
     console.error("[vectormind] failed to complete requirement memory item:", err);
   }
@@ -50,8 +50,8 @@ export function completeRequirementMemoryItemsByReqId(reqId: number): void {
 export function completeAllActiveRequirementMemoryItems(): void {
   try {
     getCompleteAllActiveRequirementMemoryItemsStatement().run(
-      safeJson({ status: "completed" }),
-      safeJson({ status: "active" }),
+      "completed",
+      "active",
     );
   } catch (err) {
     console.error("[vectormind] failed to complete all active requirement memory items:", err);

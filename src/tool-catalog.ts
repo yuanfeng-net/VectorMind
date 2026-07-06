@@ -1,8 +1,10 @@
 import { toJsonSchemaCompat } from "@modelcontextprotocol/sdk/server/zod-json-schema-compat.js";
 import {
   AddNoteArgsSchema,
+  AnalyzeMemoryConflictsArgsSchema,
   BootstrapContextArgsSchema,
   ClearActivityLogArgsSchema,
+  CompareCheckpointContextArgsSchema,
   CompleteRequirementArgsSchema,
   CreateCheckpointArgsSchema,
   DetectRtkArgsSchema,
@@ -17,6 +19,7 @@ import {
   ListProjectFilesArgsSchema,
   MaintainMemoryArgsSchema,
   MemoryTimelineArgsSchema,
+  MemoryQualityReportArgsSchema,
   PlanLargeFileSplitArgsSchema,
   PreflightChangeScopeArgsSchema,
   PruneIndexArgsSchema,
@@ -80,6 +83,9 @@ const TOOL_BEHAVIOR: Record<string, ToolBehavior> = {
   prune_index: { tags: ["index_maintenance", "dry_run_by_default", "advisory_only"], readOnlyHint: false, idempotentHint: false },
   create_checkpoint: { tags: ["write_memory", "checkpoint", "advisory_only"], readOnlyHint: false, idempotentHint: false },
   restore_checkpoint_context: { tags: ["read_only", "checkpoint_context", "advisory_only"], readOnlyHint: true, idempotentHint: true },
+  analyze_memory_conflicts: { tags: ["read_only", "memory_diagnostics", "advisory_only"], readOnlyHint: true, idempotentHint: true },
+  memory_quality_report: { tags: ["read_only", "memory_quality", "advisory_only"], readOnlyHint: true, idempotentHint: true },
+  compare_checkpoint_context: { tags: ["read_only", "checkpoint_diff", "advisory_only"], readOnlyHint: true, idempotentHint: true },
 };
 
 function withToolBehavior(tool: ToolDefinition): ToolDefinition {
@@ -298,6 +304,24 @@ export async function listToolDefinitions() {
         description:
           "Read-only restore of checkpoint context. Returns the saved snapshot but does not mutate requirements, files, runtime state, or model decisions.",
         inputSchema: toJsonSchemaCompat(RestoreCheckpointContextArgsSchema),
+      },
+      {
+        name: "analyze_memory_conflicts",
+        description:
+          "Read-only diagnostic for likely memory conflicts such as duplicate visible titles, multiple active requirements, or superseded targets that remain visible. It reports evidence only and never changes memory, source files, active requirements, or model decisions.",
+        inputSchema: toJsonSchemaCompat(AnalyzeMemoryConflictsArgsSchema),
+      },
+      {
+        name: "memory_quality_report",
+        description:
+          "Read-only quality report for the local memory store: counts, hidden memory, duplicates, oversized checkpoints, stale indexed files, and orphaned memory records. Use maintain_memory/prune_index separately if cleanup is desired.",
+        inputSchema: toJsonSchemaCompat(MemoryQualityReportArgsSchema),
+      },
+      {
+        name: "compare_checkpoint_context",
+        description:
+          "Read-only diff between a saved checkpoint snapshot and current context. Shows active requirement, project summary, decisions, recent memory, and pending-change differences without restoring or mutating anything.",
+        inputSchema: toJsonSchemaCompat(CompareCheckpointContextArgsSchema),
       },
       {
         name: "maintain_memory",

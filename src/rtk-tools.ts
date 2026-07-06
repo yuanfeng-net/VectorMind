@@ -35,14 +35,17 @@ function runRtkProbe(spec: {
   execCommand: string;
   execArgsPrefix?: string[];
   execShell?: boolean;
+  execEnv?: NodeJS.ProcessEnv;
   path?: string;
 }): RtkDetection | null {
   const argsPrefix = spec.execArgsPrefix ?? [];
+  const env = { ...process.env, VECTORMIND_RTK_NO_AUTO_INSTALL: "1", ...(spec.execEnv ?? {}) };
   const result = spawnSync(spec.execCommand, [...argsPrefix, "--version"], {
     encoding: "utf8",
     timeout: 120_000,
     windowsHide: true,
     shell: spec.execShell ?? false,
+    env,
   });
   if (result.status === 0) {
     const gain = spawnSync(spec.execCommand, [...argsPrefix, "gain"], {
@@ -50,6 +53,7 @@ function runRtkProbe(spec: {
       timeout: 120_000,
       windowsHide: true,
       shell: spec.execShell ?? false,
+      env,
     });
     let resolvedPath = spec.path;
     if (spec.source === "path") {
@@ -103,6 +107,7 @@ export function detectRtk(): RtkDetection {
       displayCommand,
       execCommand: process.execPath,
       execArgsPrefix: [shimPath],
+      execEnv: { VECTORMIND_RTK_NO_AUTO_INSTALL: "1" },
       path: shimPath,
     });
     if (shimProbe) return shimProbe;
@@ -116,8 +121,8 @@ export function detectRtk(): RtkDetection {
     path: shimPath ?? undefined,
     source: shimPath ? "package_shim" : undefined,
     note: shimPath
-      ? "rtk was not found on PATH, and VectorMind's bundled RTK shim could not verify rtk gain. VectorMind compact MCP output still works; check npm/cache or set VECTORMIND_RTK_REAL."
-      : "rtk was not found on PATH and the package RTK shim is unavailable. VectorMind compact MCP output still works; install rtk to compact shell command output too.",
+      ? "rtk was not found on PATH, and VectorMind's bundled RTK shim could not verify rtk gain without auto-installing. VectorMind compact MCP output still works; use install_rtk(dry_run=false) explicitly or set VECTORMIND_RTK_REAL."
+      : "rtk was not found on PATH and the package RTK shim is unavailable. VectorMind compact MCP output still works; install rtk explicitly to compact shell command output too.",
   };
 }
 

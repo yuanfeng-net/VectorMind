@@ -102,6 +102,7 @@ For durable context:
 - `complete_requirement(...)` when done
 - `create_checkpoint(...)` before long-session handoff or heavy compaction
 - `restore_checkpoint_context(...)` to read checkpoint context back without mutating active state
+- `analyze_memory_conflicts(...)`, `memory_quality_report(...)`, or `compare_checkpoint_context(...)` only when auditing memory quality, stale-rule regressions, or checkpoint drift
 
 ## Code search and reading
 
@@ -118,6 +119,8 @@ If a large/long-lived project feels slow:
 
 1. Call `maintain_memory({ project_root, dry_run: true })`.
 2. Apply with `dry_run: false` only if the plan is safe.
+
+For low-risk diagnosis, use `memory_quality_report(...)`, `analyze_memory_conflicts(...)`, or `compare_checkpoint_context(...)` as read-only evidence. Do not use these reports to expand the current requirement or override model judgment.
 
 ## Output policy
 

@@ -48,6 +48,7 @@ For code/design/debug/refactor tasks, follow this chain:
    - Call `add_note(...)` for durable notes.
    - Call `upsert_convention(...)` for durable project rules.
    - Call `complete_requirement(...)` when the requirement is done.
+   - Use `analyze_memory_conflicts(...)`, `memory_quality_report(...)`, or `compare_checkpoint_context(...)` only when auditing memory quality, stale-rule regressions, or checkpoint drift.
 
 ## Search and reading
 
@@ -64,6 +65,8 @@ If a long-lived project feels slow:
 
 1. Call `maintain_memory({ project_root, dry_run: true })`.
 2. Apply with `dry_run: false` only if the plan is safe.
+
+For low-risk diagnosis, use `memory_quality_report(...)`, `analyze_memory_conflicts(...)`, or `compare_checkpoint_context(...)` as read-only evidence. Do not use these reports to expand the current requirement or override model judgment.
 
 ## Output policy
 
