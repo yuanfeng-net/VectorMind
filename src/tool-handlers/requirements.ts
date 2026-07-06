@@ -5,7 +5,7 @@ import type { ToolHandlerContext } from "./context.js";
 import type { RequirementRow } from "../types.js";
 import type { ChangeMode } from "../development-warnings.js";
 import { CompleteRequirementArgsSchema, GetPendingChangesArgsSchema, MAX_PENDING_LIMIT, PreflightChangeScopeArgsSchema, StartRequirementArgsSchema, SyncChangeIntentArgsSchema } from "../tool-schemas.js";
-import { buildDevelopmentWarnings, buildRequirementScopeContract, buildRequirementStartWarnings, buildScopeDriftWarnings, getRequirementScopeContract, isDevelopmentWarningBlockingForChangeMode, mergeScopeContracts } from "../development-warnings.js";
+import { buildDevelopmentWarnings, buildRequirementMappingWarnings, buildRequirementScopeContract, buildRequirementStartWarnings, buildScopeDriftWarnings, getRequirementItems, getRequirementScopeContract, isDevelopmentWarningBlockingForChangeMode, mergeScopeContracts, normalizeRequirementItems } from "../development-warnings.js";
 import { mergePendingWithGit } from "../pending-changes.js";
 import { toolCompactOrJson } from "../token-savings.js";
 import { flushPendingChangeBuffer, indexFile } from "../file-indexing.js";
@@ -30,6 +30,7 @@ export async function handleStartRequirement(
     allowed_paths: args.allowed_paths,
     denied_paths: args.denied_paths,
   });
+  const requirement_items = normalizeRequirementItems(args.requirement_items);
   const development_warnings = buildRequirementStartWarnings({
     title: args.title,
     background: args.background,
@@ -58,7 +59,7 @@ export async function handleStartRequirement(
     null,
     null,
     id,
-    safeJson({ status: "active", scope_contract }),
+    safeJson({ status: "active", scope_contract, requirement_items }),
     sha256Hex(content),
   );
   const memory_id = Number(memoryInfo.lastInsertRowid);
@@ -68,6 +69,7 @@ export async function handleStartRequirement(
     title: args.title,
     closed_previous: args.close_previous,
     scope_contract,
+    requirement_items,
     development_warnings: development_warnings.length,
   });
 
@@ -81,6 +83,7 @@ export async function handleStartRequirement(
           memory_item: { id: memory_id },
           closed_previous: args.close_previous,
           scope_contract,
+          requirement_items,
           development_warnings,
         }),
       },
@@ -109,6 +112,12 @@ export async function handlePreflightChangeScope(
     allowed_paths: args.allowed_paths,
     denied_paths: args.denied_paths,
   });
+  const explicitRequirementItems = normalizeRequirementItems(args.requirement_items);
+  const requirementItems = explicitRequirementItems.length
+    ? explicitRequirementItems
+    : active
+      ? getRequirementItems(active.id)
+      : [];
   const fileInputs = files.map((file_path) => ({ file_path }));
   const development_warnings = [
     ...buildDevelopmentWarnings(fileInputs, { includeUnspecified: fileInputs.length === 0 }),
@@ -118,6 +127,13 @@ export async function handlePreflightChangeScope(
       intent: args.intent,
       files: fileInputs,
       includeMissingContractHint: true,
+    }),
+    ...buildRequirementMappingWarnings({
+      requirement: active,
+      requirement_items: requirementItems,
+      planned_changes: args.planned_changes,
+      files: fileInputs,
+      change_mode: changeMode,
     }),
   ];
   const scope_contract = mergeScopeContracts(
@@ -170,6 +186,10 @@ export async function handlePreflightChangeScope(
     active_requirement: active ? { id: active.id, title: active.title } : null,
     intent: args.intent,
     files: files.map(normalizeToDbPath),
+    requirement_mapping: {
+      requirement_items: requirementItems,
+      planned_changes: args.planned_changes ?? [],
+    },
     scope_contract,
     development_warnings,
   };

@@ -14,6 +14,18 @@ const OutputFormatSchema = z.object({
 
 export type OutputFormat = z.infer<typeof OutputFormatSchema>["format"];
 
+const RequirementItemSchema = z.string().min(1);
+const PlannedChangeSchema = z.object({
+  file: z.string().min(1).optional(),
+  change: z.string().min(1),
+  requirement_refs: z.array(z.string().min(1)).optional(),
+  supporting_change: z.boolean().optional().default(false),
+  change_type: z
+    .enum(["requirement", "supporting_change", "mechanical_modularization", "validation", "formatting", "test", "build_fix"])
+    .optional()
+    .default("requirement"),
+});
+
 export const StartRequirementArgsSchema = ProjectRootArgSchema.merge(
   z.object({
     title: z.string().min(1),
@@ -23,6 +35,7 @@ export const StartRequirementArgsSchema = ProjectRootArgSchema.merge(
     scope_deny: z.array(z.string().min(1)).optional(),
     allowed_paths: z.array(z.string().min(1)).optional(),
     denied_paths: z.array(z.string().min(1)).optional(),
+    requirement_items: z.array(RequirementItemSchema).optional(),
   }),
 );
 
@@ -47,6 +60,8 @@ export const PreflightChangeScopeArgsSchema = ProjectRootArgSchema.merge(OutputF
     scope_deny: z.array(z.string().min(1)).optional(),
     allowed_paths: z.array(z.string().min(1)).optional(),
     denied_paths: z.array(z.string().min(1)).optional(),
+    requirement_items: z.array(RequirementItemSchema).optional(),
+    planned_changes: z.array(PlannedChangeSchema).optional(),
   }),
 );
 

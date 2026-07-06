@@ -371,6 +371,12 @@ async function main() {
     if (!serverInstructions?.includes("Do not add extra business behavior")) {
       throw new Error("expected server instructions to include no-extra-demand guidance");
     }
+    if (!serverInstructions?.includes("planned_changes with requirement_refs")) {
+      throw new Error("expected server instructions to include requirement item mapping guidance");
+    }
+    if (!serverInstructions?.includes("cross_project_reference")) {
+      throw new Error("expected server instructions to include cross-project reference guidance");
+    }
     if (!serverInstructions?.includes("Built-in frontend output-purity quality policy:")) {
       throw new Error("expected server instructions to include frontend output-purity quality section");
     }
@@ -864,6 +870,42 @@ async function main() {
     return;
   }
 
+  const secondProjectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "vectormind-second-project-"));
+  fs.writeFileSync(path.join(secondProjectRoot, "package.json"), JSON.stringify({ name: "vm-second-project" }));
+  const bootSecondProject = await client.callTool({
+    name: "bootstrap_context",
+    arguments: {
+      project_root: secondProjectRoot,
+      query: "smoke: verify cross-project advisory",
+      format: "json",
+    },
+  });
+  console.log("\n--- bootstrap_context (cross-project advisory) ---\n");
+  const bootSecondProjectText = readText(bootSecondProject);
+  console.log(bootSecondProjectText);
+  try {
+    const parsed = JSON.parse(bootSecondProjectText);
+    const advisory = parsed?.project_context_advisory;
+    if (advisory?.code !== "cross_project_reference" || advisory?.read_only_reference !== true) {
+      throw new Error("expected project_context_advisory cross_project_reference read_only_reference=true");
+    }
+  } catch (err) {
+    console.error("\n[smoke] cross-project advisory check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const bootBackProject = await client.callTool({
+    name: "bootstrap_context",
+    arguments: {
+      project_root: toolProjectRoot,
+      query: "smoke: switch back after cross-project advisory",
+      format: "json",
+    },
+  });
+  console.log("\n--- bootstrap_context (switch back after cross-project advisory) ---\n");
+  console.log(readText(bootBackProject));
+
   const scopeReq = await client.callTool({
     name: "start_requirement",
     arguments: {
@@ -871,11 +913,130 @@ async function main() {
       title: "Add billing export",
       background: "Add a billing export endpoint and small report helper.",
       allowed_paths: ["src/billing/**"],
+      requirement_items: ["Add a billing export endpoint.", "Add a small report helper."],
     },
   });
   console.log("\n--- start_requirement (scope contract) ---\n");
   const scopeReqText = readText(scopeReq);
   console.log(scopeReqText);
+
+  const preflightMappingMissing = await client.callTool({
+    name: "preflight_change_scope",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      intent: "smoke: add billing export endpoint",
+      files: ["src/billing/export.ts"],
+      format: "json",
+    },
+  });
+  console.log("\n--- preflight_change_scope (requirement mapping missing) ---\n");
+  const preflightMappingMissingText = readText(preflightMappingMissing);
+  console.log(preflightMappingMissingText);
+  try {
+    const parsed = JSON.parse(preflightMappingMissingText);
+    const warnings = parsed?.development_warnings;
+    if (parsed?.safe_to_edit !== false || parsed?.ok !== false) {
+      throw new Error("expected missing requirement mapping to block editing");
+    }
+    if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "requirement_mapping_missing")) {
+      throw new Error("expected requirement_mapping_missing warning");
+    }
+  } catch (err) {
+    console.error("\n[smoke] requirement mapping missing check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const preflightMappingOk = await client.callTool({
+    name: "preflight_change_scope",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      intent: "smoke: add billing export endpoint",
+      files: ["src/billing/export.ts"],
+      planned_changes: [{ file: "src/billing/export.ts", change: "Add billing export endpoint.", requirement_refs: ["1"] }],
+      format: "json",
+    },
+  });
+  console.log("\n--- preflight_change_scope (requirement mapping ok) ---\n");
+  const preflightMappingOkText = readText(preflightMappingOk);
+  console.log(preflightMappingOkText);
+  try {
+    const parsed = JSON.parse(preflightMappingOkText);
+    const warnings = parsed?.development_warnings ?? [];
+    if (parsed?.safe_to_edit !== true || parsed?.ok !== true) {
+      throw new Error("expected mapped requirement change to be safe");
+    }
+    if (warnings.some((w) => w?.code === "requirement_mapping_missing")) {
+      throw new Error("expected mapped requirement change not to warn");
+    }
+  } catch (err) {
+    console.error("\n[smoke] requirement mapping ok check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const preflightMappingUnmappedFile = await client.callTool({
+    name: "preflight_change_scope",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      intent: "smoke: verify every target file is mapped",
+      files: ["src/billing/export.ts", "src/billing/extra.ts"],
+      planned_changes: [{ file: "src/billing/export.ts", change: "Add billing export endpoint.", requirement_refs: ["1"] }],
+      format: "json",
+    },
+  });
+  console.log("\n--- preflight_change_scope (requirement mapping unmapped file) ---\n");
+  const preflightMappingUnmappedFileText = readText(preflightMappingUnmappedFile);
+  console.log(preflightMappingUnmappedFileText);
+  try {
+    const parsed = JSON.parse(preflightMappingUnmappedFileText);
+    const warnings = parsed?.development_warnings ?? [];
+    if (parsed?.safe_to_edit !== false || parsed?.ok !== false) {
+      throw new Error("expected unmapped target file to block editing");
+    }
+    if (!warnings.some((w) => w?.code === "requirement_mapping_missing" && Array.isArray(w?.details?.unmapped_files) && w.details.unmapped_files.includes("src/billing/extra.ts"))) {
+      throw new Error("expected requirement_mapping_missing with unmapped_files");
+    }
+  } catch (err) {
+    console.error("\n[smoke] requirement mapping unmapped file check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const preflightMappingSupporting = await client.callTool({
+    name: "preflight_change_scope",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      intent: "smoke: add billing export test support",
+      files: ["src/billing/export.test.ts"],
+      planned_changes: [
+        {
+          file: "src/billing/export.test.ts",
+          change: "Add test coverage for the billing export endpoint.",
+          supporting_change: true,
+          change_type: "test",
+        },
+      ],
+      format: "json",
+    },
+  });
+  console.log("\n--- preflight_change_scope (requirement mapping supporting change) ---\n");
+  const preflightMappingSupportingText = readText(preflightMappingSupporting);
+  console.log(preflightMappingSupportingText);
+  try {
+    const parsed = JSON.parse(preflightMappingSupportingText);
+    const warnings = parsed?.development_warnings ?? [];
+    if (parsed?.safe_to_edit !== true || parsed?.ok !== true) {
+      throw new Error("expected supporting change to be safe");
+    }
+    if (warnings.some((w) => w?.code === "requirement_mapping_missing")) {
+      throw new Error("expected supporting change not to warn");
+    }
+  } catch (err) {
+    console.error("\n[smoke] requirement mapping supporting change check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
 
   const preflightScopeDrift = await client.callTool({
     name: "preflight_change_scope",
@@ -972,6 +1133,9 @@ async function main() {
       }
       if (!Array.isArray(meta.scope_contract?.allowed_paths) || !meta.scope_contract.allowed_paths.includes("src/billing/**")) {
         throw new Error("expected completed requirement memory to preserve scope_contract.allowed_paths");
+      }
+      if (!Array.isArray(meta.requirement_items) || meta.requirement_items.length !== 2) {
+        throw new Error("expected completed requirement memory to preserve requirement_items");
       }
     } catch (err) {
       console.error("\n[smoke] completed requirement metadata preservation check failed:", err);

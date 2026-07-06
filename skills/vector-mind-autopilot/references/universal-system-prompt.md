@@ -25,8 +25,11 @@ For code/design/debug/refactor tasks, follow this chain:
 2. **Before editing**
    - Call `start_requirement({ project_root, title, background })`.
    - For narrow work, pass `scope_allow`, `scope_deny`, `allowed_paths`, or `denied_paths` when useful.
+   - If the user request has clear bullets, acceptance points, or numbered items, pass `requirement_items`.
    - Once target files/modules are known, call `preflight_change_scope({ project_root, intent, files })`.
+   - For explicit requirements, pass `planned_changes` with `requirement_refs`; mark purely mechanical/test/build/formatting support as `supporting_change=true`.
    - Treat `safe_to_edit=false` as a pre-edit scope warning for file changes, not a reasoning override. Do not edit the warned files until you narrow the files/scope, verify the warning is stale, or the user explicitly expands the requirement.
+   - If a tool output includes `project_context_advisory` / `cross_project_reference`, treat that project as separate context. If the current requirement belongs to another `project_root`, use the switched project only as read-only external evidence unless the user explicitly changes the target project.
 
 3. **Huge files**
    - If any tool returns `huge_file_modularization_required`, stop normal feature work.

@@ -271,6 +271,7 @@ export function compactPreflightChangeScopeText(data: {
   active_requirement: { id: number; title: string } | null;
   intent: string;
   files: string[];
+  requirement_mapping?: { requirement_items?: unknown[]; planned_changes?: unknown[] };
   scope_contract: CompactRequirementScopeContract | null;
   development_warnings: CompactDevelopmentWarning[];
 }): string {
@@ -281,6 +282,11 @@ export function compactPreflightChangeScopeText(data: {
   ];
   if (data.required_action) lines.push(`required_action=${data.required_action}`);
   if (data.allowed_change_modes?.length) lines.push(`allowed_change_modes=${data.allowed_change_modes.join(",")}`);
+  if (data.requirement_mapping) {
+    lines.push(
+      `requirement_mapping items=${data.requirement_mapping.requirement_items?.length ?? 0} planned_changes=${data.requirement_mapping.planned_changes?.length ?? 0}`,
+    );
+  }
   if (data.scope_contract) {
     lines.push(
       `scope allow_terms=${data.scope_contract.allow_terms.length} deny_terms=${data.scope_contract.deny_terms.length} allowed_paths=${data.scope_contract.allowed_paths.length} denied_paths=${data.scope_contract.denied_paths.length}`,

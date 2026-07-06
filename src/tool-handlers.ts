@@ -1,7 +1,7 @@
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolRequestSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
-import type { ToolHandler, ToolHandlerContext } from "./tool-handlers/context.js";
+import type { ProjectContextAdvisory, ToolHandler, ToolHandlerContext } from "./tool-handlers/context.js";
 import { handleStartRequirement, handlePreflightChangeScope, handleSyncChangeIntent, handleGetPendingChanges, handleCompleteRequirement } from "./tool-handlers/requirements.js";
 import { handlePruneIndex, handleMaintainMemory } from "./tool-handlers/maintenance.js";
 import { handlePlanLargeFileSplit, handleRecordLargeFileSplit } from "./tool-handlers/large-files.js";
@@ -11,6 +11,7 @@ import { handleUpsertProjectSummary, handleAddNote, handleUpsertDecision, handle
 import { handleGetActivityLog, handleGetActivitySummary, handleClearActivityLog, handleDetectRtk, handleInstallRtk, handleGetTokenSavings } from "./tool-handlers/diagnostics.js";
 import { handleCreateCheckpoint, handleListCheckpoints, handleMemoryTimeline, handleRestoreCheckpointContext } from "./tool-handlers/context-recovery.js";
 import { handleAnalyzeMemoryConflicts, handleCompareCheckpointContext, handleMemoryQualityReport } from "./tool-handlers/memory-diagnostics.js";
+import { oneLine, toolJson } from "./tool-output.js";
 
 export type { ToolHandlerContext } from "./tool-handlers/context.js";
 const TOOL_HANDLERS: Record<string, ToolHandler> = {
@@ -52,6 +53,37 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
   memory_quality_report: handleMemoryQualityReport,
   compare_checkpoint_context: handleCompareCheckpointContext,
 };
+
+function attachProjectContextAdvisory(result: CallToolResult, advisory: ProjectContextAdvisory | null): CallToolResult {
+  if (!advisory) return result;
+  const content = result.content?.map((item, index) => {
+    if (index !== 0 || item.type !== "text" || typeof item.text !== "string") return item;
+    const text = item.text.trim();
+    if (text.startsWith("{") || text.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(item.text) as Record<string, unknown>;
+        return {
+          ...item,
+          text: toolJson({
+            ...parsed,
+            project_context_advisory: advisory,
+          }),
+        };
+      } catch {
+        // Fall back to compact-text injection below.
+      }
+    }
+
+    const advisoryLine =
+      `project_context_advisory ${advisory.code}: external_reference=true read_only_reference=true previous="${oneLine(advisory.previous_project_root, 90)}" current="${oneLine(advisory.current_project_root, 90)}"`;
+    return {
+      ...item,
+      text: `${advisoryLine}\n${item.text}`,
+    };
+  });
+  return { ...result, content };
+}
+
 export function registerToolHandlers(server: Server, context: ToolHandlerContext): void {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const toolName = request.params.name;
@@ -62,18 +94,19 @@ export function registerToolHandlers(server: Server, context: ToolHandlerContext
 
       const handler = TOOL_HANDLERS[toolName];
       if (!handler) {
-        return {
+        return attachProjectContextAdvisory({
           isError: true,
           content: [{ type: "text", text: `Unknown tool: ${toolName}` }],
-        };
+        }, context.consumeProjectContextAdvisory());
       }
 
-      return await handler(rawArgs, context);
+      const result = await handler(rawArgs, context);
+      return attachProjectContextAdvisory(result, context.consumeProjectContextAdvisory());
     } catch (err) {
-      return {
+      return attachProjectContextAdvisory({
         isError: true,
         content: [{ type: "text", text: String(err) }],
-      };
+      }, context.consumeProjectContextAdvisory());
     }
   });
 }

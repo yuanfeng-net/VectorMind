@@ -57,6 +57,7 @@ start_requirement({ project_root, title, background })
 ```
 
 For narrow tasks, pass `scope_allow`, `scope_deny`, `allowed_paths`, or `denied_paths` when useful.
+If the user request has clear bullets, acceptance points, or numbered items, also pass `requirement_items` so later edits can be checked against the actual request.
 
 Once planned files/modules are known, call:
 
@@ -64,7 +65,11 @@ Once planned files/modules are known, call:
 preflight_change_scope({ project_root, intent, files })
 ```
 
+For explicit requirements, pass `planned_changes` with `requirement_refs`. Mark purely mechanical/test/build/formatting support as `supporting_change=true`.
+
 Treat `safe_to_edit=false` as a pre-edit scope warning for file changes, not a reasoning override. Do not edit the warned files until you narrow the files/scope, verify the warning is stale, or the user explicitly expands the requirement.
+
+If a tool output includes `project_context_advisory` / `cross_project_reference`, treat that project as a separate context. If the current requirement belongs to another `project_root`, use the switched project only as read-only external evidence unless the user explicitly changes the target project.
 
 ### 3. Huge files
 

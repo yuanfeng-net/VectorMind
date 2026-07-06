@@ -5,8 +5,21 @@ import type { ExtractedSymbol, RootSource } from "../types.js";
 
 export type ToolStatements = Record<string, Database.Statement>;
 
+export type ProjectContextAdvisory = {
+  code: "cross_project_reference";
+  severity: "info";
+  advisory_only: true;
+  previous_project_root: string;
+  current_project_root: string;
+  external_reference: true;
+  read_only_reference: true;
+  not_current_requirement_scope: true;
+  message: string;
+};
+
 export type ToolHandlerContext = {
   ensureInitializedForArgs: (rawArgs: Record<string, unknown>) => Promise<void>;
+  consumeProjectContextAdvisory: () => ProjectContextAdvisory | null;
   getDb: () => Database.Database;
   getProjectRoot: () => string;
   getRootSource: () => RootSource;

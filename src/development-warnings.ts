@@ -54,7 +54,8 @@ type DevelopmentWarning = {
     | "multiple_active_requirements"
     | "broad_requirement_scope"
     | "scope_drift"
-    | "scope_contract_missing";
+    | "scope_contract_missing"
+    | "requirement_mapping_missing";
   severity: "info" | "warning" | "blocker";
   message: string;
   files?: string[];
@@ -85,6 +86,17 @@ type RequirementScopeContract = {
   allowed_paths: string[];
   denied_paths: string[];
   inferred_from: string[];
+};
+type RequirementItem = {
+  id: string;
+  text: string;
+};
+type PlannedRequirementChange = {
+  file?: string;
+  change: string;
+  requirement_refs?: string[];
+  supporting_change?: boolean;
+  change_type?: string;
 };
 
 export function isLikelySourceImplementationFile(filePath: string): boolean {
@@ -328,6 +340,136 @@ export function buildRequirementStartWarnings(args: {
 }
 function normalizeScopeTerms(values: string[] | undefined): string[] {
   return Array.from(new Set((values ?? []).map((v) => v.trim()).filter(Boolean)));
+}
+
+export function normalizeRequirementItems(values: string[] | undefined): RequirementItem[] {
+  return (values ?? [])
+    .map((text, index) => ({ id: String(index + 1), text: text.trim() }))
+    .filter((item) => item.text.length > 0);
+}
+
+export function getRequirementItems(reqId: number): RequirementItem[] {
+  const memId = requireDevelopmentWarningsContext().getRequirementMemoryItemId(reqId)?.id;
+  if (memId == null) return [];
+  const row = requireDevelopmentWarningsContext().getMemoryItemById(memId);
+  const meta = requireDevelopmentWarningsContext().parseMetadataJson(row?.metadata_json);
+  const raw = meta.requirement_items;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item, index) => {
+      if (typeof item === "string") return { id: String(index + 1), text: item.trim() };
+      if (!item || typeof item !== "object") return null;
+      const obj = item as Record<string, unknown>;
+      const text = typeof obj.text === "string" ? obj.text.trim() : "";
+      const id = typeof obj.id === "string" && obj.id.trim() ? obj.id.trim() : String(index + 1);
+      return text ? { id, text } : null;
+    })
+    .filter((item): item is RequirementItem => !!item);
+}
+
+function normalizeRequirementRef(value: string): string {
+  return value.trim().replace(/^#+/, "").toLowerCase();
+}
+
+function plannedChangeIsSupporting(change: PlannedRequirementChange): boolean {
+  if (change.supporting_change) return true;
+  return new Set(["supporting_change", "mechanical_modularization", "validation", "formatting", "test", "build_fix"]).has(
+    String(change.change_type ?? "").toLowerCase(),
+  );
+}
+
+export function buildRequirementMappingWarnings(args: {
+  requirement?: RequirementRow;
+  requirement_items?: RequirementItem[];
+  planned_changes?: PlannedRequirementChange[];
+  files: Array<{ file_path: string }>;
+  change_mode: ChangeMode;
+}): DevelopmentWarning[] {
+  const items = args.requirement_items ?? [];
+  const planned = args.planned_changes ?? [];
+  const warnings: DevelopmentWarning[] = [];
+  if (!items.length && !planned.length) return warnings;
+
+  if (args.change_mode === "mechanical_modularization" && planned.every(plannedChangeIsSupporting)) {
+    return warnings;
+  }
+
+  if (items.length && args.files.length > 0 && planned.length === 0) {
+    warnings.push({
+      code: "requirement_mapping_missing",
+      severity: "blocker",
+      message:
+        "This requirement has explicit requirement_items, but the planned file changes were not mapped to those items. Add planned_changes with requirement_refs, or mark purely mechanical/test/build/formatting work as supporting_change.",
+      files: args.files.map((f) => normalizeToDbPath(f.file_path)).slice(0, 12),
+      details: {
+        requirement_id: args.requirement?.id ?? null,
+        requirement_title: args.requirement?.title ?? null,
+        requirement_items: items.slice(0, 20),
+        expected_planned_changes: true,
+      },
+    });
+    return warnings;
+  }
+
+  if (!items.length && planned.length > 0) {
+    warnings.push({
+      code: "requirement_mapping_missing",
+      severity: "info",
+      message:
+        "planned_changes were provided, but no requirement_items are available to verify them. This is advisory evidence only; if the user request has explicit bullets, pass requirement_items to start_requirement or preflight_change_scope.",
+      files: planned.map((p) => p.file).filter((v): v is string => typeof v === "string").slice(0, 12),
+      details: {
+        requirement_id: args.requirement?.id ?? null,
+        requirement_title: args.requirement?.title ?? null,
+      },
+    });
+    return warnings;
+  }
+
+  const validRefs = new Set<string>();
+  for (const item of items) {
+    validRefs.add(normalizeRequirementRef(item.id));
+    validRefs.add(normalizeRequirementRef(`#${item.id}`));
+    validRefs.add(normalizeRequirementRef(item.text));
+  }
+
+  const missing = planned.filter((change) => {
+    if (plannedChangeIsSupporting(change)) return false;
+    const refs = change.requirement_refs ?? [];
+    if (!refs.length) return true;
+    return refs.every((ref) => !validRefs.has(normalizeRequirementRef(ref)));
+  });
+  const plannedFiles = new Set(
+    planned
+      .map((change) => change.file)
+      .filter((file): file is string => typeof file === "string" && file.trim().length > 0)
+      .map((file) => normalizeToDbPath(file)),
+  );
+  const unmappedFiles = args.files
+    .map((f) => normalizeToDbPath(f.file_path))
+    .filter((filePath) => filePath !== "(unspecified)" && !plannedFiles.has(filePath));
+
+  if (missing.length || unmappedFiles.length) {
+    warnings.push({
+      code: "requirement_mapping_missing",
+      severity: "blocker",
+      message:
+        "One or more planned changes or target files do not map to any explicit user requirement item. Do not implement unrelated or self-expanded behavior; map every target file/change to a requirement item, mark purely mechanical/test/build/formatting support as supporting_change, or ask the user to expand the requirement.",
+      files: Array.from(new Set([
+        ...missing.map((m) => m.file).filter((v): v is string => typeof v === "string"),
+        ...unmappedFiles,
+      ])).slice(0, 12),
+      details: {
+        requirement_id: args.requirement?.id ?? null,
+        requirement_title: args.requirement?.title ?? null,
+        requirement_items: items.slice(0, 20),
+        missing: missing.slice(0, 20),
+        unmapped_files: unmappedFiles.slice(0, 20),
+      },
+    });
+  }
+
+  return warnings;
 }
 
 export function buildRequirementScopeContract(args: {

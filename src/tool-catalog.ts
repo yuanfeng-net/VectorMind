@@ -116,7 +116,7 @@ export async function listToolDefinitions() {
       {
         name: "start_requirement",
         description:
-          "MUST call BEFORE editing code. Starts/activates the concrete user requirement so subsequent changes stay inside that requirement boundary and do not accumulate unrelated work. Supports scope_allow/scope_deny and allowed_paths/denied_paths to prevent unrelated domain drift.",
+          "MUST call BEFORE editing code. Starts/activates the concrete user requirement so subsequent changes stay inside that requirement boundary and do not accumulate unrelated work. Supports scope_allow/scope_deny, allowed_paths/denied_paths, and optional requirement_items for explicit user-request mapping.",
         inputSchema: toJsonSchemaCompat(StartRequirementArgsSchema),
       },
       {
@@ -128,7 +128,7 @@ export async function listToolDefinitions() {
       {
         name: "preflight_change_scope",
         description:
-          "MUST call BEFORE editing once you know the intended files/modules. Checks planned files against the active requirement and optional generic scope_allow/scope_deny/allowed_paths/denied_paths. If ok=false/safe_to_edit=false, stop before editing and narrow the plan or scope contract. For huge files, use change_mode='mechanical_modularization' only when the task is to split the file.",
+          "MUST call BEFORE editing once you know the intended files/modules. Checks planned files against the active requirement, optional generic scope_allow/scope_deny/allowed_paths/denied_paths, and optional requirement_items/planned_changes mapping. If ok=false/safe_to_edit=false, stop before editing and narrow the plan or scope contract. For huge files, use change_mode='mechanical_modularization' only when the task is to split the file.",
         inputSchema: toJsonSchemaCompat(PreflightChangeScopeArgsSchema),
       },
       {

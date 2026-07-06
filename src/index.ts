@@ -18,6 +18,7 @@ import type {
   RequirementRow,
   RootSource,
 } from "./types.js";
+import type { ProjectContextAdvisory } from "./tool-handlers/context.js";
 import {
   isProbablySystemDir,
   isProbablyVscodeInstallDir,
@@ -79,6 +80,7 @@ let initialized = false;
 let rootSource: RootSource = "cwd";
 let projectRoot = "";
 let dbPath = "";
+let pendingProjectContextAdvisory: ProjectContextAdvisory | null = null;
 
 configureActivityLogProjectRoot(() => projectRoot);
 
@@ -360,6 +362,7 @@ async function ensureInitialized(forced?: { root: string; source: RootSource }):
 async function switchProjectRootIfNeeded(next: { root: string; source: RootSource }): Promise<void> {
   const same = projectRoot && path.resolve(projectRoot) === path.resolve(next.root) && initialized;
   if (same) return;
+  const previousProjectRoot = initialized && projectRoot ? path.resolve(projectRoot) : "";
 
   try {
     flushPendingChangeBuffer();
@@ -383,6 +386,26 @@ async function switchProjectRootIfNeeded(next: { root: string; source: RootSourc
   initialized = false;
   initializationPromise = null;
   await ensureInitialized(next);
+  if (previousProjectRoot && path.resolve(previousProjectRoot) !== path.resolve(projectRoot)) {
+    pendingProjectContextAdvisory = {
+      code: "cross_project_reference",
+      severity: "info",
+      advisory_only: true,
+      previous_project_root: previousProjectRoot,
+      current_project_root: path.resolve(projectRoot),
+      external_reference: true,
+      read_only_reference: true,
+      not_current_requirement_scope: true,
+      message:
+        "project_root changed inside the same MCP session. Treat this as a separate project context; if the active user requirement belongs to the previous project, use the current project only as read-only external evidence and do not mix its memory into the previous project's requirement unless the user explicitly switches the target project.",
+    };
+  }
+}
+
+function consumeProjectContextAdvisory(): ProjectContextAdvisory | null {
+  const advisory = pendingProjectContextAdvisory;
+  pendingProjectContextAdvisory = null;
+  return advisory;
 }
 
 async function ensureInitializedForArgs(rawArgs: Record<string, unknown>): Promise<void> {
@@ -410,6 +433,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => listToolDefinitions
 
 registerToolHandlers(server, {
   ensureInitializedForArgs,
+  consumeProjectContextAdvisory,
   getDb: () => db,
   getProjectRoot: () => projectRoot,
   getRootSource: () => rootSource,
