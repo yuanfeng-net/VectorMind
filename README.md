@@ -26,20 +26,11 @@ VectorMind 是给 AI 编程助手用的本地项目记忆 MCP。
 
 更完整的能力表见：`docs/capability-matrix.md`
 
-## 推荐工作流
+## 安装后怎么用
 
-开发任务建议让 AI 按这个顺序使用：
+安装并配置好 MCP 后，正常跟 AI 聊天即可。
 
-1. 恢复上下文：`bootstrap_context`
-2. 记录当前需求：`start_requirement`
-   - 如果需求有清晰条目，带上 `requirement_items`
-3. 修改前检查范围：`preflight_change_scope`
-   - 如果是明确条目需求，带上 `planned_changes` 和 `requirement_refs`
-4. 修改文件
-5. 查看未同步改动：`get_pending_changes`
-6. 同步改动原因：`sync_change_intent`
-7. 需求规则变化时：`upsert_decision` / `supersede_memory`
-8. 完成后：`upsert_project_summary` / `complete_requirement`
+VectorMind 会在背后自动恢复上下文、记录需求、检查改动范围、保存改动原因和维护长期记忆。用户不需要记工具名，也不需要手动按步骤调用。
 
 ## 巨量文件规则
 
@@ -106,7 +97,7 @@ args = ["-y", "@coreyuan/vector-mind"]
 
 ## 多项目使用
 
-建议明确告诉 AI 当前项目路径：
+多数情况下直接正常聊天即可。若同一窗口里同时处理多个项目，可以明确告诉 AI 当前项目路径：
 
 ```text
 这个任务的项目路径是 H:\2025\YourProject，请 VectorMind 使用这个 project_root。
@@ -120,9 +111,11 @@ args = ["-y", "@coreyuan/vector-mind"]
 
 如果同一个 MCP 会话里切换了 `project_root`，VectorMind 会给出跨项目提示。这个提示只说明“这是另一个项目的上下文证据”，不会接管 AI 的判断，也不会改客户端权限。
 
-## 常用工具
+## 背后的能力
 
-| 能力 | 工具 |
+这些能力主要给 AI 客户端自动调用，普通用户不用手动操作。
+
+| 能力 | 背后工具 |
 | --- | --- |
 | 恢复上下文 | `bootstrap_context`, `get_brain_dump` |
 | 需求管理 | `start_requirement`, `preflight_change_scope`, `complete_requirement` |
