@@ -49,6 +49,47 @@ type CompactSemanticSearchResult = {
   matches: Array<{ score: number; item: CompactMemoryItemPreview }>;
 };
 
+type CompactCurrentConstraint = {
+  id: number;
+  kind: string;
+  title?: string | null;
+  source: string;
+  preview?: string | null;
+};
+
+type CompactOperationScopeWarning = {
+  code: string;
+  severity: string;
+  message: string;
+  evidence?: Array<{
+    constraint_id: number;
+    kind: string;
+    title?: string | null;
+    source: string;
+    preview?: string | null;
+  }>;
+};
+
+type CompactRelevantFixPattern = {
+  memory_id: number;
+  symptom: string;
+  root_cause: string;
+  invariant: string;
+  avoid_regression?: string[];
+  relevance_score: number;
+  reason?: string;
+};
+
+type CompactQualitySignals = {
+  advisory_only: boolean;
+  does_not_control_model_reasoning?: boolean;
+  does_not_control_host_runtime?: boolean;
+  does_not_replace_model_judgment?: boolean;
+  does_not_change_ok_or_safe_to_edit?: boolean;
+  does_not_expand_requirement_scope?: boolean;
+  relevant_fix_patterns?: CompactRelevantFixPattern[];
+};
+
 type CompactMaintenanceResult = {
   dry_run: boolean;
   trigger: string;
@@ -78,6 +119,24 @@ function compactDevelopmentWarningsText(warnings: CompactDevelopmentWarning[]): 
     const files = w.files?.length ? ` files=${w.files.slice(0, 5).join(",")}` : "";
     lines.push(`- ${w.severity} ${w.code}: ${oneLine(w.message, 180)}${files}`);
   }
+  return lines;
+}
+
+function compactQualitySignalsText(signals?: CompactQualitySignals): string[] {
+  const patterns = signals?.relevant_fix_patterns ?? [];
+  if (!patterns.length) return [];
+  const lines = [
+    `quality signals advisory_only=${signals?.advisory_only === true} relevant_fix_patterns=${patterns.length}`,
+  ];
+  for (const p of patterns.slice(0, 3)) {
+    lines.push(
+      `- fix_pattern #${p.memory_id} score=${Number(p.relevance_score).toFixed(2)} invariant=${oneLine(p.invariant, 150)}`,
+    );
+    if (p.avoid_regression?.length) {
+      lines.push(`  avoid: ${p.avoid_regression.slice(0, 2).map((item) => oneLine(item, 90)).join("; ")}`);
+    }
+  }
+  lines.push("hint: fix_pattern matches are reminders only; do not expand scope or change ok/safe flags from them");
   return lines;
 }
 
@@ -274,6 +333,7 @@ export function compactPreflightChangeScopeText(data: {
   requirement_mapping?: { requirement_items?: unknown[]; planned_changes?: unknown[] };
   scope_contract: CompactRequirementScopeContract | null;
   development_warnings: CompactDevelopmentWarning[];
+  quality_signals?: CompactQualitySignals;
 }): string {
   const req = data.active_requirement ? `#${data.active_requirement.id} ${data.active_requirement.title}` : "none";
   const lines = [
@@ -293,7 +353,45 @@ export function compactPreflightChangeScopeText(data: {
     );
   }
   lines.push(...compactDevelopmentWarningsText(data.development_warnings));
+  lines.push(...compactQualitySignalsText(data.quality_signals));
   if (!data.development_warnings.length) lines.push("- no development warnings");
+  return lines.join("\n");
+}
+
+export function compactPreflightOperationScopeText(data: {
+  ok: boolean;
+  safe_to_proceed: boolean;
+  advisory_only?: boolean;
+  operation: string;
+  intent: string;
+  planned_commands: string[];
+  planned_files: string[];
+  planned_targets: string[];
+  current_constraints: CompactCurrentConstraint[];
+  warnings: CompactOperationScopeWarning[];
+  recommended_action: string;
+}): string {
+  const lines = [
+    `preflight_operation_scope ok=${data.ok} safe_to_proceed=${data.safe_to_proceed} advisory_only=${data.advisory_only === true} operation="${oneLine(data.operation, 80)}" commands=${data.planned_commands.length} files=${data.planned_files.length} targets=${data.planned_targets.length}`,
+    `action: ${oneLine(data.recommended_action, 200)}`,
+  ];
+  if (data.current_constraints.length) {
+    lines.push("current_constraints:");
+    for (const c of data.current_constraints.slice(0, 8)) {
+      lines.push(`- #${c.id} ${c.source}/${c.kind} ${oneLine(c.title ?? "", 60)} —${oneLine(c.preview ?? "", 140)}`);
+    }
+  } else {
+    lines.push("current_constraints: none");
+  }
+  if (data.warnings.length) {
+    lines.push("operation warnings:");
+    for (const w of data.warnings.slice(0, 8)) {
+      const ev = w.evidence?.[0] ? ` evidence=#${w.evidence[0].constraint_id}` : "";
+      lines.push(`- ${w.severity} ${w.code}${ev}: ${oneLine(w.message, 180)}`);
+    }
+  } else {
+    lines.push("- no operation warnings");
+  }
   return lines.join("\n");
 }
 
@@ -325,6 +423,7 @@ export function compactBootstrapText(data: {
   project_summary: CompactMemoryItemPreview | null;
   decisions: Array<CompactMemoryItemPreview>;
   conventions: Array<CompactMemoryItemPreview>;
+  current_constraints?: Array<CompactCurrentConstraint>;
   current_context: Array<CompactMemoryItemPreview>;
   recent_notes: Array<CompactMemoryItemPreview>;
   pending_total: number;
@@ -333,6 +432,7 @@ export function compactBootstrapText(data: {
   pending_truncated: boolean;
   pending_changes: PendingChangeRow[];
   development_warnings?: CompactDevelopmentWarning[];
+  quality_signals?: CompactQualitySignals;
   items: Array<{
     requirement: CompactRequirementPreview;
     recent_changes: Array<CompactChangeLogPreview>;
@@ -347,6 +447,12 @@ export function compactBootstrapText(data: {
   if (data.decisions.length) {
     lines.push("current decisions:");
     for (const d of data.decisions.slice(0, 5)) lines.push(`- ${compactMemoryLabel(d, 160)}`);
+  }
+  if (data.current_constraints?.length) {
+    lines.push("current constraints:");
+    for (const c of data.current_constraints.slice(0, 6)) {
+      lines.push(`- #${c.id} ${c.source}/${c.kind} ${oneLine(c.title ?? "", 54)} —${oneLine(c.preview ?? "", 130)}`);
+    }
   }
   if (data.current_context.length) {
     lines.push("current context:");
@@ -363,6 +469,7 @@ export function compactBootstrapText(data: {
     lines.push("pending 0");
   }
   lines.push(...compactDevelopmentWarningsText(data.development_warnings ?? []));
+  lines.push(...compactQualitySignalsText(data.quality_signals));
   if (data.items.length) {
     lines.push("requirements:");
     for (const item of data.items) {

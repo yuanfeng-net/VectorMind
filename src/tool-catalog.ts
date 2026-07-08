@@ -22,6 +22,7 @@ import {
   MemoryQualityReportArgsSchema,
   PlanLargeFileSplitArgsSchema,
   PreflightChangeScopeArgsSchema,
+  PreflightOperationScopeArgsSchema,
   PruneIndexArgsSchema,
   QueryCodebaseArgsSchema,
   ReadCodexTextFileArgsSchema,
@@ -69,7 +70,8 @@ const DEFAULT_READ_ONLY_BEHAVIOR: ToolBehavior = {
 
 const TOOL_BEHAVIOR: Record<string, ToolBehavior> = {
   start_requirement: { tags: ["write_memory", "requirement_boundary", "advisory_only"], readOnlyHint: false, idempotentHint: false },
-  sync_change_intent: { tags: ["write_memory", "change_intent", "advisory_only"], readOnlyHint: false, idempotentHint: false },
+  sync_change_intent: { tags: ["write_memory", "change_intent", "fix_pattern", "advisory_only"], readOnlyHint: false, idempotentHint: false },
+  preflight_operation_scope: { tags: ["read_only", "operation_scope", "current_constraints", "advisory_only"], readOnlyHint: true, idempotentHint: true },
   record_large_file_split: { tags: ["write_memory", "large_file_tracking", "advisory_only"], readOnlyHint: false, idempotentHint: false },
   complete_requirement: { tags: ["write_memory", "requirement_lifecycle", "advisory_only"], readOnlyHint: false, idempotentHint: false },
   clear_activity_log: { tags: ["diagnostic_state", "non_project_memory"], readOnlyHint: false, idempotentHint: true },
@@ -122,14 +124,20 @@ export async function listToolDefinitions() {
       {
         name: "sync_change_intent",
         description:
-          "MUST call AFTER you edit code and save files. Archives the intent summary, links affected files to the current active requirement, and returns development_warnings for oversized files, broad change scope, or missing file targets.",
+          "MUST call AFTER you edit code and save files. Archives the intent summary, links affected files to the current active requirement, and returns development_warnings for oversized files, broad change scope, or missing file targets. Optionally stores an explicit fix_pattern as advisory regression-memory; VectorMind does not infer fix patterns automatically.",
         inputSchema: toJsonSchemaCompat(SyncChangeIntentArgsSchema),
       },
       {
         name: "preflight_change_scope",
         description:
-          "MUST call BEFORE editing once you know the intended files/modules. Checks planned files against the active requirement, optional generic scope_allow/scope_deny/allowed_paths/denied_paths, and optional requirement_items/planned_changes mapping. If ok=false/safe_to_edit=false, stop before editing and narrow the plan or scope contract. For huge files, use change_mode='mechanical_modularization' only when the task is to split the file.",
+          "MUST call BEFORE editing once you know the intended files/modules. Checks planned files against the active requirement, optional generic scope_allow/scope_deny/allowed_paths/denied_paths, and optional requirement_items/planned_changes mapping. Also returns relevant fix_pattern quality_signals as advisory-only regression reminders that must not change ok/safe_to_edit or expand scope. If ok=false/safe_to_edit=false, stop before editing and narrow the plan or scope contract. For huge files, use change_mode='mechanical_modularization' only when the task is to split the file.",
         inputSchema: toJsonSchemaCompat(PreflightChangeScopeArgsSchema),
+      },
+      {
+        name: "preflight_operation_scope",
+        description:
+          "Call BEFORE running concrete operation commands such as deploy/publish/build/test/migrate/service/git/batch scripts. It compares the planned operation/commands/files/targets against current_constraints from decisions, conventions, active requirements, and recent notes. Reports stale_default_conflict or operation_constraint_conflict as advisory quality signals only; it does not control host execution or model reasoning.",
+        inputSchema: toJsonSchemaCompat(PreflightOperationScopeArgsSchema),
       },
       {
         name: "plan_large_file_split",
@@ -152,7 +160,7 @@ export async function listToolDefinitions() {
       {
         name: "bootstrap_context",
         description:
-          "MUST call at the start of every new chat/session. Returns brain dump + pending changes + development_warnings, and (if you pass query) matches from the local memory store to avoid guessing.",
+          "MUST call at the start of every new chat/session. Returns brain dump + pending changes + development_warnings, advisory quality_signals such as relevant fix_pattern reminders, and (if you pass query) matches from the local memory store to avoid guessing.",
         inputSchema: toJsonSchemaCompat(BootstrapContextArgsSchema),
       },
       {

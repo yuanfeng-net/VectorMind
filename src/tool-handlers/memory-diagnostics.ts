@@ -13,6 +13,7 @@ import {
 import { flushPendingChangeBuffer } from "../file-indexing.js";
 import { isHiddenFromDefaultRecall, parseMetadataJson, toMemoryItemPreview, toRequirementPreview } from "../memory-recall.js";
 import { mergePendingWithGit } from "../pending-changes.js";
+import { fixPatternFromRow } from "../fix-patterns.js";
 import { logActivity } from "../activity-log.js";
 import { oneLine, toolJson } from "../tool-output.js";
 import { toolCompactOrJson } from "../token-savings.js";
@@ -72,6 +73,7 @@ function compactQualityText(data: {
   oversized_checkpoints: unknown[];
   stale_index_samples: unknown[];
   orphaned_memory_items: unknown[];
+  fix_pattern_quality: unknown[];
 }): string {
   const totals = Object.entries(data.totals)
     .sort(([a], [b]) => a.localeCompare(b))
@@ -80,7 +82,7 @@ function compactQualityText(data: {
   const lines = [
     `memory_quality read_only=${data.read_only} totals ${totals || "none"}`,
     `hidden superseded=${data.hidden.superseded} compacted=${data.hidden.compacted}`,
-    `issues duplicate_titles=${data.duplicate_titles.length} duplicate_hashes=${data.duplicate_hashes.length} oversized_checkpoints=${data.oversized_checkpoints.length} stale_indexes=${data.stale_index_samples.length} orphaned=${data.orphaned_memory_items.length}`,
+    `issues duplicate_titles=${data.duplicate_titles.length} duplicate_hashes=${data.duplicate_hashes.length} oversized_checkpoints=${data.oversized_checkpoints.length} stale_indexes=${data.stale_index_samples.length} orphaned=${data.orphaned_memory_items.length} fix_patterns=${data.fix_pattern_quality.length}`,
   ];
   for (const [label, items] of [
     ["duplicate_title", data.duplicate_titles],
@@ -88,6 +90,7 @@ function compactQualityText(data: {
     ["oversized_checkpoint", data.oversized_checkpoints],
     ["stale_index", data.stale_index_samples],
     ["orphaned_memory", data.orphaned_memory_items],
+    ["fix_pattern_quality", data.fix_pattern_quality],
   ] as const) {
     for (const item of items.slice(0, 5)) {
       lines.push(`- ${label}: ${oneLine(JSON.stringify(item), 220)}`);
@@ -152,7 +155,7 @@ function normalizeKey(value: string | null | undefined): string {
 }
 
 function shouldCheckDuplicateTitle(kind: string): boolean {
-  return ["requirement", "note", "decision", "convention", "project_summary", "checkpoint"].includes(kind);
+  return ["requirement", "note", "decision", "convention", "project_summary", "checkpoint", "fix_pattern"].includes(kind);
 }
 
 function getCoreMemoryRows(context: ToolHandlerContext, args: {
@@ -162,7 +165,7 @@ function getCoreMemoryRows(context: ToolHandlerContext, args: {
 }): MemoryItemRow[] {
   const db = context.getDb();
   const clauses = [
-    "kind IN ('requirement', 'change_intent', 'note', 'decision', 'checkpoint', 'memory_compaction', 'project_summary', 'convention')",
+    "kind IN ('requirement', 'change_intent', 'note', 'decision', 'checkpoint', 'memory_compaction', 'project_summary', 'convention', 'fix_pattern')",
   ];
   const params: unknown[] = [];
   if (args.query) {
@@ -205,7 +208,7 @@ function getCurrentSnapshot(context: ToolHandlerContext, recentLimit: number, pe
     .prepare(
       `SELECT id, kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at
        FROM memory_items
-       WHERE kind IN ('requirement', 'change_intent', 'note', 'decision', 'checkpoint', 'memory_compaction', 'project_summary', 'convention')
+       WHERE kind IN ('requirement', 'change_intent', 'note', 'decision', 'checkpoint', 'memory_compaction', 'project_summary', 'convention', 'fix_pattern')
        ORDER BY updated_at DESC, id DESC
        LIMIT ?`,
     )
@@ -354,6 +357,28 @@ export async function handleAnalyzeMemoryConflicts(
     }
   }
 
+  const currentFixPatterns = rows.filter((row) => row.kind === "fix_pattern" && !isHiddenFromDefaultRecall(row));
+  const invariantGroups = new Map<string, MemoryItemRow[]>();
+  for (const row of currentFixPatterns) {
+    const pattern = fixPatternFromRow(row);
+    if (!pattern) continue;
+    const key = normalizeKey(pattern.invariant);
+    if (!key) continue;
+    const list = invariantGroups.get(key) ?? [];
+    list.push(row);
+    invariantGroups.set(key, list);
+  }
+  for (const group of invariantGroups.values()) {
+    if (group.length < 2) continue;
+    conflicts.push({
+      code: "duplicate_fix_pattern_invariant",
+      severity: "low",
+      summary: `${group.length} visible fix_pattern records share the same invariant.`,
+      suggested_action: "Review whether duplicate fix patterns should be superseded or merged; do not change source code based on this report alone.",
+      items: group.slice(0, 6).map(itemConflictPreview),
+    });
+  }
+
   const outputValue = {
     ok: true,
     read_only: true,
@@ -479,6 +504,23 @@ export async function handleMemoryQualityReport(
     )
     .all(args.scan_limit, args.limit) as Array<{ id: number; kind: string; title: string | null; req_id: number }>;
 
+  const fixPatternQuality = rows
+    .filter((row) => row.kind === "fix_pattern" && !isHiddenFromDefaultRecall(row))
+    .map((row) => {
+      const pattern = fixPatternFromRow(row);
+      const issues: string[] = [];
+      if (!pattern) issues.push("invalid_metadata");
+      else {
+        if (pattern.symptom.length < 12) issues.push("short_symptom");
+        if (pattern.root_cause.length < 12) issues.push("short_root_cause");
+        if (pattern.invariant.length < 12) issues.push("short_invariant");
+        if (!pattern.avoid_regression?.length) issues.push("missing_avoid_regression");
+      }
+      return issues.length ? { id: row.id, title: row.title, issues } : null;
+    })
+    .filter((item): item is { id: number; title: string | null; issues: string[] } => item !== null)
+    .slice(0, args.limit);
+
   const outputValue = {
     ok: true,
     read_only: true,
@@ -495,10 +537,12 @@ export async function handleMemoryQualityReport(
     oversized_checkpoints: oversizedCheckpoints,
     stale_index_samples: staleIndexSamples,
     orphaned_memory_items: orphanedMemoryItems,
+    fix_pattern_quality: fixPatternQuality,
     recommendations: [
       "Use supersede_memory/upsert_decision only after verifying a stale memory is truly obsolete.",
       "Use maintain_memory({ dry_run: true }) for old-memory compaction and prune_index({ dry_run: true }) for stale indexes.",
       "Keep checkpoints compact; checkpoint diff is for diagnosis, not restore-by-default.",
+      "Fix pattern records are advisory quality reminders; supersede duplicates or obsolete patterns instead of turning them into hard rules.",
     ],
   };
   logActivity("memory_quality_report", {

@@ -11,6 +11,7 @@ import { handleUpsertProjectSummary, handleAddNote, handleUpsertDecision, handle
 import { handleGetActivityLog, handleGetActivitySummary, handleClearActivityLog, handleDetectRtk, handleInstallRtk, handleGetTokenSavings } from "./tool-handlers/diagnostics.js";
 import { handleCreateCheckpoint, handleListCheckpoints, handleMemoryTimeline, handleRestoreCheckpointContext } from "./tool-handlers/context-recovery.js";
 import { handleAnalyzeMemoryConflicts, handleCompareCheckpointContext, handleMemoryQualityReport } from "./tool-handlers/memory-diagnostics.js";
+import { handlePreflightOperationScope } from "./tool-handlers/operations.js";
 import { oneLine, toolJson } from "./tool-output.js";
 
 export type { ToolHandlerContext } from "./tool-handlers/context.js";
@@ -19,6 +20,7 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
   prune_index: handlePruneIndex,
   maintain_memory: handleMaintainMemory,
   preflight_change_scope: handlePreflightChangeScope,
+  preflight_operation_scope: handlePreflightOperationScope,
   plan_large_file_split: handlePlanLargeFileSplit,
   record_large_file_split: handleRecordLargeFileSplit,
   sync_change_intent: handleSyncChangeIntent,

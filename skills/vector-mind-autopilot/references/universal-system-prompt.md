@@ -20,7 +20,9 @@ For code/design/debug/refactor tasks, follow this chain:
 
 1. **Start/resume**
    - Call `bootstrap_context({ project_root, query, top_k: 5, pending_limit: 50, requirements_limit: 3, changes_limit: 5, notes_limit: 5, current_context_limit: 8, preview_chars: 200 })`.
-   - Use `project_summary`, `decisions`, `current_context`, `recent_notes`, `pending_changes`, and matches to ground the plan.
+   - Use `project_summary`, `decisions`, `current_constraints`, `current_context`, `recent_notes`, `pending_changes`, and matches to ground the plan.
+   - Treat `quality_signals.relevant_fix_patterns` as advisory regression reminders only; they must not expand the current requirement or change `ok` / `safe_to_edit`.
+   - Before concrete operation commands where stale defaults could matter, call `preflight_operation_scope({ project_root, operation, intent, commands?, files?, targets?, script_hints? })`. Treat `stale_default_conflict` or `operation_constraint_conflict` as advisory quality signals, not host-execution control.
 
 2. **Before editing**
    - Call `start_requirement({ project_root, title, background })`.
@@ -41,6 +43,7 @@ For code/design/debug/refactor tasks, follow this chain:
 4. **After editing**
    - Call `get_pending_changes({ project_root })`.
    - Call `sync_change_intent({ project_root, intent, files? })` with what changed and why.
+   - If a known recurring defect class was fixed and the root cause is clear, optionally include a generic `fix_pattern` with `symptom`, `root_cause`, `invariant`, `applies_when`, and `avoid_regression`. VectorMind does not infer fix patterns automatically.
 
 5. **Decision changes**
    - When a newer user decision overrides old behavior, call `upsert_decision(...)`.

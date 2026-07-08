@@ -15,6 +15,15 @@ const OutputFormatSchema = z.object({
 export type OutputFormat = z.infer<typeof OutputFormatSchema>["format"];
 
 const RequirementItemSchema = z.string().min(1);
+const FixPatternSchema = z.object({
+  symptom: z.string().min(1),
+  root_cause: z.string().min(1),
+  invariant: z.string().min(1),
+  applies_when: z.array(z.string().min(1)).optional(),
+  avoid_regression: z.array(z.string().min(1)).optional(),
+  verification: z.array(z.string().min(1)).optional(),
+  verification_gaps: z.array(z.string().min(1)).optional(),
+});
 const PlannedChangeSchema = z.object({
   file: z.string().min(1).optional(),
   change: z.string().min(1),
@@ -44,6 +53,9 @@ export const SyncChangeIntentArgsSchema = ProjectRootArgSchema.merge(
     intent: z.string().min(1),
     files: z.array(z.string().min(1)).optional(),
     affected_files: z.array(z.string().min(1)).optional(),
+    verification: z.array(z.string().min(1)).optional(),
+    verification_gaps: z.array(z.string().min(1)).optional(),
+    fix_pattern: FixPatternSchema.optional(),
   }),
 );
 
@@ -62,6 +74,19 @@ export const PreflightChangeScopeArgsSchema = ProjectRootArgSchema.merge(OutputF
     denied_paths: z.array(z.string().min(1)).optional(),
     requirement_items: z.array(RequirementItemSchema).optional(),
     planned_changes: z.array(PlannedChangeSchema).optional(),
+  }),
+);
+
+export const PreflightOperationScopeArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
+  z.object({
+    operation: z.string().min(1),
+    intent: z.string().optional().default(""),
+    commands: z.array(z.string().min(1)).optional(),
+    files: z.array(z.string().min(1)).optional(),
+    targets: z.array(z.string().min(1)).optional(),
+    script_hints: z.array(z.string().min(1)).optional(),
+    constraints_limit: z.number().int().min(1).max(50).optional().default(12),
+    preview_chars: z.number().int().min(50).max(10_000).optional().default(180),
   }),
 );
 

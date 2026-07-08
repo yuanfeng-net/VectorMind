@@ -45,8 +45,17 @@ bootstrap_context({ project_root, query, top_k: 5, pending_limit: 50, requiremen
 ```
 
 Use returned summaries, decisions, current context, notes, pending changes, and matches to ground the plan.
+If `quality_signals.relevant_fix_patterns` appears, treat it as a historical regression reminder only. Do not let it expand the current requirement, change `ok`/`safe_to_edit`, or override direct repository facts.
 
 Skip this only for pure execution-first tasks with explicit targets, such as a known build/test/package command.
+
+For concrete operation commands where stale defaults could matter (deploy/publish/build/test/migrate/service/git/batch scripts), call:
+
+```text
+preflight_operation_scope({ project_root, operation, intent, commands?, files?, targets?, script_hints? })
+```
+
+Treat `stale_default_conflict` or `operation_constraint_conflict` as advisory quality signals: align the plan with current constraints, directly observed repo facts, or explicit user instructions before running commands.
 
 ### 2. Before editing
 
@@ -91,6 +100,21 @@ sync_change_intent({ project_root, intent, files? })
 ```
 
 The intent should say what changed, why, and any follow-up.
+
+If the edit fixed a known recurring class of defect and the root cause is clear, you may include `fix_pattern` in `sync_change_intent`:
+
+```text
+sync_change_intent({
+  project_root,
+  intent,
+  files?,
+  verification?,
+  verification_gaps?,
+  fix_pattern: { symptom, root_cause, invariant, applies_when?, avoid_regression? }
+})
+```
+
+Keep fix patterns generic and project-agnostic. VectorMind does not infer them automatically, and returned matches are advisory quality signals only.
 
 ### 5. Decisions and durable memory
 

@@ -9,6 +9,7 @@ import { ListRootsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { runFileToolCases } from "./smoke/file-tool-cases.mjs";
 import { runMaintenanceCases } from "./smoke/maintenance-cases.mjs";
 import { runMemoryRecallCases } from "./smoke/memory-recall-cases.mjs";
+import { runQualityGuardCases } from "./smoke/quality-guard-cases.mjs";
 
 function getFlag(name) {
   const prefix = `--${name}=`;
@@ -133,6 +134,7 @@ async function main() {
     "analyze_memory_conflicts",
     "memory_quality_report",
     "compare_checkpoint_context",
+    "preflight_operation_scope",
   ]) {
     if (!toolList.tools.some((t) => t.name === toolName)) {
       console.error(`\n[smoke] expected tool list to include ${toolName}`);
@@ -142,12 +144,15 @@ async function main() {
   }
   try {
     const byName = new Map(toolList.tools.map((t) => [t.name, t]));
+    const syncTool = byName.get("sync_change_intent");
+    const preflightTool = byName.get("preflight_change_scope");
     const timelineTool = byName.get("memory_timeline");
     const checkpointTool = byName.get("create_checkpoint");
     const restoreTool = byName.get("restore_checkpoint_context");
     const conflictsTool = byName.get("analyze_memory_conflicts");
     const qualityTool = byName.get("memory_quality_report");
     const checkpointDiffTool = byName.get("compare_checkpoint_context");
+    const operationScopeTool = byName.get("preflight_operation_scope");
     if (timelineTool?.annotations?.readOnlyHint !== true) {
       throw new Error("expected memory_timeline to be annotated readOnlyHint=true");
     }
@@ -166,11 +171,23 @@ async function main() {
     if (checkpointDiffTool?.annotations?.readOnlyHint !== true) {
       throw new Error("expected compare_checkpoint_context to be annotated readOnlyHint=true");
     }
+    if (operationScopeTool?.annotations?.readOnlyHint !== true) {
+      throw new Error("expected preflight_operation_scope to be annotated readOnlyHint=true");
+    }
+    if (!syncTool?._meta?.["vectormind/behavior"]?.tags?.includes("fix_pattern")) {
+      throw new Error("expected sync_change_intent behavior tags to include fix_pattern");
+    }
+    if (!String(preflightTool?.description ?? "").includes("relevant fix_pattern quality_signals")) {
+      throw new Error("expected preflight_change_scope description to mention advisory fix_pattern signals");
+    }
     if (!timelineTool?._meta?.["vectormind/behavior"]?.advisory_only) {
       throw new Error("expected tool behavior metadata to mark tools advisory_only");
     }
     if (!checkpointDiffTool?._meta?.["vectormind/behavior"]?.does_not_control_model_reasoning) {
       throw new Error("expected diagnostic tools to avoid model-reasoning control");
+    }
+    if (operationScopeTool?._meta?.["vectormind/behavior"]?.does_not_control_host_runtime !== true) {
+      throw new Error("expected operation preflight not to control host runtime");
     }
   } catch (err) {
     console.error("\n[smoke] tool behavior annotations check failed:", err);
@@ -238,6 +255,9 @@ async function main() {
       throw new Error(`expected db file to exist at ${expectedDbPath}`);
     }
     const conventions = Array.isArray(parsed?.conventions) ? parsed.conventions : [];
+    if (!Array.isArray(parsed?.current_constraints)) {
+      throw new Error("expected bootstrap_context to return current_constraints array");
+    }
     const conventionKeys = new Set(
       conventions
         .map((item) => {
@@ -426,6 +446,21 @@ async function main() {
     if (!serverInstructions?.includes("you may skip retrieval and go straight to the minimum necessary shell or host tools")) {
       throw new Error("expected server instructions to mention direct execution for execution-first tasks");
     }
+    if (!serverInstructions?.includes("preflight_operation_scope({ project_root")) {
+      throw new Error("expected server instructions to mention preflight_operation_scope with project_root");
+    }
+    if (!serverInstructions?.includes("current_constraints")) {
+      throw new Error("expected server instructions to mention current_constraints");
+    }
+    if (!serverInstructions?.includes("stale_default_conflict/operation_constraint_conflict")) {
+      throw new Error("expected server instructions to mention generic operation conflict warnings");
+    }
+    if (!serverInstructions?.includes("quality_signals.relevant_fix_patterns")) {
+      throw new Error("expected server instructions to mention advisory fix pattern quality signals");
+    }
+    if (!serverInstructions?.includes("VectorMind does not infer fix patterns automatically")) {
+      throw new Error("expected server instructions to say fix patterns are explicit only");
+    }
     if (!serverInstructions?.includes("prefix shell commands with the command returned by detect_rtk")) {
       throw new Error("expected server instructions to mention detect_rtk returned command prefixes");
     }
@@ -488,6 +523,90 @@ async function main() {
   });
   console.log("\n--- start_requirement ---\n");
   console.log(readText(req));
+
+  const operationDecision = await client.callTool({
+    name: "upsert_decision",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      key: "smoke-operation-current-rule",
+      title: "Smoke operation current rule",
+      content: "Current operation rule: do not use legacy-default pipeline for release smoke operations; use the current-target path instead.",
+      tags: ["smoke", "operation"],
+    },
+  });
+  console.log("\n--- upsert_decision (operation rule) ---\n");
+  console.log(readText(operationDecision));
+
+  const operationPreflight = await client.callTool({
+    name: "preflight_operation_scope",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      operation: "release smoke operation",
+      intent: "run release using the legacy-default pipeline",
+      commands: ["node scripts/release.mjs --target legacy-default"],
+      script_hints: ["script has default legacy-default pipeline fallback"],
+      targets: ["legacy-default"],
+      format: "json",
+    },
+  });
+  console.log("\n--- preflight_operation_scope (stale default conflict) ---\n");
+  const operationPreflightText = readText(operationPreflight);
+  console.log(operationPreflightText);
+  try {
+    const parsed = JSON.parse(operationPreflightText);
+    const warnings = parsed?.warnings ?? [];
+    if (parsed?.safe_to_proceed !== false || parsed?.ok !== false) {
+      throw new Error("expected operation preflight to block stale default conflict");
+    }
+    if (
+      parsed?.advisory_only !== true ||
+      parsed?.read_only !== true ||
+      parsed?.does_not_control_host_runtime !== true ||
+      parsed?.does_not_replace_model_judgment !== true
+    ) {
+      throw new Error("expected operation preflight to expose advisory-only/non-runtime-control metadata");
+    }
+    if (!Array.isArray(parsed?.current_constraints) || parsed.current_constraints.length === 0) {
+      throw new Error("expected operation preflight to return current_constraints");
+    }
+    if (!warnings.some((w) => w?.code === "stale_default_conflict")) {
+      throw new Error("expected stale_default_conflict warning");
+    }
+  } catch (err) {
+    console.error("\n[smoke] operation preflight check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const operationAlignedPreflight = await client.callTool({
+    name: "preflight_operation_scope",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      operation: "release smoke operation",
+      intent: "run release using the current-target path",
+      commands: ["node scripts/release.mjs --target current-target"],
+      script_hints: ["script has explicit target current-target"],
+      targets: ["current-target"],
+      format: "json",
+    },
+  });
+  console.log("\n--- preflight_operation_scope (aligned current target) ---\n");
+  const operationAlignedPreflightText = readText(operationAlignedPreflight);
+  console.log(operationAlignedPreflightText);
+  try {
+    const parsed = JSON.parse(operationAlignedPreflightText);
+    const warnings = parsed?.warnings ?? [];
+    if (parsed?.safe_to_proceed !== true || parsed?.ok !== true) {
+      throw new Error("expected aligned operation preflight to proceed");
+    }
+    if (warnings.some((w) => w?.code === "stale_default_conflict" || w?.code === "operation_constraint_conflict")) {
+      throw new Error("expected aligned operation not to trigger stale/default or negated-constraint conflict");
+    }
+  } catch (err) {
+    console.error("\n[smoke] aligned operation preflight check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
 
   const preflightMissingContract = await client.callTool({
     name: "preflight_change_scope",
@@ -571,275 +690,7 @@ async function main() {
   console.log("\n--- sync_change_intent (auto-link pending) ---\n");
   console.log(readText(sync));
 
-  const pending2 = await client.callTool({
-    name: "get_pending_changes",
-    arguments: useToolProjectRoot ? { project_root: toolProjectRoot } : {},
-  });
-  console.log("\n--- get_pending_changes (after) ---\n");
-  console.log(readText(pending2));
-
-  const bigFilePath = path.join(toolProjectRoot, "src", "god_file.ts");
-  fs.mkdirSync(path.dirname(bigFilePath), { recursive: true });
-  fs.writeFileSync(
-    bigFilePath,
-    Array.from({ length: 1250 }, (_, i) => `export const smokeValue${i} = ${i};`).join("\n") + "\n",
-  );
-  await new Promise((r) => setTimeout(r, 1000));
-
-  const preflightBig = await client.callTool({
-    name: "preflight_change_scope",
-    arguments: {
-      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
-      intent: "smoke: verify large-file pre-edit guard",
-      files: ["src/god_file.ts"],
-      format: "json",
-    },
-  });
-  console.log("\n--- preflight_change_scope (large-file development warnings) ---\n");
-  const preflightBigText = readText(preflightBig);
-  console.log(preflightBigText);
-  try {
-    const parsed = JSON.parse(preflightBigText);
-    const warnings = parsed?.development_warnings;
-    if (parsed?.safe_to_edit !== false || parsed?.ok !== false) {
-      throw new Error("expected preflight_change_scope to block editing a very large file");
-    }
-    if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "very_large_file")) {
-      throw new Error("expected preflight_change_scope to include very_large_file development warning");
-    }
-  } catch (err) {
-    console.error("\n[smoke] preflight large-file development warning check failed:", err);
-    process.exitCode = 1;
-    return;
-  }
-
-  const pendingBig = await client.callTool({
-    name: "get_pending_changes",
-    arguments: {
-      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
-      limit: 50,
-    },
-  });
-  console.log("\n--- get_pending_changes (development warnings) ---\n");
-  const pendingBigText = readText(pendingBig);
-  console.log(pendingBigText);
-  try {
-    const parsed = JSON.parse(pendingBigText);
-    const warnings = parsed?.development_warnings;
-    if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "very_large_file")) {
-      throw new Error("expected very_large_file development warning");
-    }
-  } catch (err) {
-    console.error("\n[smoke] development warning check failed:", err);
-    process.exitCode = 1;
-    return;
-  }
-
-  const syncBig = await client.callTool({
-    name: "sync_change_intent",
-    arguments: {
-      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
-      intent: "smoke: verify large-file development warnings",
-      files: ["src/god_file.ts"],
-    },
-  });
-  console.log("\n--- sync_change_intent (development warnings) ---\n");
-  const syncBigText = readText(syncBig);
-  console.log(syncBigText);
-  try {
-    const parsed = JSON.parse(syncBigText);
-    const warnings = parsed?.development_warnings;
-    if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "very_large_file")) {
-      throw new Error("expected sync_change_intent to include very_large_file development warning");
-    }
-  } catch (err) {
-    console.error("\n[smoke] sync development warning check failed:", err);
-    process.exitCode = 1;
-    return;
-  }
-
-  const readBig = await client.callTool({
-    name: "read_file_lines",
-    arguments: {
-      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
-      path: "src/god_file.ts",
-      from_line: 1,
-      total_count: 5,
-      format: "json",
-    },
-  });
-  console.log("\n--- read_file_lines (large-file development warnings) ---\n");
-  const readBigText = readText(readBig);
-  console.log(readBigText);
-  try {
-    const parsed = JSON.parse(readBigText);
-    const warnings = parsed?.development_warnings;
-    if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "large_file_read")) {
-      throw new Error("expected read_file_lines to include large_file_read development warning");
-    }
-  } catch (err) {
-    console.error("\n[smoke] read large-file development warning check failed:", err);
-    process.exitCode = 1;
-    return;
-  }
-
-  const grepBig = await client.callTool({
-    name: "grep",
-    arguments: {
-      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
-      query: "smokeValue1249",
-      mode: "literal",
-      include_paths: ["src/god_file.ts"],
-      max_results: 5,
-      format: "json",
-    },
-  });
-  console.log("\n--- grep (large-file development warnings) ---\n");
-  const grepBigText = readText(grepBig);
-  console.log(grepBigText);
-  try {
-    const parsed = JSON.parse(grepBigText);
-    const warnings = parsed?.development_warnings;
-    if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "large_file_read")) {
-      throw new Error("expected grep to include large_file_read development warning");
-    }
-  } catch (err) {
-    console.error("\n[smoke] grep large-file development warning check failed:", err);
-    process.exitCode = 1;
-    return;
-  }
-
-  const hugeFilePath = path.join(toolProjectRoot, "src", "huge_controller.ts");
-  fs.writeFileSync(
-    hugeFilePath,
-    Array.from({ length: 3200 }, (_, i) => {
-      if (i % 400 === 0) return `export function loadConfigSmoke${i}() { return ${i}; }`;
-      if (i % 400 === 100) return `export function syncApiSmoke${i}() { return ${i}; }`;
-      if (i % 400 === 200) return `export function renderViewSmoke${i}() { return ${i}; }`;
-      if (i % 400 === 300) return `export function normalizePathSmoke${i}() { return ${i}; }`;
-      return `export const hugeSmokeValue${i} = ${i};`;
-    }).join("\n") + "\n",
-  );
-  await new Promise((r) => setTimeout(r, 1000));
-
-  const preflightHuge = await client.callTool({
-    name: "preflight_change_scope",
-    arguments: {
-      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
-      intent: "smoke: normal feature should be blocked on huge files",
-      files: ["src/huge_controller.ts"],
-      format: "json",
-    },
-  });
-  console.log("\n--- preflight_change_scope (huge-file normal mode) ---\n");
-  const preflightHugeText = readText(preflightHuge);
-  console.log(preflightHugeText);
-  try {
-    const parsed = JSON.parse(preflightHugeText);
-    const warnings = parsed?.development_warnings;
-    if (parsed?.safe_to_edit !== false || parsed?.ok !== false) {
-      throw new Error("expected normal preflight to block editing a huge file");
-    }
-    if (parsed?.required_action !== "mechanical_modularization") {
-      throw new Error("expected required_action=mechanical_modularization for huge files");
-    }
-    if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "huge_file_modularization_required")) {
-      throw new Error("expected huge_file_modularization_required development warning");
-    }
-  } catch (err) {
-    console.error("\n[smoke] huge-file normal preflight check failed:", err);
-    process.exitCode = 1;
-    return;
-  }
-
-  const preflightHugeSplit = await client.callTool({
-    name: "preflight_change_scope",
-    arguments: {
-      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
-      intent: "smoke: mechanically split huge file",
-      files: ["src/huge_controller.ts"],
-      change_mode: "mechanical_modularization",
-      format: "json",
-    },
-  });
-  console.log("\n--- preflight_change_scope (huge-file split mode) ---\n");
-  const preflightHugeSplitText = readText(preflightHugeSplit);
-  console.log(preflightHugeSplitText);
-  try {
-    const parsed = JSON.parse(preflightHugeSplitText);
-    const warnings = parsed?.development_warnings;
-    if (parsed?.safe_to_edit !== true || parsed?.ok !== true) {
-      throw new Error("expected mechanical_modularization preflight to allow the split");
-    }
-    if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "huge_file_modularization_required")) {
-      throw new Error("expected huge warning to remain visible during split mode");
-    }
-  } catch (err) {
-    console.error("\n[smoke] huge-file split-mode preflight check failed:", err);
-    process.exitCode = 1;
-    return;
-  }
-
-  const hugeSplitPlan = await client.callTool({
-    name: "plan_large_file_split",
-    arguments: {
-      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
-      file: "src/huge_controller.ts",
-      intent: "smoke: mechanically split huge controller",
-      format: "json",
-    },
-  });
-  console.log("\n--- plan_large_file_split (json) ---\n");
-  const hugeSplitPlanText = readText(hugeSplitPlan);
-  console.log(hugeSplitPlanText);
-  let splitModules = [];
-  try {
-    const parsed = JSON.parse(hugeSplitPlanText);
-    if (parsed?.ok !== true) throw new Error("expected plan_large_file_split ok=true");
-    if (parsed?.required_action !== "mechanical_modularization") {
-      throw new Error("expected split plan required_action=mechanical_modularization");
-    }
-    if (!Array.isArray(parsed?.forbidden_patterns) || !parsed.forbidden_patterns.includes("*.parts")) {
-      throw new Error("expected split plan to forbid *.parts");
-    }
-    splitModules = Array.isArray(parsed?.modules) ? parsed.modules : [];
-    if (!splitModules.length) throw new Error("expected split plan modules");
-    if (splitModules.some((m) => String(m?.target_path ?? "").includes(".parts"))) {
-      throw new Error("split plan must not create .parts target paths");
-    }
-    if (splitModules.some((m) => /part\d*$/i.test(String(m?.module ?? "")))) {
-      throw new Error("split plan must not use partN module names");
-    }
-  } catch (err) {
-    console.error("\n[smoke] plan_large_file_split check failed:", err);
-    process.exitCode = 1;
-    return;
-  }
-
-  const recordHugeSplit = await client.callTool({
-    name: "record_large_file_split",
-    arguments: {
-      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
-      file: "src/huge_controller.ts",
-      status: "planned",
-      summary: "Smoke planned mechanical split into real modules.",
-      modules: splitModules.slice(0, 4).map((m) => m.target_path),
-      remaining_lines: 3200,
-    },
-  });
-  console.log("\n--- record_large_file_split ---\n");
-  const recordHugeSplitText = readText(recordHugeSplit);
-  console.log(recordHugeSplitText);
-  try {
-    const parsed = JSON.parse(recordHugeSplitText);
-    if (parsed?.ok !== true || Number(parsed?.note?.id ?? 0) <= 0) {
-      throw new Error("expected record_large_file_split to create a note");
-    }
-  } catch (err) {
-    console.error("\n[smoke] record_large_file_split check failed:", err);
-    process.exitCode = 1;
-    return;
-  }
+  if (!(await runQualityGuardCases({ client, useToolProjectRoot, toolProjectRoot, readText }))) return;
 
   const outsideProjectDir = fs.mkdtempSync(path.join(os.tmpdir(), "vectormind-outside-project-"));
   const outsideProjectFile = path.join(outsideProjectDir, "outside.ts");

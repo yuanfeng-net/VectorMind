@@ -9,9 +9,12 @@ import { buildDevelopmentWarnings, buildScopeDriftWarnings } from "../developmen
 import { mergePendingWithGit } from "../pending-changes.js";
 import { toolCompactOrJson, toolText } from "../token-savings.js";
 import { flushPendingChangeBuffer } from "../file-indexing.js";
+import { buildFixPatternQualitySignals, collectRelevantFixPatterns } from "../fix-patterns.js";
 import { BOOTSTRAP_DEFAULT_CONTEXT_KINDS, getConventionPreviews, getCurrentContextPreviews, getDecisionPreviews, isHiddenFromDefaultRecall, semanticSearchHybridInternal, toChangeLogPreview, toMemoryItemPreview, toRequirementPreview } from "../memory-recall.js";
 import { logActivity } from "../activity-log.js";
 import { compactBootstrapText, compactBrainDumpText, compactSemanticSearchText, toolJson } from "../tool-output.js";
+import { expandOperationQuery } from "../operation-scope.js";
+import { collectCurrentConstraintsForBootstrap } from "./operations.js";
 function getVisibleRecentNotePreviews(
   db: Database.Database,
   limit: number,
@@ -99,6 +102,15 @@ export async function handleBootstrapContext(
   const decisions = getDecisionPreviews(decisionsLimit, previewChars, contentMaxChars);
   const conventions = getConventionPreviews(conventionsLimit, previewChars, contentMaxChars);
   const current_context = getCurrentContextPreviews(currentContextLimit, previewChars, contentMaxChars);
+  const current_constraints = collectCurrentConstraintsForBootstrap(context, Math.max(8, Math.min(20, currentContextLimit + decisionsLimit)), previewChars);
+  const activeForScope = getActiveRequirementStmt.get() as RequirementRow | undefined;
+  const relevantFixPatterns = collectRelevantFixPatterns(context, {
+    intent: args.query ?? "",
+    files: [],
+    requirement: activeForScope ?? null,
+    limit: 3,
+  });
+  const quality_signals = buildFixPatternQualitySignals(relevantFixPatterns);
   const pending_offset = args.pending_offset;
   const pending_limit = args.pending_limit;
   const pendingDbRows = listPendingChangesStmt.all() as Array<{
@@ -110,7 +122,6 @@ export async function handleBootstrapContext(
   const pending_total = mergedPending.total;
   const pending_truncated = mergedPending.truncated;
   const pending_changes = mergedPending.page;
-  const activeForScope = getActiveRequirementStmt.get() as RequirementRow | undefined;
   const development_warnings = [
     ...buildDevelopmentWarnings(pending_changes),
     ...(activeForScope
@@ -120,11 +131,12 @@ export async function handleBootstrapContext(
 
   const q = args.query?.trim() ?? "";
   const semanticKinds = args.kinds?.length ? args.kinds : BOOTSTRAP_DEFAULT_CONTEXT_KINDS;
+  const expandedQuery = q ? expandOperationQuery(q) : "";
   const semantic =
     q
       ? await Promise.race([
           semanticSearchHybridInternal({
-            query: q,
+            query: expandedQuery,
             topK: args.top_k,
             kinds: semanticKinds,
             includeContent,
@@ -181,7 +193,9 @@ export async function handleBootstrapContext(
     pending_truncated,
     pending_changes,
     development_warnings,
+    quality_signals,
     items,
+    current_constraints,
     semantic,
   };
 
@@ -246,6 +260,8 @@ export async function handleGetBrainDump(
   const decisions = getDecisionPreviews(decisionsLimit, previewChars, contentMaxChars);
   const conventions = getConventionPreviews(conventionsLimit, previewChars, contentMaxChars);
   const current_context = getCurrentContextPreviews(currentContextLimit, previewChars, contentMaxChars);
+  const current_constraints = collectCurrentConstraintsForBootstrap(context, Math.max(8, Math.min(20, currentContextLimit + decisionsLimit)), previewChars);
+  const quality_signals = buildFixPatternQualitySignals([]);
   const pending_offset = args.pending_offset;
   const pending_limit = args.pending_limit;
   const pendingDbRows = listPendingChangesStmt.all() as Array<{
@@ -306,7 +322,9 @@ export async function handleGetBrainDump(
     pending_truncated,
     pending_changes,
     development_warnings,
+    quality_signals,
     items,
+    current_constraints,
     semantic: null,
   };
 

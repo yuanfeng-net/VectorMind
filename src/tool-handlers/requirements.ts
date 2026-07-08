@@ -9,6 +9,7 @@ import { buildDevelopmentWarnings, buildRequirementMappingWarnings, buildRequire
 import { mergePendingWithGit } from "../pending-changes.js";
 import { toolCompactOrJson } from "../token-savings.js";
 import { flushPendingChangeBuffer, indexFile } from "../file-indexing.js";
+import { buildFixPatternContent, buildFixPatternMetadata, buildFixPatternQualitySignals, collectRelevantFixPatterns, normalizeFixPattern } from "../fix-patterns.js";
 import { completeAllActiveRequirementMemoryItems, completeRequirementMemoryItemsByReqId } from "../memory-mutations.js";
 import { makePreviewText } from "../memory-recall.js";
 import { logActivity } from "../activity-log.js";
@@ -158,6 +159,15 @@ export async function handlePreflightChangeScope(
   );
   const hasBlockingWarnings = blockingWarnings.length > 0;
   const safeToEdit = hasTargetFiles && !hasBlockingWarnings;
+  const normalizedFiles = files.map(normalizeToDbPath);
+  const relevantFixPatterns = collectRelevantFixPatterns(context, {
+    intent: args.intent,
+    files: normalizedFiles,
+    planned_changes: args.planned_changes,
+    requirement: active ?? null,
+    limit: 3,
+  });
+  const quality_signals = buildFixPatternQualitySignals(relevantFixPatterns);
   const recommendedAction = !hasTargetFiles
     ? "Identify the intended target files/modules and rerun preflight_change_scope before editing."
     : hasHugeFile && changeMode === "mechanical_modularization" && safeToEdit
@@ -185,13 +195,14 @@ export async function handlePreflightChangeScope(
     allowed_change_modes: allowedChangeModes,
     active_requirement: active ? { id: active.id, title: active.title } : null,
     intent: args.intent,
-    files: files.map(normalizeToDbPath),
+    files: normalizedFiles,
     requirement_mapping: {
       requirement_items: requirementItems,
       planned_changes: args.planned_changes ?? [],
     },
     scope_contract,
     development_warnings,
+    quality_signals,
   };
 
   return {
@@ -227,6 +238,15 @@ export async function handleSyncChangeIntent(
   } = context.getStatements();
 
   const args = SyncChangeIntentArgsSchema.parse(rawArgs);
+  const explicitFixPattern = args.fix_pattern
+    ? normalizeFixPattern({
+        ...args.fix_pattern,
+        verification: args.fix_pattern.verification?.length ? args.fix_pattern.verification : args.verification,
+        verification_gaps: args.fix_pattern.verification_gaps?.length
+          ? args.fix_pattern.verification_gaps
+          : args.verification_gaps,
+      })
+    : null;
   flushPendingChangeBuffer();
   const explicitFiles = (args.files ?? args.affected_files ?? []).filter(
     (f): f is string => typeof f === "string" && f.length > 0,
@@ -255,6 +275,7 @@ export async function handleSyncChangeIntent(
     change_log_id: number;
     memory_item_id: number;
   }> = [];
+  const fixPatternMemoryItem: { value: { id: number; kind: "fix_pattern"; title: string } | null } = { value: null };
   const synced_files: Array<{
     file_path: string;
     event: string;
@@ -321,6 +342,8 @@ export async function handleSyncChangeIntent(
           event: t.event,
           source: t.source,
           file_state_hash: isUnspecified ? null : getFileStateHash(t.rawFile),
+          verification: args.verification ?? [],
+          verification_gaps: args.verification_gaps ?? [],
         }),
         sha256Hex(args.intent),
       );
@@ -342,6 +365,32 @@ export async function handleSyncChangeIntent(
         indexFile(abs, "manual");
       }
     }
+
+    if (explicitFixPattern) {
+      const sourceFiles = Array.from(new Set(synced_files.map((f) => f.file_path).filter((f) => f !== "(unspecified)")));
+      const content = buildFixPatternContent(explicitFixPattern, args.intent, sourceFiles);
+      const title = `Fix pattern: ${makePreviewText(explicitFixPattern.invariant, 120)}`;
+      const memoryInfo = insertMemoryItemStmt.run(
+        "fix_pattern",
+        title,
+        content,
+        null,
+        null,
+        null,
+        active.id,
+        buildFixPatternMetadata({
+          pattern: explicitFixPattern,
+          intent: args.intent,
+          files: sourceFiles,
+          requirement_id: active.id,
+          source_change_ids: created.map((c) => c.change_log_id),
+          verification: args.verification,
+          verification_gaps: args.verification_gaps,
+        }),
+        sha256Hex(content),
+      );
+      fixPatternMemoryItem.value = { id: Number(memoryInfo.lastInsertRowid), kind: "fix_pattern", title };
+    }
   });
   insertTx();
   const development_warnings = [
@@ -361,6 +410,7 @@ export async function handleSyncChangeIntent(
     intent_preview: makePreviewText(args.intent, 200),
     files: synced_files.slice(0, 25),
     files_total: synced_files.length,
+    fix_pattern_memory_id: fixPatternMemoryItem.value?.id ?? null,
     development_warnings: development_warnings.length,
   });
 
@@ -373,6 +423,9 @@ export async function handleSyncChangeIntent(
           linked_to_requirement: { id: active.id, title: active.title },
           synced_files,
           created,
+          verification: args.verification ?? [],
+          verification_gaps: args.verification_gaps ?? [],
+          created_fix_pattern: fixPatternMemoryItem.value,
           development_warnings,
         }),
       },

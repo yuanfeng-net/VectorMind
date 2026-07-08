@@ -253,6 +253,8 @@ function semanticKindWeight(kind: string): number {
       return 0.4;
     case "change_intent":
       return 0.2;
+    case "fix_pattern":
+      return 1.8;
     case "memory_compaction":
       return 0.7;
     default:
@@ -377,10 +379,12 @@ function filterAndRankSemanticRows(
   scoreOf: (row: MemoryItemSearchRow) => number,
   opts: SemanticSearchOpts,
 ): SemanticSearchMatch[] {
+  const explicitKinds = new Set(opts.kinds ?? []);
   return rows
     .map((r) => ({ row: r, score: adjustSemanticScore(r, scoreOf(r)) }))
     .filter(({ row }) => {
       if (isHiddenFromDefaultRecall(row)) return false;
+      if (row.kind === "fix_pattern" && !explicitKinds.has("fix_pattern")) return false;
       if (shouldIgnoreDbFilePath(row.file_path) && row.kind !== "change_intent") return false;
       return true;
     })
