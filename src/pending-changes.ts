@@ -101,6 +101,7 @@ function collectGitPendingChanges(limit: number): PendingChangeRow[] {
     }
     const filePath = normalizeGitStatusPath(rawPath);
     if (!filePath || filePath === ".vectormind" || filePath.startsWith(".vectormind/")) continue;
+    if (shouldIgnoreDbFilePath(filePath)) continue;
     rows.push({
       file_path: filePath,
       last_event: status.includes("D") ? "unlink" : status === "??" ? "add" : "change",
@@ -125,6 +126,7 @@ export function mergePendingWithGit(
 
   const gitRows = collectGitPendingChanges(Math.max(500, opts.offset + opts.limit * 4));
   for (const g of gitRows) {
+    if (shouldIgnoreDbFilePath(g.file_path)) continue;
     const latestSyncedHash = getLatestSyncedFileHash(g.file_path);
     if (latestSyncedHash && g.file_state_hash && latestSyncedHash === g.file_state_hash) continue;
     const existing = byPath.get(g.file_path);

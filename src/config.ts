@@ -1,5 +1,5 @@
 export const SERVER_NAME = "vector-mind";
-export const SERVER_VERSION = "1.0.52";
+export const SERVER_VERSION = "1.0.53";
 
 export const prettyJsonOutput = ["1", "true", "on", "yes"].includes(
   (process.env.VECTORMIND_PRETTY_JSON ?? "").trim().toLowerCase(),
@@ -159,6 +159,28 @@ export const MAINTENANCE_MAX_INDEX_FILES = (() => {
   const n = Number.parseInt(raw, 10);
   if (!Number.isFinite(n) || n < 1) return 1500;
   return Math.min(50_000, n);
+})();
+
+export const MAINTENANCE_PURGE_HIDDEN_AFTER_DAYS = (() => {
+  const raw = process.env.VECTORMIND_PURGE_HIDDEN_AFTER_DAYS?.trim();
+  if (!raw) return 60;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return 60;
+  return Math.min(3650, n);
+})();
+
+export const MAINTENANCE_TOKEN_SAVINGS_RETENTION_DAYS = (() => {
+  const raw = process.env.VECTORMIND_TOKEN_SAVINGS_RETENTION_DAYS?.trim();
+  if (!raw) return 30;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return 30;
+  return Math.min(3650, n);
+})();
+
+export const MAINTENANCE_CHECKPOINT_WAL = (() => {
+  const raw = (process.env.VECTORMIND_CHECKPOINT_WAL ?? "").trim().toLowerCase();
+  if (!raw) return true;
+  return ["1", "true", "on", "yes"].includes(raw);
 })();
 
 export const ROOTS_LIST_TIMEOUT_MS = (() => {

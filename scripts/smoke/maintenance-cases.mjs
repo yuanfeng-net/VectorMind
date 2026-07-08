@@ -40,6 +40,8 @@ export async function runMaintenanceCases(ctx) {
   const db = new Database(dbPath);
   const oldDate = "2000-01-01 00:00:00";
   const stalePath = "old_stale_index.md";
+  const ignoredTmpPath = ".tmp/noisy-runtime-probe.md";
+  const ignoredTmpPrefixPath = ".tmp-browser-profile/noisy-runtime-probe.ts";
   const keepDecisionContent = `Current smoke decision must remain searchable token=${token}`;
   const oldRequirementInfo = db
     .prepare(
@@ -113,6 +115,31 @@ export async function runMaintenanceCases(ctx) {
       oldDate,
       oldDate,
     );
+  db
+    .prepare(
+      `INSERT INTO memory_items
+         (kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at)
+       VALUES
+         ('doc_chunk', ?, ?, ?, 1, 1, NULL, ?, ?, ?, ?)`,
+    )
+    .run(
+      `${ignoredTmpPath}#L1-L1`,
+      `Ignored .tmp index should be pruned token=${token}`,
+      ignoredTmpPath,
+      JSON.stringify({ ext: ".md" }),
+      "ignored-tmp-hash",
+      oldDate,
+      oldDate,
+    );
+  db
+    .prepare(
+      `INSERT INTO symbols (name, type, file_path, signature)
+       VALUES (?, 'const', ?, ?)`,
+    )
+    .run("ignoredTmpSymbol", ignoredTmpPrefixPath, `ignored tmp symbol token=${token}`);
+  db
+    .prepare(`INSERT OR REPLACE INTO pending_changes (file_path, last_event, updated_at) VALUES (?, 'add', ?)`)
+    .run(ignoredTmpPath, oldDate);
   db.close();
 
   const maintainDry = await client.callTool({
@@ -137,6 +164,12 @@ export async function runMaintenanceCases(ctx) {
     }
     if (Number(parsed?.pruned?.stale_files?.files_matched ?? 0) < 1) {
       throw new Error("expected stale index candidate");
+    }
+    if (Number(parsed?.pruned?.ignored_paths?.chunks_deleted ?? 0) < 1) {
+      throw new Error("expected ignored .tmp index candidate");
+    }
+    if (Number(parsed?.pending_pruned?.ignored_deleted ?? 0) < 1) {
+      throw new Error("expected ignored .tmp pending candidate");
     }
   } catch (err) {
     console.error("\n[smoke] maintain_memory dry-run check failed:", err);
@@ -169,6 +202,21 @@ export async function runMaintenanceCases(ctx) {
     }
     if (Number(parsed?.pruned?.stale_files?.chunks_deleted ?? 0) < 1) {
       throw new Error("expected stale doc_chunk to be deleted");
+    }
+    if (Number(parsed?.pruned?.ignored_paths?.chunks_deleted ?? 0) < 1) {
+      throw new Error("expected ignored .tmp doc_chunk to be deleted");
+    }
+    if (Number(parsed?.pruned?.ignored_paths?.symbols_deleted ?? 0) < 1) {
+      throw new Error("expected ignored .tmp-* symbol to be deleted");
+    }
+    if (Number(parsed?.pending_pruned?.ignored_deleted ?? 0) < 1) {
+      throw new Error("expected ignored .tmp pending change to be deleted");
+    }
+    if (Number(parsed?.purged_hidden_memory?.memory_deleted ?? 0) < 1) {
+      throw new Error("expected compacted hidden memory stubs to be hard-pruned");
+    }
+    if (parsed?.wal_checkpointed !== true) {
+      throw new Error("expected WAL checkpoint to run during apply maintenance");
     }
   } catch (err) {
     console.error("\n[smoke] maintain_memory apply check failed:", err);

@@ -2,8 +2,11 @@ import { z } from "zod";
 
 import {
   MAINTENANCE_COMPACT_AFTER_DAYS,
+  MAINTENANCE_CHECKPOINT_WAL,
   MAINTENANCE_MAX_INDEX_FILES,
   MAINTENANCE_MAX_MEMORY_ITEMS,
+  MAINTENANCE_PURGE_HIDDEN_AFTER_DAYS,
+  MAINTENANCE_TOKEN_SAVINGS_RETENTION_DAYS,
 } from "./config.js";
 const ProjectRootArgSchema = z.object({
   project_root: z.string().optional(),
@@ -252,9 +255,23 @@ export const MaintainMemoryArgsSchema = ProjectRootArgSchema.merge(OutputFormatS
     prune_stale_indexes: z.boolean().optional().default(true),
     prune_ignored_paths: z.boolean().optional().default(true),
     prune_filename_noise: z.boolean().optional().default(true),
+    prune_pending_noise: z.boolean().optional().default(true),
+    purge_hidden_memories: z.boolean().optional().default(true),
+    purge_archives: z.boolean().optional().default(true),
+    prune_token_savings: z.boolean().optional().default(true),
+    optimize_fts: z.boolean().optional().default(true),
+    checkpoint_wal: z.boolean().optional().default(MAINTENANCE_CHECKPOINT_WAL),
     compact_after_days: z.number().int().min(1).max(3650).optional().default(MAINTENANCE_COMPACT_AFTER_DAYS),
+    purge_after_days: z.number().int().min(1).max(3650).optional().default(MAINTENANCE_PURGE_HIDDEN_AFTER_DAYS),
     max_memory_items: z.number().int().min(1).max(5000).optional().default(MAINTENANCE_MAX_MEMORY_ITEMS),
     max_index_files: z.number().int().min(1).max(50_000).optional().default(MAINTENANCE_MAX_INDEX_FILES),
+    token_savings_retention_days: z
+      .number()
+      .int()
+      .min(1)
+      .max(3650)
+      .optional()
+      .default(MAINTENANCE_TOKEN_SAVINGS_RETENTION_DAYS),
     vacuum: z.boolean().optional().default(false),
   }),
 );

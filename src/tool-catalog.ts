@@ -334,7 +334,7 @@ export async function listToolDefinitions() {
       {
         name: "maintain_memory",
         description:
-          "Compact old completed memory and prune stale/noisy indexes to keep long-lived large projects fast. Defaults to dry_run=true; automatic safe maintenance also runs periodically.",
+          "Compact old completed memory, hard-prune safe hidden/superseded details, prune transient pending/index noise, optimize FTS, and checkpoint WAL to keep long-lived large projects fast. Defaults to dry_run=true; automatic safe maintenance also runs periodically.",
         inputSchema: toJsonSchemaCompat(MaintainMemoryArgsSchema),
       },
       {

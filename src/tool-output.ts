@@ -93,6 +93,8 @@ type CompactQualitySignals = {
 type CompactMaintenanceResult = {
   dry_run: boolean;
   trigger: string;
+  db_size_before?: { total_bytes: number; db_bytes: number; wal_bytes: number; shm_bytes: number };
+  db_size_after?: { total_bytes: number; db_bytes: number; wal_bytes: number; shm_bytes: number };
   compacted_memory: {
     candidates: number;
     compacted: number;
@@ -105,6 +107,18 @@ type CompactMaintenanceResult = {
     filename_noise: { chunks_deleted: number; symbols_deleted: number };
     stale_files: { chunks_deleted: number; symbols_deleted: number; samples: string[] };
   };
+  pending_pruned?: { ignored_deleted: number; old_deleted: number; overflow_deleted: number };
+  purged_hidden_memory?: {
+    memory_candidates: number;
+    memory_deleted: number;
+    archive_candidates: number;
+    archives_deleted: number;
+    samples: Array<{ id: number; kind: string; title?: string | null; file_path?: string | null; updated_at: string }>;
+  };
+  metrics_pruned?: { token_savings_deleted: number };
+  fts_optimized?: boolean;
+  wal_checkpointed?: boolean;
+  vacuumed?: boolean;
 };
 
 type CompactTokenSavingsSummary = {
@@ -300,9 +314,20 @@ export function compactMaintenanceText(data: CompactMaintenanceResult): string {
     data.pruned.ignored_paths.symbols_deleted +
     data.pruned.filename_noise.symbols_deleted +
     data.pruned.stale_files.symbols_deleted;
+  const pendingPruned = data.pending_pruned
+    ? data.pending_pruned.ignored_deleted + data.pending_pruned.old_deleted + data.pending_pruned.overflow_deleted
+    : 0;
+  const hiddenDeleted = data.purged_hidden_memory?.memory_deleted ?? 0;
+  const archivesDeleted = data.purged_hidden_memory?.archives_deleted ?? 0;
+  const tokenSavingsDeleted = data.metrics_pruned?.token_savings_deleted ?? 0;
+  const beforeBytes = data.db_size_before?.total_bytes ?? 0;
+  const afterBytes = data.db_size_after?.total_bytes ?? 0;
   const lines = [
-    `maintain_memory ok dry_run=${data.dry_run} trigger=${data.trigger} compacted=${data.compacted_memory.compacted}/${data.compacted_memory.candidates} archived=${data.compacted_memory.archived} pruned_chunks=${prunedChunks} pruned_symbols=${prunedSymbols}`,
+    `maintain_memory ok dry_run=${data.dry_run} trigger=${data.trigger} compacted=${data.compacted_memory.compacted}/${data.compacted_memory.candidates} archived=${data.compacted_memory.archived} pruned_chunks=${prunedChunks} pruned_symbols=${prunedSymbols} pending_pruned=${pendingPruned} hidden_deleted=${hiddenDeleted} archives_deleted=${archivesDeleted} token_savings_deleted=${tokenSavingsDeleted}`,
   ];
+  if (beforeBytes || afterBytes) {
+    lines.push(`db_size total ${beforeBytes} -> ${afterBytes} bytes`);
+  }
   if (data.compacted_memory.summary_memory_id) {
     lines.push(`summary memory_compaction #${data.compacted_memory.summary_memory_id}`);
   }
@@ -315,6 +340,15 @@ export function compactMaintenanceText(data: CompactMaintenanceResult): string {
   if (data.pruned.stale_files.samples.length) {
     lines.push("stale index samples:");
     for (const s of data.pruned.stale_files.samples.slice(0, 8)) lines.push(`- ${s}`);
+  }
+  if (data.purged_hidden_memory?.samples?.length) {
+    lines.push("hidden memory purge candidates:");
+    for (const s of data.purged_hidden_memory.samples.slice(0, 8)) {
+      lines.push(`- #${s.id} ${s.kind} ${s.file_path ?? ""} ${oneLine(s.title ?? "", 80)} ${s.updated_at}`);
+    }
+  }
+  if (data.fts_optimized || data.wal_checkpointed || data.vacuumed) {
+    lines.push(`sqlite maintenance fts_optimized=${data.fts_optimized === true} wal_checkpointed=${data.wal_checkpointed === true} vacuumed=${data.vacuumed === true}`);
   }
   lines.push("hint: dry_run=false applies changes; vacuum=true reclaims sqlite file space after pruning");
   return lines.join("\n");

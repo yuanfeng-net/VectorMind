@@ -12,6 +12,7 @@ import { handleGetActivityLog, handleGetActivitySummary, handleClearActivityLog,
 import { handleCreateCheckpoint, handleListCheckpoints, handleMemoryTimeline, handleRestoreCheckpointContext } from "./tool-handlers/context-recovery.js";
 import { handleAnalyzeMemoryConflicts, handleCompareCheckpointContext, handleMemoryQualityReport } from "./tool-handlers/memory-diagnostics.js";
 import { handlePreflightOperationScope } from "./tool-handlers/operations.js";
+import { runAutoMaintenanceIfDue } from "./memory-maintenance.js";
 import { oneLine, toolJson } from "./tool-output.js";
 
 export type { ToolHandlerContext } from "./tool-handlers/context.js";
@@ -93,6 +94,7 @@ export function registerToolHandlers(server: Server, context: ToolHandlerContext
 
     try {
       await context.ensureInitializedForArgs(rawArgs);
+      if (toolName !== "maintain_memory") runAutoMaintenanceIfDue();
 
       const handler = TOOL_HANDLERS[toolName];
       if (!handler) {
