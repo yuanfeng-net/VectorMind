@@ -6,7 +6,7 @@ import type { RequirementRow } from "../types.js";
 import { DEVELOPMENT_HUGE_FILE_LINES } from "../config.js";
 import { PlanLargeFileSplitArgsSchema, RecordLargeFileSplitArgsSchema } from "../tool-schemas.js";
 import { countFileLinesBounded, isLikelySourceImplementationFile } from "../development-warnings.js";
-import { buildLargeFileSplitPlan } from "../large-file-split.js";
+import { buildLargeFileSplitPlan, hasOrdinalModuleName } from "../large-file-split.js";
 import { toolCompactOrJson } from "../token-savings.js";
 import { flushPendingChangeBuffer } from "../file-indexing.js";
 import { logActivity } from "../activity-log.js";
@@ -112,6 +112,25 @@ export async function handleRecordLargeFileSplit(
   const normalizedFile = normalizeToDbPath(args.file);
   const active = getActiveRequirementStmt.get() as RequirementRow | undefined;
   const modules = (args.modules ?? []).map(normalizeToDbPath);
+  const ordinalModules = modules.filter(hasOrdinalModuleName);
+  if (ordinalModules.length) {
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text: toolJson({
+            ok: false,
+            error: "Ordinal-prefixed module file names are not allowed for mechanical modularization.",
+            file_path: normalizedFile,
+            invalid_modules: ordinalModules,
+            required_naming:
+              "Use stable semantic names such as config.ts, api.ts, service.ts, storage.ts, ui.ts, or maintenance.ts; do not use 1_xxx, 2_xxx, 03-xxx, or other ordering prefixes.",
+          }),
+        },
+      ],
+    };
+  }
   const content = [
     `Huge-file mechanical modularization ${args.status}: ${normalizedFile}`,
     "",

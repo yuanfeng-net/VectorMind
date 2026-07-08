@@ -34,6 +34,12 @@ function oneLine(input: string | null | undefined, max = 120): string {
   return `${normalized.slice(0, Math.max(0, max - 1))}…`;
 }
 
+export function hasOrdinalModuleName(input: string): boolean {
+  const normalized = input.replace(/\\/g, "/").trim();
+  const base = path.basename(normalized, path.extname(normalized));
+  return /^\d+(?:$|[\s._-]+)/.test(base);
+}
+
 function declarationRegexForExtension(ext: string): RegExp {
   switch (ext) {
     case ".rs":
@@ -152,10 +158,10 @@ export function buildLargeFileSplitPlan(args: {
     required_action: "mechanical_modularization",
     intent: args.intent,
     target_dir: targetDir,
-    forbidden_patterns: ["*.generated.*", "*.parts", "*.rs.parts", "*_part*", "*Part*"],
+    forbidden_patterns: ["*.generated.*", "*.parts", "*.rs.parts", "*_part*", "*Part*", "[0-9]_*", "[0-9]-*", "[0-9].*"],
     mechanical_rules: [
       "Move only complete declarations/impl blocks/functions/classes/types; do not split a declaration body.",
-      "Use real module names and clear directory boundaries; do not create generated/parts/partN files.",
+      "Use real semantic module names and clear directory boundaries; do not create generated/parts/partN files or ordinal file names such as 1_config.ts, 2_api.ts, or 03-service.rs.",
       "Preserve behavior, names, API semantics, data formats, side effects, and test expectations.",
       "Only add necessary module declarations, imports, pub(crate), and re-exports to make moved code compile.",
       "Run formatter, build/check, and relevant tests after each small phase.",
@@ -170,7 +176,7 @@ export function buildLargeFileSplitPlan(args: {
       "Resume the original feature only after the target huge file is no longer the default place for new code.",
     ],
     validation: [
-      "No *.generated.*, *.parts, *.rs.parts, or numbered part files were created.",
+      "No *.generated.*, *.parts, *.rs.parts, numbered part files, or ordinal-prefixed files such as 1_xxx/2_xxx were created.",
       "The original file line count decreased or contains only thin orchestration glue.",
       "Formatter passes.",
       "Build/check passes.",

@@ -204,10 +204,10 @@ function buildLargeImplementationFileWarning(args: {
         huge_lines: DEVELOPMENT_HUGE_FILE_LINES,
         required_action: "mechanical_modularization",
         allowed_change_modes: ["mechanical_modularization", "emergency_hotfix"],
-        forbidden_file_patterns: ["*.generated.*", "*.parts", "*.rs.parts", "*_part*"],
+        forbidden_file_patterns: ["*.generated.*", "*.parts", "*.rs.parts", "*_part*", "[0-9]_*", "[0-9]-*", "[0-9].*"],
         mechanical_rules: [
           "move whole declarations only",
-          "use real module names and clear directory boundaries",
+          "use real semantic module names and clear directory boundaries; do not use ordinal prefixes like 1_xxx or 2_xxx",
           "preserve behavior and public semantics",
           "only add necessary mod/use/pub(crate)/re-export glue",
           "run formatter, build, and tests after each phase",

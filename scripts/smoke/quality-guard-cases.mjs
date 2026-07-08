@@ -475,6 +475,9 @@ export async function runQualityGuardCases(ctx) {
     if (!Array.isArray(parsed?.forbidden_patterns) || !parsed.forbidden_patterns.includes("*.parts")) {
       throw new Error("expected split plan to forbid *.parts");
     }
+    if (!Array.isArray(parsed?.forbidden_patterns) || !parsed.forbidden_patterns.includes("[0-9]_*")) {
+      throw new Error("expected split plan to forbid ordinal-prefixed module files");
+    }
     splitModules = Array.isArray(parsed?.modules) ? parsed.modules : [];
     if (!splitModules.length) throw new Error("expected split plan modules");
     if (splitModules.some((m) => String(m?.target_path ?? "").includes(".parts"))) {
@@ -483,8 +486,36 @@ export async function runQualityGuardCases(ctx) {
     if (splitModules.some((m) => /part\d*$/i.test(String(m?.module ?? "")))) {
       throw new Error("split plan must not use partN module names");
     }
+    if (splitModules.some((m) => /(^|\/)\d+[\s._-]+[A-Za-z_$]/.test(String(m?.target_path ?? "").replace(/\\/g, "/")))) {
+      throw new Error("split plan must not use ordinal-prefixed target paths");
+    }
   } catch (err) {
     console.error("\n[smoke] plan_large_file_split check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const recordOrdinalSplit = await client.callTool({
+    name: "record_large_file_split",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      file: "src/huge_controller.ts",
+      status: "planned",
+      summary: "Smoke should reject ordinal-prefixed module paths.",
+      modules: ["src/huge_controller/1_config.ts"],
+      remaining_lines: 3200,
+    },
+  });
+  console.log("\n--- record_large_file_split (ordinal prefix rejected) ---\n");
+  const recordOrdinalSplitText = readText(recordOrdinalSplit);
+  console.log(recordOrdinalSplitText);
+  try {
+    const parsed = JSON.parse(recordOrdinalSplitText);
+    if (parsed?.ok !== false || !String(parsed?.error ?? "").includes("Ordinal-prefixed")) {
+      throw new Error("expected record_large_file_split to reject ordinal-prefixed module paths");
+    }
+  } catch (err) {
+    console.error("\n[smoke] record ordinal-prefixed split rejection check failed:", err);
     process.exitCode = 1;
     return;
   }

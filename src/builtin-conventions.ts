@@ -53,7 +53,7 @@ export const BUILTIN_CONVENTIONS: BuiltinConventionSpec[] = [
   {
     key: "builtin:architecture_single_responsibility",
     content:
-      `${DEVELOPMENT_GUIDELINE_SCOPE} 单个模块和单个文件必须保持单一主职责。不得把路由、业务规则、数据访问、状态管理、渲染、工具函数、配置装配等多类职责混写在同一文件中；若职责已经混杂，应立即拆分，不得继续把新需求堆进该文件。实现文件接近 800 行时应优先拆模块；超过 1200 行时默认禁止继续追加新功能；达到巨量文件阈值时，应先做机械搬迁式模块化拆分，移动完整声明到真实命名的模块/目录，不得创建 generated/parts/partN 假拆分文件。`,
+      `${DEVELOPMENT_GUIDELINE_SCOPE} 单个模块和单个文件必须保持单一主职责。不得把路由、业务规则、数据访问、状态管理、渲染、工具函数、配置装配等多类职责混写在同一文件中；若职责已经混杂，应立即拆分，不得继续把新需求堆进该文件。实现文件接近 800 行时应优先拆模块；超过 1200 行时默认禁止继续追加新功能；达到巨量文件阈值时，应先做机械搬迁式模块化拆分，移动完整声明到真实命名的模块/目录，不得创建 generated/parts/partN 假拆分文件，也不得创建 1_xxx、2_xxx、03-xxx 这类序号排序文件；模块应使用稳定语义名称。`,
     tags: ["builtin", "architecture", "single-responsibility", "modularity", "huge-file"],
   },
   {

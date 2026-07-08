@@ -142,7 +142,7 @@ export async function listToolDefinitions() {
       {
         name: "plan_large_file_split",
         description:
-          "Plan a mechanical modularization split for a huge implementation file. Produces real module names/directories and explicitly forbids generated/parts/partN files. Use this before normal feature work when preflight_change_scope returns huge_file_modularization_required.",
+          "Plan a mechanical modularization split for a huge implementation file. Produces real semantic module names/directories and explicitly forbids generated/parts/partN files plus ordinal prefixes like 1_xxx/2_xxx. Use this before normal feature work when preflight_change_scope returns huge_file_modularization_required.",
         inputSchema: toJsonSchemaCompat(PlanLargeFileSplitArgsSchema),
       },
       {
