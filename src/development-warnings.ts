@@ -9,6 +9,7 @@ import {
   DEVELOPMENT_WARN_FILE_LINES,
   DEVELOPMENT_WARN_PENDING_FILES,
 } from "./config.js";
+import { looksLikeGeneratedFile, shouldIgnoreDbFilePath } from "./path-rules.js";
 
 type DevelopmentWarningsContext = {
   getProjectRoot: () => string;
@@ -46,6 +47,7 @@ type DevelopmentWarning = {
     | "large_file"
     | "very_large_file"
     | "huge_file_modularization_required"
+    | "generated_source_not_editable"
     | "many_pending_files"
     | "broad_change_surface"
     | "unspecified_change_target"
@@ -146,6 +148,66 @@ export function countFileLinesBounded(absPath: string, maxBytes: number): { line
     fs.closeSync(fd);
   }
 }
+
+function countFileLinesToThreshold(
+  absPath: string,
+  stopAtLines: number,
+  maxBytes = 32_000_000,
+): { lines: number; truncated: boolean } | null {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(absPath);
+  } catch {
+    return null;
+  }
+  if (!stat.isFile()) return null;
+  const fd = fs.openSync(absPath, "r");
+  const buffer = Buffer.alloc(64 * 1024);
+  let lines = stat.size > 0 ? 1 : 0;
+  let offset = 0;
+  try {
+    while (offset < stat.size && offset < maxBytes && lines < stopAtLines) {
+      const bytesRead = fs.readSync(fd, buffer, 0, Math.min(buffer.length, stat.size - offset), offset);
+      if (bytesRead <= 0) break;
+      for (let index = 0; index < bytesRead; index += 1) {
+        if (buffer[index] === 10) lines += 1;
+      }
+      offset += bytesRead;
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return { lines, truncated: offset < stat.size };
+}
+
+function generatedSourceWarning(filePath: string, absPath: string): DevelopmentWarning | null {
+  if (shouldIgnoreDbFilePath(filePath)) {
+    return {
+      code: "generated_source_not_editable",
+      severity: "blocker",
+      message: "This path is generated, vendored, dependency, cache, or build output. Regenerate it or change the source-of-truth file instead of editing or modularizing it.",
+      files: [filePath],
+    };
+  }
+  try {
+    const fd = fs.openSync(absPath, "r");
+    try {
+      const buffer = Buffer.alloc(16_384);
+      const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, 0);
+      if (!looksLikeGeneratedFile(buffer.subarray(0, bytesRead).toString("utf8"))) return null;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+  return {
+    code: "generated_source_not_editable",
+    severity: "blocker",
+    message: "This source file declares that it is generated. Change its generator or source-of-truth instead of editing or mechanically splitting the generated output.",
+    files: [filePath],
+  };
+}
 function isPathInsideProjectRoot(absPath: string): boolean {
   const root = path.resolve(getProjectRoot());
   const rel = path.relative(root, path.resolve(absPath));
@@ -192,7 +254,7 @@ function buildLargeImplementationFileWarning(args: {
   if (args.lineCount >= DEVELOPMENT_HUGE_FILE_LINES) {
     return {
       code: "huge_file_modularization_required",
-      severity: "blocker",
+      severity: "warning",
       message:
         "This implementation file is huge. Before any normal feature work, perform mechanical modularization: move whole functions/types/impl blocks into real, clearly named modules/directories, avoid *.generated.* or *.parts files, preserve behavior, then run format/build/tests.",
       files: [args.filePath],
@@ -245,6 +307,8 @@ export function buildFileReadDevelopmentWarnings(filePath: string, absPath: stri
     return warnings;
   }
   if (!isLikelySourceImplementationFile(filePath)) return warnings;
+  const generatedWarning = generatedSourceWarning(filePath, absPath);
+  if (generatedWarning) return [generatedWarning];
 
   let st = stat;
   try {
@@ -254,7 +318,7 @@ export function buildFileReadDevelopmentWarnings(filePath: string, absPath: stri
   }
   if (!st.isFile()) return warnings;
 
-  const lineInfo = countFileLinesBounded(absPath, 2_000_000);
+  const lineInfo = countFileLinesToThreshold(absPath, DEVELOPMENT_HUGE_FILE_LINES);
   const lineCount = lineInfo?.lines ?? 0;
   const tooManyLines = lineCount >= DEVELOPMENT_BLOCK_FILE_LINES;
   const warnLines = lineCount >= DEVELOPMENT_WARN_FILE_LINES;
@@ -397,7 +461,7 @@ export function buildRequirementMappingWarnings(args: {
   if (items.length && args.files.length > 0 && planned.length === 0) {
     warnings.push({
       code: "requirement_mapping_missing",
-      severity: "blocker",
+      severity: "warning",
       message:
         "This requirement has explicit requirement_items, but the planned file changes were not mapped to those items. Add planned_changes with requirement_refs, or mark purely mechanical/test/build/formatting work as supporting_change.",
       files: args.files.map((f) => normalizeToDbPath(f.file_path)).slice(0, 12),
@@ -695,6 +759,11 @@ export function buildDevelopmentWarnings(
   for (const relPath of uniqueFiles) {
     if (!isLikelySourceImplementationFile(relPath)) continue;
     const absPath = path.isAbsolute(relPath) ? relPath : path.join(getProjectRoot(), relPath);
+    const generatedWarning = generatedSourceWarning(relPath, absPath);
+    if (generatedWarning) {
+      warnings.push(generatedWarning);
+      continue;
+    }
     let stat: fs.Stats;
     try {
       stat = fs.statSync(absPath);
@@ -703,7 +772,7 @@ export function buildDevelopmentWarnings(
     }
     if (!stat.isFile()) continue;
 
-    const lineInfo = countFileLinesBounded(absPath, 2_000_000);
+    const lineInfo = countFileLinesToThreshold(absPath, DEVELOPMENT_HUGE_FILE_LINES);
     const lineCount = lineInfo?.lines ?? 0;
     const tooManyLines = lineCount >= DEVELOPMENT_BLOCK_FILE_LINES;
     const warnLines = lineCount >= DEVELOPMENT_WARN_FILE_LINES;
@@ -733,14 +802,12 @@ function isLargeFileWarningCode(code: DevelopmentWarning["code"]): boolean {
 }
 
 export function isDevelopmentWarningBlockingForChangeMode(warning: DevelopmentWarning, changeMode: ChangeMode): boolean {
-  if (changeMode === "mechanical_modularization") {
-    if (isLargeFileWarningCode(warning.code)) return false;
-    if (warning.code === "scope_contract_missing") return false;
+  if (warning.code === "huge_file_modularization_required") {
+    return changeMode !== "mechanical_modularization" && changeMode !== "emergency_hotfix";
   }
-  if (changeMode === "emergency_hotfix") {
-    if (isLargeFileWarningCode(warning.code)) return false;
-    if (warning.code === "scope_contract_missing") return false;
-  }
-  return warning.severity === "blocker" || warning.severity === "warning";
+  if (isLargeFileWarningCode(warning.code)) return false;
+  if (warning.code === "generated_source_not_editable") return true;
+  return warning.severity === "blocker" &&
+    (warning.code === "scope_drift" || warning.code === "cross_project_path");
 }
 

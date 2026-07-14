@@ -154,6 +154,7 @@ export const BOOTSTRAP_DEFAULT_CONTEXT_KINDS = [
   "note",
   "requirement",
   "change_intent",
+  "large_file_split_plan",
 ];
 
 const TOKEN_SEARCH_DEFAULT_KINDS = [
@@ -164,6 +165,7 @@ const TOKEN_SEARCH_DEFAULT_KINDS = [
   "note",
   "requirement",
   "change_intent",
+  "large_file_split_plan",
   "code_chunk",
   "doc_chunk",
 ];
@@ -257,6 +259,8 @@ function semanticKindWeight(kind: string): number {
       return 1.8;
     case "memory_compaction":
       return 0.7;
+    case "large_file_split_plan":
+      return 1.6;
     default:
       return 0;
   }
@@ -385,6 +389,11 @@ function filterAndRankSemanticRows(
     .filter(({ row }) => {
       if (isHiddenFromDefaultRecall(row)) return false;
       if (row.kind === "fix_pattern" && !explicitKinds.has("fix_pattern")) return false;
+      if (
+        row.kind === "large_file_split_plan" &&
+        ["resolved", "deferred", "abandoned"].includes(metadataStatus(row)) &&
+        !explicitKinds.has("large_file_split_plan")
+      ) return false;
       if (shouldIgnoreDbFilePath(row.file_path) && row.kind !== "change_intent") return false;
       return true;
     })
@@ -528,6 +537,10 @@ export function getCurrentContextPreviews(
   const addRow = (row: MemoryItemRow | undefined): void => {
     if (!row) return;
     if (isHiddenFromDefaultRecall(row)) return;
+    if (
+      row.kind === "large_file_split_plan" &&
+      !["planned", "in_progress", "partial", "needs_refinement"].includes(metadataStatus(row) ?? "")
+    ) return;
     if (shouldIgnoreDbFilePath(row.file_path) && row.kind !== "change_intent") return;
     if (!picked.has(row.id)) {
       picked.set(row.id, toMemoryItemPreview(row, false, previewChars, contentMaxChars));
@@ -543,7 +556,7 @@ export function getCurrentContextPreviews(
   const recentContextPageStmt = getDb().prepare(
     `SELECT id, kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at
      FROM memory_items
-     WHERE kind IN ('note', 'requirement', 'change_intent')
+     WHERE kind IN ('note', 'requirement', 'change_intent', 'large_file_split_plan')
      ORDER BY updated_at DESC, id DESC
      LIMIT ? OFFSET ?`,
   );
@@ -605,7 +618,9 @@ export function toChangeLogPreview(
   contentMaxChars: number,
 ): {
   id: number;
-  file_path: string;
+  file_path: string | null;
+  files?: string[];
+  file_count?: number;
   timestamp: string;
   intent_preview: string;
   intent_summary?: string;
@@ -613,9 +628,23 @@ export function toChangeLogPreview(
 } {
   const preview = makePreviewText(change.intent_summary, previewChars);
   const intentSlice = includeContent ? sliceTextForOutput(change.intent_summary, contentMaxChars) : null;
+  const parsedFiles = (() => {
+    if (!change.files_json) return [];
+    try {
+      const parsed = JSON.parse(change.files_json);
+      if (!Array.isArray(parsed)) return [];
+      return parsed
+        .map((item) => (item && typeof item === "object" ? (item as { file_path?: unknown }).file_path : null))
+        .filter((filePath): filePath is string => typeof filePath === "string" && filePath.length > 0);
+    } catch {
+      return [];
+    }
+  })();
   return {
     id: change.id,
     file_path: change.file_path,
+    files: parsedFiles.length ? parsedFiles : undefined,
+    file_count: change.file_count ?? (parsedFiles.length || undefined),
     timestamp: change.timestamp,
     intent_preview: preview,
     intent_summary: intentSlice ? intentSlice.text : undefined,

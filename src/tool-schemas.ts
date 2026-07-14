@@ -7,9 +7,11 @@ import {
   MAINTENANCE_MAX_MEMORY_ITEMS,
   MAINTENANCE_PURGE_HIDDEN_AFTER_DAYS,
   MAINTENANCE_TOKEN_SAVINGS_RETENTION_DAYS,
+  DEVELOPMENT_BLOCK_FILE_LINES,
 } from "./config.js";
 const ProjectRootArgSchema = z.object({
   project_root: z.string().optional(),
+  project_root_mode: z.enum(["canonical", "exact"]).optional().default("canonical"),
 });
 const OutputFormatSchema = z.object({
   format: z.enum(["compact", "json"]).optional().default("compact"),
@@ -37,12 +39,19 @@ const PlannedChangeSchema = z.object({
     .optional()
     .default("requirement"),
 });
+const LargeFileSplitDeferralSchema = z.object({
+  file: z.string().min(1),
+  reason: z.string().min(1).max(1000),
+});
 
 export const StartRequirementArgsSchema = ProjectRootArgSchema.merge(
   z.object({
     title: z.string().min(1),
     background: z.string().optional().default(""),
+    goal_key: z.string().min(1).max(240).optional(),
     close_previous: z.boolean().optional().default(true),
+    previous_req_id: z.number().int().positive().optional(),
+    reuse_active: z.boolean().optional().default(true),
     scope_allow: z.array(z.string().min(1)).optional(),
     scope_deny: z.array(z.string().min(1)).optional(),
     allowed_paths: z.array(z.string().min(1)).optional(),
@@ -53,17 +62,23 @@ export const StartRequirementArgsSchema = ProjectRootArgSchema.merge(
 
 export const SyncChangeIntentArgsSchema = ProjectRootArgSchema.merge(
   z.object({
+    req_id: z.number().int().positive().optional(),
+    goal_key: z.string().min(1).max(240).optional(),
     intent: z.string().min(1),
     files: z.array(z.string().min(1)).optional(),
     affected_files: z.array(z.string().min(1)).optional(),
     verification: z.array(z.string().min(1)).optional(),
     verification_gaps: z.array(z.string().min(1)).optional(),
     fix_pattern: FixPatternSchema.optional(),
+    large_file_split_deferrals: z.array(LargeFileSplitDeferralSchema).max(50).optional(),
+    complete_requirement: z.boolean().optional().default(false),
   }),
 );
 
 export const PreflightChangeScopeArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
   z.object({
+    req_id: z.number().int().positive().optional(),
+    goal_key: z.string().min(1).max(240).optional(),
     intent: z.string().optional().default(""),
     files: z.array(z.string().min(1)).optional(),
     planned_files: z.array(z.string().min(1)).optional(),
@@ -71,6 +86,10 @@ export const PreflightChangeScopeArgsSchema = ProjectRootArgSchema.merge(OutputF
       .enum(["feature", "bugfix", "refactor", "mechanical_modularization", "emergency_hotfix"])
       .optional()
       .default("feature"),
+    split_plan_id: z.number().int().positive().optional(),
+    split_plan_ids: z.array(z.number().int().positive()).max(50).optional(),
+    adds_responsibility: z.boolean().optional(),
+    defer_split_reason: z.string().min(1).max(1000).optional(),
     scope_allow: z.array(z.string().min(1)).optional(),
     scope_deny: z.array(z.string().min(1)).optional(),
     allowed_paths: z.array(z.string().min(1)).optional(),
@@ -95,20 +114,45 @@ export const PreflightOperationScopeArgsSchema = ProjectRootArgSchema.merge(Outp
 
 export const PlanLargeFileSplitArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
   z.object({
+    req_id: z.number().int().positive().optional(),
+    goal_key: z.string().min(1).max(240).optional(),
     file: z.string().min(1),
     intent: z.string().optional().default("mechanical modularization"),
     target_dir: z.string().optional(),
     max_modules: z.number().int().min(2).max(30).optional().default(12),
+    max_declarations_per_module: z.number().int().min(20).max(1000).optional().default(200),
+    max_lines_per_module: z.number().int().min(100).max(100_000).optional().default(DEVELOPMENT_BLOCK_FILE_LINES),
+    module_overrides: z.array(
+      z.object({
+        module: z.string().min(1).max(120),
+        target_path: z.string().min(1),
+        declaration_names: z.array(z.string().min(1).max(240)).max(10_000).optional(),
+        line_ranges: z.array(
+          z.object({
+            start: z.number().int().min(1),
+            end: z.number().int().min(1),
+          }).refine((range) => range.end >= range.start, { message: "line range end must be >= start" }),
+        ).max(10_000).optional(),
+      }).refine(
+        (override) => Boolean(override.declaration_names?.length || override.line_ranges?.length),
+        { message: "module override requires declaration_names or line_ranges" },
+      ),
+    ).max(30).optional(),
   }),
 );
 
 export const RecordLargeFileSplitArgsSchema = ProjectRootArgSchema.merge(
   z.object({
+    req_id: z.number().int().positive().optional(),
+    goal_key: z.string().min(1).max(240).optional(),
+    plan_id: z.number().int().positive(),
     file: z.string().min(1),
     status: z.enum(["planned", "in_progress", "partial", "resolved"]),
     summary: z.string().min(1),
     modules: z.array(z.string().min(1)).optional(),
     remaining_lines: z.number().int().min(0).optional(),
+    verification: z.array(z.string().min(1)).optional(),
+    verification_gaps: z.array(z.string().min(1)).optional(),
   }),
 );
 
@@ -315,6 +359,8 @@ const BrainDumpLimitsSchema = z.object({
 
 export const GetPendingChangesArgsSchema = ProjectRootArgSchema.merge(
   z.object({
+    req_id: z.number().int().positive().optional(),
+    goal_key: z.string().min(1).max(240).optional(),
     offset: z.number().int().min(0).optional().default(0),
     limit: z.number().int().min(1).max(MAX_PENDING_LIMIT).optional().default(DEFAULT_PENDING_LIMIT),
   }),
@@ -323,6 +369,7 @@ export const GetPendingChangesArgsSchema = ProjectRootArgSchema.merge(
 export const CompleteRequirementArgsSchema = ProjectRootArgSchema.merge(
   z.object({
     req_id: z.number().int().positive().optional(),
+    goal_key: z.string().min(1).max(240).optional(),
     all_active: z.boolean().optional().default(false),
   }),
 );
@@ -361,6 +408,10 @@ export const BootstrapContextArgsSchema = ProjectRootArgSchema.merge(
     top_k: z.number().int().min(1).max(50).optional().default(3),
     kinds: z.array(z.string().min(1)).optional(),
     include_content: z.boolean().optional().default(false),
+    context_mode: z.enum(["focused", "full"]).optional().default("focused"),
+    include_pending: z.boolean().optional().default(false),
+    include_recent: z.boolean().optional().default(false),
+    max_output_chars: z.number().int().min(500).max(50_000).optional().default(6_000),
     pending_offset: z.number().int().min(0).optional().default(0),
     pending_limit: z.number().int().min(1).max(MAX_PENDING_LIMIT).optional().default(DEFAULT_PENDING_LIMIT),
   })

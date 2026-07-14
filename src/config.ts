@@ -1,5 +1,5 @@
 export const SERVER_NAME = "vector-mind";
-export const SERVER_VERSION = "1.0.53";
+export const SERVER_VERSION = "1.1.0";
 
 export const prettyJsonOutput = ["1", "true", "on", "yes"].includes(
   (process.env.VECTORMIND_PRETTY_JSON ?? "").trim().toLowerCase(),

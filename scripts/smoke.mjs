@@ -3,6 +3,7 @@ import path from "node:path";
 import os from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import Database from "better-sqlite3";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ListRootsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -10,6 +11,12 @@ import { runFileToolCases } from "./smoke/file-tool-cases.mjs";
 import { runMaintenanceCases } from "./smoke/maintenance-cases.mjs";
 import { runMemoryRecallCases } from "./smoke/memory-recall-cases.mjs";
 import { runQualityGuardCases } from "./smoke/quality-guard-cases.mjs";
+import { runContextGovernanceCases } from "./smoke/context-governance-cases.mjs";
+import { listToolDefinitions } from "../dist/tool-catalog.js";
+import { filterFocusedSemanticResult } from "../dist/context-governance.js";
+import { compactBootstrapText, compactSemanticSearchText } from "../dist/tool-output.js";
+import { openDatabaseRuntime } from "../dist/database-runtime.js";
+import { boundToolResult, enqueueToolCall } from "../dist/tool-handlers.js";
 
 function getFlag(name) {
   const prefix = `--${name}=`;
@@ -61,6 +68,7 @@ fs.mkdirSync(path.join(agentsHome, "skills", "vm-agent-skill"), { recursive: tru
 Object.assign(env, {
   CODEX_HOME: codexHome,
   AGENTS_HOME: agentsHome,
+  VECTORMIND_TOOL_PROFILE: "full",
 });
 
 const transport = new StdioClientTransport({
@@ -89,6 +97,181 @@ async function main() {
       if (!packageFiles.includes(expectedPackageFile)) {
         throw new Error(`expected package.json files to include ${expectedPackageFile}`);
       }
+    }
+    const previousToolProfile = process.env.VECTORMIND_TOOL_PROFILE;
+    delete process.env.VECTORMIND_TOOL_PROFILE;
+    const coreToolDefinitions = await listToolDefinitions();
+    const coreToolNames = coreToolDefinitions.tools.map((tool) => tool.name);
+    const coreToolPayloadChars = JSON.stringify(coreToolDefinitions).length;
+    if (previousToolProfile === undefined) delete process.env.VECTORMIND_TOOL_PROFILE;
+    else process.env.VECTORMIND_TOOL_PROFILE = previousToolProfile;
+    const expectedCoreTools = [
+      "bootstrap_context",
+      "start_requirement",
+      "preflight_change_scope",
+      "plan_large_file_split",
+      "record_large_file_split",
+      "sync_change_intent",
+      "preflight_operation_scope",
+      "read_memory_item",
+      "upsert_decision",
+      "supersede_memory",
+      "complete_requirement",
+    ];
+    if (JSON.stringify(coreToolNames) !== JSON.stringify(expectedCoreTools)) {
+      throw new Error(`unexpected core tool profile: ${JSON.stringify(coreToolNames)}`);
+    }
+    if (coreToolPayloadChars > 50_000) {
+      throw new Error(`expected bounded default core tool metadata, got ${coreToolPayloadChars} chars`);
+    }
+    const preflightBehavior = coreToolDefinitions.tools.find((tool) => tool.name === "preflight_change_scope")
+      ?._meta?.["vectormind/behavior"];
+    if (preflightBehavior?.workflow_gate !== true || preflightBehavior?.advisory_only !== false) {
+      throw new Error("expected preflight_change_scope metadata to distinguish its conditional workflow gate from advisory tools");
+    }
+    const queueOrder = [];
+    await Promise.all([
+      enqueueToolCall(async () => {
+        queueOrder.push("a:start");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        queueOrder.push("a:end");
+      }),
+      enqueueToolCall(async () => {
+        queueOrder.push("b:start");
+        queueOrder.push("b:end");
+      }),
+    ]);
+    if (queueOrder.join(",") !== "a:start,a:end,b:start,b:end") {
+      throw new Error(`expected MCP tool calls to serialize across project-root switches, got ${queueOrder.join(",")}`);
+    }
+
+    const previousMaxToolOutput = process.env.VECTORMIND_MAX_TOOL_OUTPUT_CHARS;
+    process.env.VECTORMIND_MAX_TOOL_OUTPUT_CHARS = "4000";
+    const boundedJsonResult = boundToolResult("smoke_large_json", {
+      content: [{ type: "text", text: JSON.stringify({ ok: true, payload: "x".repeat(5000) }) }],
+    });
+    if (previousMaxToolOutput === undefined) delete process.env.VECTORMIND_MAX_TOOL_OUTPUT_CHARS;
+    else process.env.VECTORMIND_MAX_TOOL_OUTPUT_CHARS = previousMaxToolOutput;
+    const boundedJson = JSON.parse(readText(boundedJsonResult));
+    if (boundedJsonResult.isError !== true || boundedJson?.output_truncated !== true || readText(boundedJsonResult).length >= 4000) {
+      throw new Error("expected oversized structured tool output to become a bounded valid JSON error");
+    }
+
+    const migrationRoot = path.join(runDir, "migration-project");
+    fs.mkdirSync(migrationRoot, { recursive: true });
+    const initialRuntime = openDatabaseRuntime(migrationRoot);
+    const migrationDbPath = initialRuntime.dbPath;
+    initialRuntime.db.close();
+    const legacyDb = new Database(migrationDbPath);
+    legacyDb.prepare("DELETE FROM meta_kv WHERE key = ?").run("migration:aggregate_change_records:v1");
+    legacyDb.exec("DROP INDEX IF EXISTS idx_requirements_active_goal_key_unique");
+    const older = legacyDb.prepare("INSERT INTO requirements (title, context_data, goal_key, status) VALUES (?, ?, ?, 'active')")
+      .run("Legacy duplicate older", "old", "legacy-duplicate-goal");
+    legacyDb.prepare("INSERT INTO requirements (title, context_data, goal_key, status) VALUES (?, ?, ?, 'active')")
+      .run("Legacy duplicate newer", "new", "legacy-duplicate-goal");
+    legacyDb.prepare("INSERT INTO memory_items (kind, title, content, req_id, metadata_json, content_hash) VALUES ('requirement', ?, ?, ?, ?, ?)")
+      .run("Legacy duplicate older", "old", Number(older.lastInsertRowid), JSON.stringify({ status: "active" }), "legacy-duplicate-hash");
+    const legitimateTimestamp = "2026-01-01 00:00:00";
+    for (const [index, filePath] of ["src/retry-a.ts", "src/retry-b.ts"].entries()) {
+      legacyDb.prepare(
+        "INSERT INTO change_logs (req_id, file_path, intent_summary, files_json, file_count, timestamp) VALUES (?, ?, ?, ?, 1, ?)",
+      ).run(
+        Number(older.lastInsertRowid),
+        filePath,
+        "Legitimate repeated sync",
+        JSON.stringify([{ file_path: filePath, event: "manual", source: "args", file_state_hash: `hash-${index}` }]),
+        legitimateTimestamp,
+      );
+      legacyDb.prepare(
+        "INSERT INTO memory_items (kind, title, content, file_path, req_id, metadata_json, content_hash, updated_at) VALUES ('change_intent', ?, ?, ?, ?, ?, ?, ?)",
+      ).run(
+        "Legitimate repeated sync",
+        "Legitimate repeated sync",
+        filePath,
+        Number(older.lastInsertRowid),
+        JSON.stringify({ files: [{ file_path: filePath, file_state_hash: `hash-${index}` }] }),
+        `legitimate-${index}`,
+        `2026-01-01 00:00:0${index}`,
+      );
+    }
+    legacyDb.close();
+    const migratedRuntime = openDatabaseRuntime(migrationRoot);
+    const migrated = migratedRuntime.db.prepare(`
+      SELECT r.status, m.metadata_json
+      FROM requirements r
+      JOIN memory_items m ON m.req_id = r.id AND m.kind = 'requirement'
+      WHERE r.id = ?
+    `).get(Number(older.lastInsertRowid));
+    const legitimateChangeLogs = migratedRuntime.db.prepare(
+      "SELECT COUNT(*) AS count FROM change_logs WHERE req_id = ? AND intent_summary = ?",
+    ).get(Number(older.lastInsertRowid), "Legitimate repeated sync");
+    const legitimateChangeIntents = migratedRuntime.db.prepare(
+      "SELECT COUNT(*) AS count FROM memory_items WHERE kind = 'change_intent' AND req_id = ? AND content = ?",
+    ).get(Number(older.lastInsertRowid), "Legitimate repeated sync");
+    const preservedSyncedState = migratedRuntime.db.prepare(
+      "SELECT updated_at FROM synced_file_states WHERE file_path = ?",
+    ).get("src/retry-a.ts");
+    migratedRuntime.db.close();
+    if (migrated?.status !== "superseded" || JSON.parse(migrated?.metadata_json ?? "{}")?.status !== "superseded") {
+      throw new Error("expected duplicate active-goal migration to supersede both requirement and requirement memory metadata");
+    }
+    if (
+      Number(legitimateChangeLogs?.count ?? 0) !== 2 ||
+      Number(legitimateChangeIntents?.count ?? 0) !== 2 ||
+      preservedSyncedState?.updated_at !== "2026-01-01 00:00:00"
+    ) {
+      throw new Error("expected aggregate-format repeated sync history and original synced-state timestamps to survive migration");
+    }
+    const fallbackSemantic = filterFocusedSemanticResult("billing export", {
+      query: "billing export",
+      top_k: 3,
+      mode: "token",
+      matches: [{ score: 1, item: { id: 1, kind: "note", title: "Typography history", preview: "Unrelated palette note." } }],
+    });
+    if (!fallbackSemantic?.focused_no_match || fallbackSemantic.matches.length !== 0 || !compactSemanticSearchText(fallbackSemantic).includes("no query-relevant memory")) {
+      throw new Error("expected focused semantic filtering to return no unrelated fallback memory");
+    }
+    const compactFallbackBootstrap = compactBootstrapText({
+      generated_at: new Date().toISOString(),
+      project_root: runDir,
+      root_source: "tool_arg",
+      watcher_enabled: false,
+      watcher_ready: false,
+      project_summary: null,
+      decisions: [],
+      conventions: [],
+      current_constraints: [],
+      current_context: [],
+      recent_notes: [],
+      pending_total: 0,
+      pending_offset: 0,
+      pending_limit: 10,
+      pending_truncated: false,
+      pending_changes: [],
+      items: [],
+      semantic: fallbackSemantic,
+    });
+    if (!compactFallbackBootstrap.includes("no query-relevant memory passed focused filtering")) {
+      throw new Error("expected bootstrap compact output to state that focused recall found no relevant memory");
+    }
+    const coreEnv = { ...env };
+    delete coreEnv.VECTORMIND_TOOL_PROFILE;
+    const coreTransport = new StdioClientTransport({
+      command: "node",
+      args: [serverEntry],
+      cwd: runDir,
+      env: coreEnv,
+      stderr: "inherit",
+    });
+    const coreClient = new Client({ name: "vectormind-core-profile-smoke", version: "0.0.0" }, { capabilities: {} });
+    await coreClient.connect(coreTransport);
+    try {
+      const actualCoreTools = (await coreClient.listTools()).tools.map((tool) => tool.name);
+      if (JSON.stringify(actualCoreTools) !== JSON.stringify(expectedCoreTools)) {
+        throw new Error(`unexpected default MCP server tool profile: ${JSON.stringify(actualCoreTools)}`);
+      }
+    } finally {
+      await coreClient.close();
     }
   } catch (err) {
     console.error("\n[smoke] package files check failed:", err);
@@ -299,109 +482,42 @@ async function main() {
   }
 
   try {
-    if (!serverInstructions?.includes("Development guideline scope")) {
-      throw new Error("expected server instructions to state development-guideline scope");
+    if (!serverInstructions || serverInstructions.length > 800) {
+      throw new Error(`expected minimal server instructions <=800 chars, got ${serverInstructions?.length ?? 0}`);
     }
-    if (!serverInstructions?.includes("VectorMind autonomy floor")) {
-      throw new Error("expected server instructions to state autonomy floor");
+    for (const requiredTerm of [
+      "always pass project_root",
+      "bounded evidence",
+      "directly observed repository facts win over stale memory",
+      "compact/focused defaults",
+      "core tool profile minimizes schema load",
+      "VECTORMIND_TOOL_PROFILE=full",
+      "Each tool description defines its own lifecycle",
+    ]) {
+      if (!serverInstructions.toLocaleLowerCase().includes(requiredTerm.toLocaleLowerCase())) {
+        throw new Error(`expected compact server instructions to include: ${requiredTerm}`);
+      }
     }
-    if (!serverInstructions?.includes("newer/direct evidence wins over stale memory")) {
-      throw new Error("expected server instructions to keep model-judgment evidence priority");
+    for (const forbiddenBloatTerm of [
+      "Built-in task-list / Plan-Lite quality policy:",
+      "Built-in architecture and code-organization quality policy:",
+      "Built-in frontend output-purity quality policy:",
+      "页面代码、模板内容",
+      "本次更改的内容描述或总结",
+      "bootstrap_context",
+      "start_requirement",
+      "preflight_change_scope",
+      "sync_change_intent",
+      "12000",
+      "30000",
+      "RTK",
+    ]) {
+      if (serverInstructions.includes(forbiddenBloatTerm)) {
+        throw new Error(`expected generic policy bloat to stay out of MCP instructions: ${forbiddenBloatTerm}`);
+      }
     }
-    if (serverInstructions?.includes("trust the tool output")) {
+    if (serverInstructions.includes("trust the tool output")) {
       throw new Error("expected server instructions to avoid tool-output-over-model wording");
-    }
-    if (!serverInstructions?.includes("Required VectorMind call chain for development work:")) {
-      throw new Error("expected server instructions to include required VectorMind call chain");
-    }
-    for (const chainTerm of [
-      "call bootstrap_context with project_root",
-      "call start_requirement for the current user request",
-      "call preflight_change_scope with the planned files/modules",
-      "call get_pending_changes, then sync_change_intent",
-      "call upsert_decision and supersede_memory",
-      "complete_requirement when the requirement is done",
-    ]) {
-      if (!serverInstructions?.includes(chainTerm)) {
-        throw new Error(`expected server instructions call chain to include: ${chainTerm}`);
-      }
-    }
-    for (const projectRootExample of [
-      "bootstrap_context({ project_root",
-      "get_brain_dump({ project_root",
-      "start_requirement({ project_root",
-      "preflight_change_scope({ project_root",
-      "get_pending_changes({ project_root",
-      "sync_change_intent({ project_root",
-      "upsert_decision({ project_root",
-      "supersede_memory({ project_root",
-      "query_codebase({ project_root",
-      "semantic_search({ project_root",
-      "memory_timeline({ project_root",
-      "create_checkpoint({ project_root",
-      "restore_checkpoint_context({ project_root",
-      "analyze_memory_conflicts({ project_root",
-      "memory_quality_report({ project_root",
-      "compare_checkpoint_context({ project_root",
-      "maintain_memory({ project_root",
-    ]) {
-      if (!serverInstructions?.includes(projectRootExample)) {
-        throw new Error(`expected server instructions to include project_root example: ${projectRootExample}`);
-      }
-    }
-    for (const staleExample of [
-      "bootstrap_context({ query:",
-      "start_requirement(title",
-      "preflight_change_scope(intent",
-      "get_pending_changes()",
-      "sync_change_intent(intent",
-      "query_codebase(query",
-      "semantic_search(query",
-      "maintain_memory({ dry_run",
-    ]) {
-      if (serverInstructions?.includes(staleExample)) {
-        throw new Error(`expected server instructions to avoid project_root-less example: ${staleExample}`);
-      }
-    }
-    for (const staleRuntimeHint of [
-      "Call start_requirement(title, background)",
-    ]) {
-      if (serverInstructions?.includes(staleRuntimeHint)) {
-        throw new Error(`expected server instructions to avoid stale runtime hint: ${staleRuntimeHint}`);
-      }
-    }
-    if (!serverInstructions?.includes("Built-in task-list / Plan-Lite quality policy:")) {
-      throw new Error("expected server instructions to include Plan-Lite quality section");
-    }
-    if (!serverInstructions?.includes("Built-in destructive-operation quality guard:")) {
-      throw new Error("expected server instructions to include destructive-operation quality section");
-    }
-    if (!serverInstructions?.includes("Built-in architecture and code-organization quality policy:")) {
-      throw new Error("expected server instructions to include architecture/code-organization quality section");
-    }
-    if (!serverInstructions?.includes("Built-in requirement boundary and modularity quality policy:")) {
-      throw new Error("expected server instructions to include requirement-boundary/modularity quality section");
-    }
-    if (!serverInstructions?.includes("Do not keep piling new feature code into a large single file")) {
-      throw new Error("expected server instructions to include anti-god-file guidance");
-    }
-    if (!serverInstructions?.includes("huge_file_modularization_required")) {
-      throw new Error("expected server instructions to include huge-file modularization guidance");
-    }
-    if (!serverInstructions?.includes("Do not add extra business behavior")) {
-      throw new Error("expected server instructions to include no-extra-demand guidance");
-    }
-    if (!serverInstructions?.includes("planned_changes with requirement_refs")) {
-      throw new Error("expected server instructions to include requirement item mapping guidance");
-    }
-    if (!serverInstructions?.includes("cross_project_reference")) {
-      throw new Error("expected server instructions to include cross-project reference guidance");
-    }
-    if (!serverInstructions?.includes("Built-in frontend output-purity quality policy:")) {
-      throw new Error("expected server instructions to include frontend output-purity quality section");
-    }
-    if (!serverInstructions?.includes("Built-in git commit summary quality policy:")) {
-      throw new Error("expected server instructions to include git commit summary quality section");
     }
     const forbiddenInstructionTerms = [
       "access " + "per" + "missions",
@@ -421,66 +537,6 @@ async function main() {
     const leakedInstructionTerm = forbiddenInstructionTerms.find((term) => serverInstructions?.includes(term));
     if (leakedInstructionTerm) {
       throw new Error("expected server instructions to avoid runtime-control wording");
-    }
-    if (!serverInstructions?.includes("页面代码、模板内容")) {
-      throw new Error("expected server instructions to keep frontend prompt-leakage quality rule");
-    }
-    if (!serverInstructions?.includes("本次更改的内容描述或总结")) {
-      throw new Error("expected server instructions to keep git commit summary quality rule");
-    }
-    if (serverInstructions?.includes("THREAD_HANDOFF_PACK")) {
-      throw new Error("expected server instructions to stop using the old THREAD_HANDOFF_PACK template");
-    }
-    if (!serverInstructions?.includes("list_project_files({ project_root, path, recursive?, max_depth? })")) {
-      throw new Error("expected server instructions to recommend list_project_files");
-    }
-    if (!serverInstructions?.includes("read_file_text({ project_root, path, offset?, max_chars? })")) {
-      throw new Error("expected server instructions to recommend read_file_text");
-    }
-    if (!serverInstructions?.includes("read_codex_text_file({ path })")) {
-      throw new Error("expected server instructions to recommend read_codex_text_file");
-    }
-    if (!serverInstructions?.includes("uses ripgrep against real project files")) {
-      throw new Error("expected server instructions to mention the ripgrep-backed grep behavior");
-    }
-    if (!serverInstructions?.includes("you may skip retrieval and go straight to the minimum necessary shell or host tools")) {
-      throw new Error("expected server instructions to mention direct execution for execution-first tasks");
-    }
-    if (!serverInstructions?.includes("preflight_operation_scope({ project_root")) {
-      throw new Error("expected server instructions to mention preflight_operation_scope with project_root");
-    }
-    if (!serverInstructions?.includes("current_constraints")) {
-      throw new Error("expected server instructions to mention current_constraints");
-    }
-    if (!serverInstructions?.includes("stale_default_conflict/operation_constraint_conflict")) {
-      throw new Error("expected server instructions to mention generic operation conflict warnings");
-    }
-    if (!serverInstructions?.includes("quality_signals.relevant_fix_patterns")) {
-      throw new Error("expected server instructions to mention advisory fix pattern quality signals");
-    }
-    if (!serverInstructions?.includes("VectorMind does not infer fix patterns automatically")) {
-      throw new Error("expected server instructions to say fix patterns are explicit only");
-    }
-    if (!serverInstructions?.includes("prefix shell commands with the command returned by detect_rtk")) {
-      throw new Error("expected server instructions to mention detect_rtk returned command prefixes");
-    }
-    if (!serverInstructions?.includes("VectorMind's bundled RTK shim")) {
-      throw new Error("expected server instructions to mention the bundled RTK shim fallback");
-    }
-    if (!serverInstructions?.includes("install_rtk")) {
-      throw new Error("expected server instructions to mention install_rtk");
-    }
-    if (!serverInstructions?.includes("dry_run=true")) {
-      throw new Error("expected server instructions to mention dry-run rtk installation");
-    }
-    if (!serverInstructions?.includes("get_token_savings")) {
-      throw new Error("expected server instructions to mention get_token_savings");
-    }
-    if (!serverInstructions?.includes("Optional low-risk diagnostics")) {
-      throw new Error("expected server instructions to mention optional low-risk diagnostics");
-    }
-    if (!serverInstructions?.includes("must not expand the current requirement or replace model judgment")) {
-      throw new Error("expected diagnostic instructions to preserve model autonomy and requirement boundary");
     }
   } catch (err) {
     console.error("\n[smoke] server instructions check failed:", err);
@@ -623,14 +679,70 @@ async function main() {
   try {
     const parsed = JSON.parse(preflightMissingContractText);
     const warnings = parsed?.development_warnings;
-    if (parsed?.safe_to_edit !== false || parsed?.ok !== false) {
-      throw new Error("expected preflight_change_scope without scope contract to block editing");
+    if (parsed?.safe_to_edit !== true || parsed?.ok !== true) {
+      throw new Error("expected missing scope contract to remain advisory when an active requirement exists");
     }
     if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "scope_contract_missing")) {
       throw new Error("expected preflight_change_scope to include scope_contract_missing warning");
     }
   } catch (err) {
     console.error("\n[smoke] missing scope contract preflight check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    const dbPath = path.join(toolProjectRoot, ".vectormind", "vectormind.db");
+    const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+    try {
+      const row = db
+        .prepare("SELECT COUNT(*) AS count FROM mcp_guard_events WHERE tool_name = 'preflight_change_scope' AND event_type = 'scope_contract_guard'")
+        .get();
+      if (Number(row?.count ?? 0) < 1) {
+        throw new Error("expected preflight_change_scope scope_contract_missing warning to persist a guard event");
+      }
+    } finally {
+      db.close();
+    }
+  } catch (err) {
+    console.error("\n[smoke] persisted MCP guard event check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
+  const compactPreflightMissingContract = await client.callTool({
+    name: "preflight_change_scope",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      intent: "smoke: verify compact scope contract guard persists",
+      files: ["vm_smoke_test.md"],
+    },
+  });
+  console.log("\n--- preflight_change_scope (compact missing scope contract) ---\n");
+  const compactPreflightMissingContractText = readText(compactPreflightMissingContract);
+  console.log(compactPreflightMissingContractText);
+  try {
+    if (!/preflight_change_scope ok=true safe_to_edit=true/.test(compactPreflightMissingContractText)) {
+      throw new Error("expected compact missing-contract preflight to remain advisory");
+    }
+    if (!/scope_contract_missing/.test(compactPreflightMissingContractText)) {
+      throw new Error("expected compact preflight_change_scope to include scope_contract_missing warning");
+    }
+    const dbPath = path.join(toolProjectRoot, ".vectormind", "vectormind.db");
+    const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+    try {
+      const row = db
+        .prepare(
+          "SELECT COUNT(*) AS count FROM mcp_guard_events WHERE tool_name = 'preflight_change_scope' AND event_type = 'scope_contract_guard' AND metadata_json LIKE '%\"compact\":true%'",
+        )
+        .get();
+      if (Number(row?.count ?? 0) < 1) {
+        throw new Error("expected compact preflight_change_scope warning to persist a guard event");
+      }
+    } finally {
+      db.close();
+    }
+  } catch (err) {
+    console.error("\n[smoke] compact persisted MCP guard event check failed:", err);
     process.exitCode = 1;
     return;
   }
@@ -690,6 +802,73 @@ async function main() {
   console.log("\n--- sync_change_intent (auto-link pending) ---\n");
   console.log(readText(sync));
 
+  const multiSyncIntent = `smoke: aggregate multi-file sync_change_intent (${token})`;
+  const multiSyncFiles = ["vm_multi_a.ts", "vm_multi_b.ts", "./vm_multi_b.ts", "vm_multi_c.ts"];
+  for (const filePath of ["vm_multi_a.ts", "vm_multi_b.ts", "vm_multi_c.ts"]) {
+    fs.writeFileSync(path.join(toolProjectRoot, filePath), `export const ${filePath.replace(/\W+/g, "_")} = "${token}";\n`);
+  }
+  const multiSync = await client.callTool({
+    name: "sync_change_intent",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      intent: multiSyncIntent,
+      files: multiSyncFiles,
+    },
+  });
+  console.log("\n--- sync_change_intent (multi-file aggregate) ---\n");
+  const multiSyncText = readText(multiSync);
+  console.log(multiSyncText);
+  try {
+    const parsed = JSON.parse(multiSyncText);
+    if (parsed?.ok !== true) throw new Error("expected multi-file sync to succeed");
+    if (Number(parsed?.created_change?.file_count ?? 0) !== 3) {
+      throw new Error(`expected created_change.file_count=3, got ${parsed?.created_change?.file_count}`);
+    }
+    if (!Array.isArray(parsed?.created) || parsed.created.length !== 3) {
+      throw new Error(`expected exactly 3 deduped created file links, got ${parsed?.created?.length}`);
+    }
+
+    const dbPath = path.join(toolProjectRoot, ".vectormind", "vectormind.db");
+    const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+    try {
+      const changeLogRows = db
+        .prepare("SELECT id, file_path, files_json, file_count FROM change_logs WHERE intent_summary = ?")
+        .all(multiSyncIntent);
+      if (changeLogRows.length !== 1) {
+        throw new Error(`expected one change_logs row for multi-file intent, got ${changeLogRows.length}`);
+      }
+      const filesJson = JSON.parse(changeLogRows[0].files_json ?? "[]");
+      if (changeLogRows[0].file_path !== "(multiple)" || Number(changeLogRows[0].file_count ?? 0) !== 3) {
+        throw new Error("expected aggregate change_logs row to be marked (multiple) with file_count=3");
+      }
+      if (!Array.isArray(filesJson) || filesJson.length !== 3) {
+        throw new Error(`expected files_json to contain 3 unique files, got ${filesJson.length}`);
+      }
+      const memoryRows = db
+        .prepare("SELECT id, file_path, metadata_json FROM memory_items WHERE kind = 'change_intent' AND content = ?")
+        .all(multiSyncIntent);
+      if (memoryRows.length !== 1) {
+        throw new Error(`expected one change_intent memory row for multi-file intent, got ${memoryRows.length}`);
+      }
+      const meta = JSON.parse(memoryRows[0].metadata_json ?? "{}");
+      if (memoryRows[0].file_path !== null || Number(meta.file_count ?? 0) !== 3 || !Array.isArray(meta.files) || meta.files.length !== 3) {
+        throw new Error("expected aggregate change_intent metadata to describe 3 files and use null file_path");
+      }
+      const syncedStateRows = db
+        .prepare("SELECT COUNT(*) AS count FROM synced_file_states WHERE file_path IN ('vm_multi_a.ts','vm_multi_b.ts','vm_multi_c.ts')")
+        .get();
+      if (Number(syncedStateRows?.count ?? 0) !== 3) {
+        throw new Error(`expected 3 synced_file_states rows, got ${syncedStateRows?.count}`);
+      }
+    } finally {
+      db.close();
+    }
+  } catch (err) {
+    console.error("\n[smoke] multi-file sync aggregation check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
+
   if (!(await runQualityGuardCases({ client, useToolProjectRoot, toolProjectRoot, readText }))) return;
 
   const outsideProjectDir = fs.mkdtempSync(path.join(os.tmpdir(), "vectormind-outside-project-"));
@@ -723,6 +902,60 @@ async function main() {
 
   const secondProjectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "vectormind-second-project-"));
   fs.writeFileSync(path.join(secondProjectRoot, "package.json"), JSON.stringify({ name: "vm-second-project" }));
+
+  const legacyDuplicateIntent = `smoke: repair legacy duplicate change records (${token})`;
+  const legacyDbPath = path.join(toolProjectRoot, ".vectormind", "vectormind.db");
+  {
+    const db = new Database(legacyDbPath);
+    try {
+      db.prepare("DELETE FROM meta_kv WHERE key = ?").run("migration:aggregate_change_records:v1");
+      const reqInfo = db
+        .prepare(
+          `INSERT INTO requirements (title, status, context_data, created_at, updated_at)
+           VALUES ('Legacy duplicate repair smoke', 'completed', 'legacy duplicate repair smoke', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+        )
+        .run();
+      const reqId = Number(reqInfo.lastInsertRowid);
+      const timestamp = "2001-01-01 00:00:00";
+      const files = ["legacy_dup_a.ts", "legacy_dup_b.ts", "legacy_dup_c.ts"];
+      const changeIds = files.map((filePath) =>
+        Number(
+          db
+            .prepare(
+              `INSERT INTO change_logs (req_id, file_path, intent_summary, files_json, file_count, timestamp)
+               VALUES (?, ?, ?, NULL, 1, ?)`,
+            )
+            .run(reqId, filePath, legacyDuplicateIntent, timestamp).lastInsertRowid,
+        ),
+      );
+      files.forEach((filePath, index) => {
+        db
+          .prepare(
+            `INSERT INTO memory_items
+               (kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at)
+             VALUES
+               ('change_intent', 'Legacy duplicate repair smoke', ?, ?, NULL, NULL, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            legacyDuplicateIntent,
+            filePath,
+            reqId,
+            JSON.stringify({
+              change_log_id: changeIds[index],
+              event: "manual",
+              source: "args",
+              file_state_hash: `legacy-hash-${index}`,
+            }),
+            `legacy-duplicate-hash-${index}`,
+            timestamp,
+            timestamp,
+          );
+      });
+    } finally {
+      db.close();
+    }
+  }
+
   const bootSecondProject = await client.callTool({
     name: "bootstrap_context",
     arguments: {
@@ -756,6 +989,43 @@ async function main() {
   });
   console.log("\n--- bootstrap_context (switch back after cross-project advisory) ---\n");
   console.log(readText(bootBackProject));
+  try {
+    const db = new Database(legacyDbPath, { readonly: true, fileMustExist: true });
+    try {
+      const changeLogRows = db
+        .prepare("SELECT id, file_path, files_json, file_count FROM change_logs WHERE intent_summary = ?")
+        .all(legacyDuplicateIntent);
+      if (changeLogRows.length !== 1) {
+        throw new Error(`expected legacy duplicate change_logs to be repaired to 1 row, got ${changeLogRows.length}`);
+      }
+      const filesJson = JSON.parse(changeLogRows[0].files_json ?? "[]");
+      if (changeLogRows[0].file_path !== "(multiple)" || Number(changeLogRows[0].file_count ?? 0) !== 3 || filesJson.length !== 3) {
+        throw new Error("expected repaired legacy change_logs row to contain 3 files");
+      }
+      const memoryRows = db
+        .prepare("SELECT id, file_path, metadata_json FROM memory_items WHERE kind = 'change_intent' AND content = ?")
+        .all(legacyDuplicateIntent);
+      if (memoryRows.length !== 1) {
+        throw new Error(`expected legacy duplicate change_intent memory to be repaired to 1 row, got ${memoryRows.length}`);
+      }
+      const meta = JSON.parse(memoryRows[0].metadata_json ?? "{}");
+      if (memoryRows[0].file_path !== null || Number(meta.file_count ?? 0) !== 3 || !Array.isArray(meta.files) || meta.files.length !== 3) {
+        throw new Error("expected repaired legacy change_intent metadata to contain 3 files");
+      }
+      const syncedStateRows = db
+        .prepare("SELECT COUNT(*) AS count FROM synced_file_states WHERE file_path IN ('legacy_dup_a.ts','legacy_dup_b.ts','legacy_dup_c.ts')")
+        .get();
+      if (Number(syncedStateRows?.count ?? 0) !== 3) {
+        throw new Error(`expected repaired legacy change_intent to backfill 3 synced file states, got ${syncedStateRows?.count}`);
+      }
+    } finally {
+      db.close();
+    }
+  } catch (err) {
+    console.error("\n[smoke] legacy duplicate change-record repair check failed:", err);
+    process.exitCode = 1;
+    return;
+  }
 
   const scopeReq = await client.callTool({
     name: "start_requirement",
@@ -786,8 +1056,8 @@ async function main() {
   try {
     const parsed = JSON.parse(preflightMappingMissingText);
     const warnings = parsed?.development_warnings;
-    if (parsed?.safe_to_edit !== false || parsed?.ok !== false) {
-      throw new Error("expected missing requirement mapping to block editing");
+    if (parsed?.safe_to_edit !== true || parsed?.ok !== true) {
+      throw new Error("expected missing requirement mapping to remain advisory");
     }
     if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "requirement_mapping_missing")) {
       throw new Error("expected requirement_mapping_missing warning");
@@ -842,8 +1112,8 @@ async function main() {
   try {
     const parsed = JSON.parse(preflightMappingUnmappedFileText);
     const warnings = parsed?.development_warnings ?? [];
-    if (parsed?.safe_to_edit !== false || parsed?.ok !== false) {
-      throw new Error("expected unmapped target file to block editing");
+    if (parsed?.safe_to_edit !== true || parsed?.ok !== true) {
+      throw new Error("expected unmapped target file to remain advisory");
     }
     if (!warnings.some((w) => w?.code === "requirement_mapping_missing" && Array.isArray(w?.details?.unmapped_files) && w.details.unmapped_files.includes("src/billing/extra.ts"))) {
       throw new Error("expected requirement_mapping_missing with unmapped_files");
@@ -994,6 +1264,8 @@ async function main() {
       return;
     }
   }
+
+  if (!(await runContextGovernanceCases({ client, useToolProjectRoot, toolProjectRoot, readText }))) return;
 
   if (!(await runMemoryRecallCases({ client, useToolProjectRoot, toolProjectRoot, testPath, token, readText }))) return;
 

@@ -124,6 +124,19 @@ function isProjectRootMarkerPresent(dir: string): boolean {
   }
   return false;
 }
+function findNearestVectorMindRoot(startDir: string): string | null {
+  let current = fs.existsSync(startDir) && fs.statSync(startDir).isFile()
+    ? path.dirname(startDir)
+    : startDir;
+  current = path.resolve(current);
+  for (;;) {
+    const vmDir = path.join(current, ".vectormind");
+    if (fs.existsSync(path.join(vmDir, "vectormind.db")) || fs.existsSync(vmDir)) return current;
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
 function findNearestProjectRoot(startDir: string): string {
   let current = fs.existsSync(startDir) && fs.statSync(startDir).isFile()
     ? path.dirname(startDir)
@@ -137,7 +150,15 @@ function findNearestProjectRoot(startDir: string): string {
   }
 }
 
-export function resolveRootFromToolArgOrThrow(raw: unknown): { root: string; source: RootSource } | null {
+function isPathWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+export function resolveRootFromToolArgOrThrow(
+  raw: unknown,
+  options: { preferred_root?: string; mode?: "canonical" | "exact" } = {},
+): { root: string; source: RootSource } | null {
   if (typeof raw !== "string") return null;
   const trimmed = raw.trim();
   if (!trimmed) return null;
@@ -145,16 +166,27 @@ export function resolveRootFromToolArgOrThrow(raw: unknown): { root: string; sou
   const fileUriPath = trimmed.startsWith("file://") ? parseFileUriToPath(trimmed) : null;
   const base = fileUriPath ?? trimmed;
   const abs = path.resolve(base);
+  const resolveCandidate = (candidate: string): string => {
+    const exactRoot = findNearestProjectRoot(candidate);
+    if (options.mode === "exact" || !options.preferred_root) return exactRoot;
+    const preferredRoot = path.resolve(options.preferred_root);
+    if (!isPathWithin(preferredRoot, candidate)) return exactRoot;
+    const nestedVectorMindRoot = findNearestVectorMindRoot(candidate);
+    if (nestedVectorMindRoot && path.resolve(nestedVectorMindRoot) !== preferredRoot) {
+      return nestedVectorMindRoot;
+    }
+    return preferredRoot;
+  };
   try {
     if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
-      return { root: findNearestProjectRoot(abs), source: "tool_arg" };
+      return { root: resolveCandidate(abs), source: "tool_arg" };
     }
     if (fs.existsSync(abs) && fs.statSync(abs).isDirectory()) {
-      return { root: findNearestProjectRoot(abs), source: "tool_arg" };
+      return { root: resolveCandidate(abs), source: "tool_arg" };
     }
     const parent = path.dirname(abs);
     if (fs.existsSync(parent) && fs.statSync(parent).isDirectory()) {
-      return { root: findNearestProjectRoot(parent), source: "tool_arg" };
+      return { root: resolveCandidate(parent), source: "tool_arg" };
     }
   } catch (err) {
     throw new Error(`[VectorMind] Invalid project_root: ${abs}. (${String(err)})`);

@@ -37,6 +37,7 @@ export type MaintenancePurgeHiddenResult = {
 export type MaintenanceMetricsPruneResult = {
   cutoff: string;
   token_savings_deleted: number;
+  mcp_tool_metrics_deleted: number;
 };
 
 export type MaintenanceDbSize = {

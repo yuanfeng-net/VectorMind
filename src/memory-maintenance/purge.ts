@@ -3,7 +3,7 @@ import { logActivity } from "../activity-log.js";
 import { getDb } from "./context.js";
 import type { MaintenancePurgeHiddenResult } from "./types.js";
 
-const SAFE_HARD_PURGE_KINDS = ["requirement", "change_intent", "note"];
+const SAFE_HARD_PURGE_KINDS = ["requirement", "change_intent", "note", "large_file_split_plan"];
 
 function validMetadataExpr(alias: string): string {
   return `CASE WHEN json_valid(COALESCE(${alias}.metadata_json, '{}')) THEN COALESCE(${alias}.metadata_json, '{}') ELSE '{}' END`;

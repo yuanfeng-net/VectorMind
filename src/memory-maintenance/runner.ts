@@ -19,7 +19,7 @@ import {
   pruneIgnoredIndexesByPathPatterns,
   pruneStaleFileIndexes,
 } from "./index-prune.js";
-import { pruneTokenSavings } from "./metrics.js";
+import { pruneMetrics } from "./metrics.js";
 import { prunePendingNoise } from "./pending.js";
 import { purgeHiddenMemory } from "./purge.js";
 import { checkpointWal, getDbSize, kvGet, kvSet, optimizeFts } from "./sqlite.js";
@@ -90,10 +90,11 @@ export function runMemoryMaintenance(
       };
 
   const metricsPruned = args.prune_token_savings
-    ? pruneTokenSavings({ dryRun: args.dry_run, retentionDays: args.token_savings_retention_days })
+    ? pruneMetrics({ dryRun: args.dry_run, retentionDays: args.token_savings_retention_days })
     : {
         cutoff: new Date(Date.now() - args.token_savings_retention_days * 86_400_000).toISOString(),
         token_savings_deleted: 0,
+        mcp_tool_metrics_deleted: 0,
       };
 
   const ftsOptimized = args.optimize_fts ? optimizeFts({ dryRun: args.dry_run }) : false;
@@ -174,6 +175,7 @@ export function runAutoMaintenanceIfDue(): void {
     runMemoryMaintenance(
       {
         project_root: getProjectRoot(),
+        project_root_mode: "canonical",
         dry_run: false,
         format: "compact",
         compact_old_memories: true,

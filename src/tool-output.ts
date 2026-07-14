@@ -38,7 +38,9 @@ type CompactRequirementPreview = {
 
 type CompactChangeLogPreview = {
   id: number;
-  file_path: string;
+  file_path: string | null;
+  files?: string[];
+  file_count?: number;
   intent_preview: string;
 };
 
@@ -46,6 +48,8 @@ type CompactSemanticSearchResult = {
   query: string;
   top_k: number;
   mode: string;
+  focused_fallback?: boolean;
+  focused_no_match?: boolean;
   matches: Array<{ score: number; item: CompactMemoryItemPreview }>;
 };
 
@@ -115,7 +119,7 @@ type CompactMaintenanceResult = {
     archives_deleted: number;
     samples: Array<{ id: number; kind: string; title?: string | null; file_path?: string | null; updated_at: string }>;
   };
-  metrics_pruned?: { token_savings_deleted: number };
+  metrics_pruned?: { token_savings_deleted: number; mcp_tool_metrics_deleted?: number };
   fts_optimized?: boolean;
   wal_checkpointed?: boolean;
   vacuumed?: boolean;
@@ -189,7 +193,11 @@ function compactRequirementLabel(req: CompactRequirementPreview): string {
   return `req#${req.id}${mem} [${req.status}] ${oneLine(req.title, 80)}${ctx}`;
 }
 function compactChangeLabel(change: CompactChangeLogPreview): string {
-  return `change#${change.id} ${change.file_path}: ${oneLine(change.intent_preview, 120)}`;
+  const files = change.files?.length
+    ? `${change.files.slice(0, 3).join(",")}${change.files.length > 3 ? "..." : ""}`
+    : (change.file_path ?? "unspecified");
+  const count = change.file_count && change.file_count > 1 ? ` files=${change.file_count}` : "";
+  return `change#${change.id}${count} ${files}: ${oneLine(change.intent_preview, 120)}`;
 }
 function compactPendingLabel(p: { file_path: string; last_event: string; updated_at: string }): string {
   const source = "source" in p && p.source === "git" ? " git" : "";
@@ -201,6 +209,7 @@ export function compactSemanticSearchText(data: { ok?: boolean } & CompactSemant
   const lines: string[] = [
     `semantic ${data.mode} ${data.matches.length}/${data.top_k} q="${oneLine(data.query, 100)}"`,
   ];
+  if (data.focused_no_match) lines.push("confidence: no query-relevant memory passed focused relevance filtering");
   for (const m of data.matches.slice(0, data.top_k)) {
     lines.push(`- score=${m.score.toFixed(3)} ${compactMemoryLabel(m.item, 160)}`);
   }
@@ -320,10 +329,11 @@ export function compactMaintenanceText(data: CompactMaintenanceResult): string {
   const hiddenDeleted = data.purged_hidden_memory?.memory_deleted ?? 0;
   const archivesDeleted = data.purged_hidden_memory?.archives_deleted ?? 0;
   const tokenSavingsDeleted = data.metrics_pruned?.token_savings_deleted ?? 0;
+  const toolMetricsDeleted = data.metrics_pruned?.mcp_tool_metrics_deleted ?? 0;
   const beforeBytes = data.db_size_before?.total_bytes ?? 0;
   const afterBytes = data.db_size_after?.total_bytes ?? 0;
   const lines = [
-    `maintain_memory ok dry_run=${data.dry_run} trigger=${data.trigger} compacted=${data.compacted_memory.compacted}/${data.compacted_memory.candidates} archived=${data.compacted_memory.archived} pruned_chunks=${prunedChunks} pruned_symbols=${prunedSymbols} pending_pruned=${pendingPruned} hidden_deleted=${hiddenDeleted} archives_deleted=${archivesDeleted} token_savings_deleted=${tokenSavingsDeleted}`,
+    `maintain_memory ok dry_run=${data.dry_run} trigger=${data.trigger} compacted=${data.compacted_memory.compacted}/${data.compacted_memory.candidates} archived=${data.compacted_memory.archived} pruned_chunks=${prunedChunks} pruned_symbols=${prunedSymbols} pending_pruned=${pendingPruned} hidden_deleted=${hiddenDeleted} archives_deleted=${archivesDeleted} token_savings_deleted=${tokenSavingsDeleted} mcp_tool_metrics_deleted=${toolMetricsDeleted}`,
   ];
   if (beforeBytes || afterBytes) {
     lines.push(`db_size total ${beforeBytes} -> ${afterBytes} bytes`);
@@ -429,17 +439,28 @@ export function compactPreflightOperationScopeText(data: {
   return lines.join("\n");
 }
 
-export function compactLargeFileSplitPlanText(data: LargeFileSplitPlan): string {
+export function compactLargeFileSplitPlanText(
+  data: LargeFileSplitPlan & {
+    plan_id?: number;
+    plan_status?: string;
+    requirement?: { id: number; title: string };
+  },
+): string {
   const lines = [
-    `large_file_split ok=${data.ok} file=${data.file_path} lines=${data.line_count} threshold=${data.huge_threshold_lines} action=${data.required_action}`,
+    `large_file_split ok=${data.ok} plan_id=${data.plan_id ?? ""} status=${data.plan_status ?? ""} file=${data.file_path} lines=${data.line_count} threshold=${data.huge_threshold_lines} action=${data.required_action}`,
+    ...(data.requirement ? [`requirement=req#${data.requirement.id} ${oneLine(data.requirement.title, 90)}`] : []),
+    `analysis=${data.analysis_mode} confidence=${data.confidence} coverage=${data.coverage.assigned_declarations}/${data.coverage.detected_declarations} complete=${data.coverage.complete}`,
+    `module_constraints max_declarations=${data.module_constraints.max_declarations_per_module} max_lines=${data.module_constraints.max_estimated_lines_per_module} oversized=${data.module_constraints.oversized_modules.length} satisfied=${data.module_constraints.satisfied}`,
     `target_dir=${data.target_dir}`,
     `forbidden=${data.forbidden_patterns.join(",")}`,
   ];
   lines.push("modules:");
   for (const m of data.modules.slice(0, 20)) {
     const decls = m.declarations.length ? ` decls=${m.declarations.slice(0, 8).join("; ")}` : " decls=(manual sections)";
-    lines.push(`- ${m.module} -> ${m.target_path}${decls}`);
+    const omitted = m.omitted_declarations ? ` samples_omitted=${m.omitted_declarations}` : "";
+    lines.push(`- ${m.module} -> ${m.target_path} count=${m.declaration_count} estimated_lines=${m.estimated_lines}${omitted}${decls}`);
   }
+  for (const warning of data.warnings.slice(0, 6)) lines.push(`warning: ${warning}`);
   lines.push("steps:");
   for (const step of data.steps.slice(0, 8)) lines.push(`- ${step}`);
   lines.push("validation:");
@@ -454,6 +475,13 @@ export function compactBootstrapText(data: {
   root_source: RootSource;
   watcher_enabled: boolean;
   watcher_ready: boolean;
+  context_policy?: {
+    mode: "focused" | "full";
+    include_pending: boolean;
+    include_recent: boolean;
+    max_output_chars: number;
+    compact_truncated?: boolean;
+  };
   project_summary: CompactMemoryItemPreview | null;
   decisions: Array<CompactMemoryItemPreview>;
   conventions: Array<CompactMemoryItemPreview>;
@@ -461,6 +489,7 @@ export function compactBootstrapText(data: {
   current_context: Array<CompactMemoryItemPreview>;
   recent_notes: Array<CompactMemoryItemPreview>;
   pending_total: number;
+  pending_included?: boolean;
   pending_offset: number;
   pending_limit: number;
   pending_truncated: boolean;
@@ -475,9 +504,18 @@ export function compactBootstrapText(data: {
 }): string {
   const lines: string[] = [];
   lines.push(
-    `ok ctx ${data.root_source} watcher=${data.watcher_enabled ? (data.watcher_ready ? "ready" : "starting") : "off"} root=${data.project_root}`,
+    `ok ctx ${data.root_source} mode=${data.context_policy?.mode ?? "full"} watcher=${data.watcher_enabled ? (data.watcher_ready ? "ready" : "starting") : "off"} root=${data.project_root}`,
   );
   if (data.project_summary) lines.push(`summary ${compactMemoryLabel(data.project_summary, 140)}`);
+  if (data.semantic) {
+    lines.push(`semantic ${data.semantic.mode} ${data.semantic.matches.length}/${data.semantic.top_k} for "${oneLine(data.semantic.query, 80)}":`);
+    if (data.semantic.focused_no_match) {
+      lines.push("- no query-relevant memory passed focused filtering; continue from current repository facts");
+    }
+    for (const m of data.semantic.matches.slice(0, 5)) {
+      lines.push(`- score=${m.score.toFixed(3)} ${compactMemoryLabel(m.item, 120)}`);
+    }
+  }
   if (data.decisions.length) {
     lines.push("current decisions:");
     for (const d of data.decisions.slice(0, 5)) lines.push(`- ${compactMemoryLabel(d, 160)}`);
@@ -492,7 +530,9 @@ export function compactBootstrapText(data: {
     lines.push("current context:");
     for (const c of data.current_context.slice(0, 8)) lines.push(`- ${compactMemoryLabel(c, 160)}`);
   }
-  if (data.pending_total) {
+  if (data.pending_included === false) {
+    if (data.pending_total) lines.push(`pending omitted total=${data.pending_total}; call get_pending_changes only before sync or when diagnosing scope`);
+  } else if (data.pending_total) {
     lines.push(
       `pending ${data.pending_changes.length}/${data.pending_total}${data.pending_truncated ? " truncated" : ""}: ${data.pending_changes
         .slice(0, 8)
@@ -510,7 +550,7 @@ export function compactBootstrapText(data: {
       lines.push(`- ${compactRequirementLabel(item.requirement)}`);
       for (const c of item.recent_changes.slice(0, 3)) lines.push(`  - ${compactChangeLabel(c)}`);
     }
-  } else {
+  } else if (data.context_policy?.include_recent !== false) {
     lines.push("requirements: none");
   }
   if (data.recent_notes.length) {
@@ -524,12 +564,6 @@ export function compactBootstrapText(data: {
         .map((c) => c.title ?? `#${c.id}`)
         .join(", ")}`,
     );
-  }
-  if (data.semantic) {
-    lines.push(`semantic ${data.semantic.mode} ${data.semantic.matches.length}/${data.semantic.top_k} for "${oneLine(data.semantic.query, 80)}":`);
-    for (const m of data.semantic.matches.slice(0, 5)) {
-      lines.push(`- score=${m.score.toFixed(3)} ${compactMemoryLabel(m.item, 120)}`);
-    }
   }
   lines.push("hint: use format=json for full structured output; read_memory_item(id) for full content");
   return lines.join("\n");

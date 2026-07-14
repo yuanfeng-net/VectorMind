@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import crypto from "node:crypto";
 
 import type { MemoryItemRow } from "./types.js";
 import { parseMetadataJson } from "./memory-recall.js";
@@ -8,7 +9,6 @@ type MemoryMutationContext = {
   getDb: () => Database.Database | undefined;
   getMemoryItemByIdStatement: () => Database.Statement;
   getCompleteRequirementMemoryItemByReqIdStatement: () => Database.Statement;
-  getCompleteAllActiveRequirementMemoryItemsStatement: () => Database.Statement;
 };
 
 let memoryMutationContext: MemoryMutationContext | null = null;
@@ -36,26 +36,79 @@ function getCompleteRequirementMemoryItemByReqIdStatement(): Database.Statement 
   return requireMemoryMutationContext().getCompleteRequirementMemoryItemByReqIdStatement();
 }
 
-function getCompleteAllActiveRequirementMemoryItemsStatement(): Database.Statement {
-  return requireMemoryMutationContext().getCompleteAllActiveRequirementMemoryItemsStatement();
-}
-export function completeRequirementMemoryItemsByReqId(reqId: number): void {
-  try {
-    getCompleteRequirementMemoryItemByReqIdStatement().run("completed", reqId);
-  } catch (err) {
-    console.error("[vectormind] failed to complete requirement memory item:", err);
+const INCOMPLETE_SPLIT_PLAN_STATUSES = new Set(["planned", "in_progress", "partial", "needs_refinement"]);
+
+export function deferIncompleteLargeFileSplitPlansByReqId(
+  reqId: number,
+  reason = "requirement_completed_before_split_resolved",
+): number[] {
+  const rows = getDb().prepare(
+    `SELECT id, content, metadata_json
+       FROM memory_items
+      WHERE kind = 'large_file_split_plan' AND req_id = ?`,
+  ).all(reqId) as Array<{ id: number; content: string; metadata_json: string | null }>;
+  const updated: number[] = [];
+  const now = new Date().toISOString();
+  const updateStmt = getDb().prepare(
+    `UPDATE memory_items
+        SET content = ?, metadata_json = ?, content_hash = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND kind = 'large_file_split_plan'`,
+  );
+  for (const row of rows) {
+    const metadata = parseMetadataJson(row.metadata_json);
+    if (!INCOMPLETE_SPLIT_PLAN_STATUSES.has(String(metadata.status))) continue;
+    let content = row.content;
+    try {
+      const parsed = JSON.parse(row.content) as Record<string, unknown>;
+      content = safeJson({
+        ...parsed,
+        status: "deferred",
+        deferred: true,
+        deferred_at: now,
+        deferred_reason: reason,
+      }) ?? row.content;
+    } catch {
+      // Legacy plan content remains readable; metadata carries the lifecycle state.
+    }
+    updateStmt.run(
+      content,
+      safeJson({
+        ...metadata,
+        status: "deferred",
+        deferred: true,
+        deferred_at: now,
+        deferred_reason: reason,
+      }),
+      crypto.createHash("sha256").update(content).digest("hex"),
+      row.id,
+    );
+    updated.push(row.id);
   }
+  return updated;
 }
 
-export function completeAllActiveRequirementMemoryItems(): void {
-  try {
-    getCompleteAllActiveRequirementMemoryItemsStatement().run(
-      "completed",
-      "active",
-    );
-  } catch (err) {
-    console.error("[vectormind] failed to complete all active requirement memory items:", err);
-  }
+export function completeRequirementMemoryItemsByReqId(reqId: number): void {
+  const transaction = getDb().transaction(() => {
+    getDb().prepare(`UPDATE requirements SET status = 'completed' WHERE id = ?`).run(reqId);
+    deferIncompleteLargeFileSplitPlansByReqId(reqId);
+    getCompleteRequirementMemoryItemByReqIdStatement().run("completed", reqId);
+  });
+  transaction();
+}
+
+export function completeAllActiveRequirementMemoryItems(): number[] {
+  const activeRows = getDb().prepare(
+    `SELECT id FROM requirements WHERE status = 'active' ORDER BY created_at DESC, id DESC`,
+  ).all() as Array<{ id: number }>;
+  const transaction = getDb().transaction(() => {
+    for (const row of activeRows) {
+      getDb().prepare(`UPDATE requirements SET status = 'completed' WHERE id = ?`).run(row.id);
+      deferIncompleteLargeFileSplitPlansByReqId(row.id);
+      getCompleteRequirementMemoryItemByReqIdStatement().run("completed", row.id);
+    }
+  });
+  transaction();
+  return activeRows.map((row) => row.id);
 }
 
 function patchMemoryItemMetadata(id: number, patch: Record<string, unknown>): void {

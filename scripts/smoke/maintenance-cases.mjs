@@ -67,6 +67,23 @@ export async function runMaintenanceCases(ctx) {
       oldDate,
     );
   const oldMemId = Number(oldMemInfo.lastInsertRowid);
+  const oldPlanToken = `OLD_RESOLVED_SPLIT_PLAN_${token}`;
+  const oldPlanInfo = db.prepare(
+    `INSERT INTO memory_items
+       (kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at)
+     VALUES
+       ('large_file_split_plan', ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)`,
+  ).run(
+    "Old resolved split plan",
+    JSON.stringify({ type: "large_file_split_plan", summary: oldPlanToken, plan: { ok: true } }),
+    "src/old-huge.ts",
+    oldReqId,
+    JSON.stringify({ type: "large_file_split_plan", status: "resolved", file: "src/old-huge.ts" }),
+    "old-plan-hash",
+    oldDate,
+    oldDate,
+  );
+  const oldPlanId = Number(oldPlanInfo.lastInsertRowid);
   db
     .prepare(
       `INSERT INTO memory_items
@@ -140,6 +157,15 @@ export async function runMaintenanceCases(ctx) {
   db
     .prepare(`INSERT OR REPLACE INTO pending_changes (file_path, last_event, updated_at) VALUES (?, 'add', ?)`)
     .run(ignoredTmpPath, oldDate);
+  db.prepare(
+    `INSERT INTO token_savings (tool, raw_tokens, output_tokens, saved_tokens, savings_pct, created_at)
+     VALUES ('old-smoke', 100, 50, 50, 50, ?)`,
+  ).run(oldDate);
+  db.prepare(
+    `INSERT INTO mcp_tool_metrics
+       (tool_name, duration_ms, raw_output_chars, output_chars, is_error, root_source, created_at)
+     VALUES ('old-smoke', 1, 100, 50, 0, 'tool_arg', ?)`,
+  ).run(oldDate);
   db.close();
 
   const maintainDry = await client.callTool({
@@ -159,8 +185,8 @@ export async function runMaintenanceCases(ctx) {
   try {
     const parsed = JSON.parse(maintainDryText);
     if (parsed?.ok !== true || parsed?.dry_run !== true) throw new Error("expected dry-run maintain_memory ok");
-    if (Number(parsed?.compacted_memory?.candidates ?? 0) < 2) {
-      throw new Error("expected old completed requirement/change intent candidates");
+    if (Number(parsed?.compacted_memory?.candidates ?? 0) < 3) {
+      throw new Error("expected old completed requirement/change intent/resolved split-plan candidates");
     }
     if (Number(parsed?.pruned?.stale_files?.files_matched ?? 0) < 1) {
       throw new Error("expected stale index candidate");
@@ -170,6 +196,10 @@ export async function runMaintenanceCases(ctx) {
     }
     if (Number(parsed?.pending_pruned?.ignored_deleted ?? 0) < 1) {
       throw new Error("expected ignored .tmp pending candidate");
+    }
+    if (Number(parsed?.metrics_pruned?.token_savings_deleted ?? 0) < 1 ||
+        Number(parsed?.metrics_pruned?.mcp_tool_metrics_deleted ?? 0) < 1) {
+      throw new Error("expected old token and MCP tool metrics candidates");
     }
   } catch (err) {
     console.error("\n[smoke] maintain_memory dry-run check failed:", err);
@@ -194,7 +224,7 @@ export async function runMaintenanceCases(ctx) {
   try {
     const parsed = JSON.parse(maintainApplyText);
     if (parsed?.ok !== true || parsed?.dry_run !== false) throw new Error("expected apply maintain_memory ok");
-    if (Number(parsed?.compacted_memory?.compacted ?? 0) < 2) {
+    if (Number(parsed?.compacted_memory?.compacted ?? 0) < 3) {
       throw new Error("expected old memory items to be compacted");
     }
     if (Number(parsed?.compacted_memory?.summary_memory_id ?? 0) <= 0) {
@@ -215,6 +245,10 @@ export async function runMaintenanceCases(ctx) {
     if (Number(parsed?.purged_hidden_memory?.memory_deleted ?? 0) < 1) {
       throw new Error("expected compacted hidden memory stubs to be hard-pruned");
     }
+    if (Number(parsed?.metrics_pruned?.token_savings_deleted ?? 0) < 1 ||
+        Number(parsed?.metrics_pruned?.mcp_tool_metrics_deleted ?? 0) < 1) {
+      throw new Error("expected old token and MCP tool metrics to be deleted");
+    }
     if (parsed?.wal_checkpointed !== true) {
       throw new Error("expected WAL checkpoint to run during apply maintenance");
     }
@@ -222,6 +256,20 @@ export async function runMaintenanceCases(ctx) {
     console.error("\n[smoke] maintain_memory apply check failed:", err);
     process.exitCode = 1;
     return;
+  }
+
+  const oldPlanSearch = await client.callTool({
+    name: "semantic_search",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      query: oldPlanToken,
+      top_k: 5,
+      format: "json",
+    },
+  });
+  const oldPlanMatches = JSON.parse(readText(oldPlanSearch))?.matches ?? [];
+  if (oldPlanMatches.some((match) => match?.item?.id === oldPlanId)) {
+    throw new Error("expected old resolved split plan detail to leave default recall after maintenance");
   }
 
   const oldSearch = await client.callTool({

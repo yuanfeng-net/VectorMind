@@ -10,11 +10,15 @@ import { mergePendingWithGit } from "../pending-changes.js";
 import { toolCompactOrJson, toolText } from "../token-savings.js";
 import { flushPendingChangeBuffer } from "../file-indexing.js";
 import { buildFixPatternQualitySignals, collectRelevantFixPatterns } from "../fix-patterns.js";
-import { BOOTSTRAP_DEFAULT_CONTEXT_KINDS, getConventionPreviews, getCurrentContextPreviews, getDecisionPreviews, isHiddenFromDefaultRecall, semanticSearchHybridInternal, toChangeLogPreview, toMemoryItemPreview, toRequirementPreview } from "../memory-recall.js";
+import { BOOTSTRAP_DEFAULT_CONTEXT_KINDS, getConventionPreviews, getCurrentContextPreviews, getDecisionPreviews, isHiddenFromDefaultRecall, metadataStatus, semanticSearchHybridInternal, toChangeLogPreview, toMemoryItemPreview, toRequirementPreview } from "../memory-recall.js";
 import { logActivity } from "../activity-log.js";
 import { compactBootstrapText, compactBrainDumpText, compactSemanticSearchText, toolJson } from "../tool-output.js";
-import { expandOperationQuery } from "../operation-scope.js";
 import { collectCurrentConstraintsForBootstrap } from "./operations.js";
+import {
+  boundCompactContext,
+  filterFocusedSemanticResult,
+  resolveBootstrapContextPolicy,
+} from "../context-governance.js";
 function getVisibleRecentNotePreviews(
   db: Database.Database,
   limit: number,
@@ -49,6 +53,29 @@ function getVisibleRecentNotePreviews(
     .map((n) => toMemoryItemPreview(n, includeContent, previewChars, contentMaxChars));
 }
 
+function getActiveLargeFilePlanPreviews(
+  db: Database.Database,
+  reqId: number,
+  limit: number,
+  previewChars: number,
+  contentMaxChars: number,
+) {
+  if (limit <= 0) return [];
+  const rows = db.prepare(
+    `SELECT id, kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at
+       FROM memory_items
+      WHERE kind = 'large_file_split_plan'
+        AND req_id = ?
+        AND COALESCE(json_extract(
+          CASE WHEN json_valid(COALESCE(metadata_json, '{}')) THEN COALESCE(metadata_json, '{}') ELSE '{}' END,
+          '$.status'
+        ), '') NOT IN ('resolved', 'superseded', 'compacted', 'deferred', 'abandoned')
+      ORDER BY updated_at DESC, id DESC
+      LIMIT ?`,
+  ).all(reqId, limit) as MemoryItemRow[];
+  return rows.map((row) => toMemoryItemPreview(row, false, previewChars, contentMaxChars));
+}
+
 export async function handleBootstrapContext(
   rawArgs: Record<string, unknown>,
   context: ToolHandlerContext,
@@ -68,6 +95,7 @@ export async function handleBootstrapContext(
   } = context.getStatements();
 
   const args = BootstrapContextArgsSchema.parse(rawArgs);
+  const contextPolicy = resolveBootstrapContextPolicy(rawArgs, args);
   flushPendingChangeBuffer();
 
   const previewChars = args.preview_chars;
@@ -80,8 +108,13 @@ export async function handleBootstrapContext(
   const decisionsLimit = args.decisions_limit;
   const currentContextLimit = args.current_context_limit;
 
-  const recent = listRecentRequirementsStmt.all(requirementsLimit) as RequirementRow[];
-  const items = recent.map((req) => {
+  const activeRequirement = getActiveRequirementStmt.get() as RequirementRow | undefined;
+  const recent = contextPolicy.include_recent
+    ? listRecentRequirementsStmt.all(requirementsLimit) as RequirementRow[]
+    : activeRequirement
+      ? [activeRequirement]
+      : [];
+  let items = recent.map((req) => {
     const changes = listChangeLogsForRequirementStmt.all(req.id, changesLimit) as ChangeLogRow[];
     return {
       requirement: toRequirementPreview(req, includeContent, previewChars, contentMaxChars),
@@ -92,18 +125,30 @@ export async function handleBootstrapContext(
   const project_summary = projectSummaryRow
     ? toMemoryItemPreview(projectSummaryRow, includeContent, previewChars, contentMaxChars)
     : null;
-  const recent_notes = getVisibleRecentNotePreviews(
-    db,
-    notesLimit,
-    includeContent,
+  let recent_notes = contextPolicy.include_recent
+    ? getVisibleRecentNotePreviews(db, notesLimit, includeContent, previewChars, contentMaxChars)
+    : [];
+  let decisions = getDecisionPreviews(
+    contextPolicy.include_recent ? decisionsLimit : Math.min(3, decisionsLimit),
     previewChars,
     contentMaxChars,
   );
-  const decisions = getDecisionPreviews(decisionsLimit, previewChars, contentMaxChars);
-  const conventions = getConventionPreviews(conventionsLimit, previewChars, contentMaxChars);
-  const current_context = getCurrentContextPreviews(currentContextLimit, previewChars, contentMaxChars);
-  const current_constraints = collectCurrentConstraintsForBootstrap(context, Math.max(8, Math.min(20, currentContextLimit + decisionsLimit)), previewChars);
-  const activeForScope = getActiveRequirementStmt.get() as RequirementRow | undefined;
+  const conventions = contextPolicy.include_recent
+    ? getConventionPreviews(conventionsLimit, previewChars, contentMaxChars)
+    : [];
+  let current_context = contextPolicy.include_recent
+    ? getCurrentContextPreviews(currentContextLimit, previewChars, contentMaxChars)
+    : activeRequirement
+      ? getActiveLargeFilePlanPreviews(db, activeRequirement.id, Math.min(3, currentContextLimit), previewChars, contentMaxChars)
+      : [];
+  let current_constraints = collectCurrentConstraintsForBootstrap(
+    context,
+    contextPolicy.include_recent
+      ? Math.max(8, Math.min(20, currentContextLimit + decisionsLimit))
+      : 8,
+    previewChars,
+  );
+  const activeForScope = activeRequirement;
   const relevantFixPatterns = collectRelevantFixPatterns(context, {
     intent: args.query ?? "",
     files: [],
@@ -113,16 +158,20 @@ export async function handleBootstrapContext(
   const quality_signals = buildFixPatternQualitySignals(relevantFixPatterns);
   const pending_offset = args.pending_offset;
   const pending_limit = args.pending_limit;
-  const pendingDbRows = listPendingChangesStmt.all() as Array<{
-    file_path: string;
-    last_event: string;
-    updated_at: string;
-  }>;
-  const mergedPending = mergePendingWithGit(pendingDbRows, { offset: pending_offset, limit: pending_limit });
+  const mergedPending = contextPolicy.include_pending
+    ? mergePendingWithGit(
+        listPendingChangesStmt.all() as Array<{
+          file_path: string;
+          last_event: string;
+          updated_at: string;
+        }>,
+        { offset: pending_offset, limit: pending_limit },
+      )
+    : { total: 0, truncated: false, page: [] };
   const pending_total = mergedPending.total;
-  const pending_truncated = mergedPending.truncated;
-  const pending_changes = mergedPending.page;
-  const development_warnings = [
+  let pending_truncated = mergedPending.truncated;
+  let pending_changes = mergedPending.page;
+  let development_warnings = [
     ...buildDevelopmentWarnings(pending_changes),
     ...(activeForScope
       ? buildScopeDriftWarnings({ requirement: activeForScope, files: pending_changes })
@@ -131,12 +180,11 @@ export async function handleBootstrapContext(
 
   const q = args.query?.trim() ?? "";
   const semanticKinds = args.kinds?.length ? args.kinds : BOOTSTRAP_DEFAULT_CONTEXT_KINDS;
-  const expandedQuery = q ? expandOperationQuery(q) : "";
-  const semantic =
+  const semanticRaw =
     q
       ? await Promise.race([
           semanticSearchHybridInternal({
-            query: expandedQuery,
+            query: q,
             topK: args.top_k,
             kinds: semanticKinds,
             includeContent,
@@ -149,6 +197,24 @@ export async function handleBootstrapContext(
           return null;
         })
       : null;
+  const semanticWithoutInactiveDefaultPlans = semanticRaw && !args.kinds?.length
+    ? {
+        ...semanticRaw,
+        matches: semanticRaw.matches.filter((match) =>
+          match.item.kind !== "large_file_split_plan" ||
+          !["resolved", "deferred", "abandoned"].includes(metadataStatus(match.item))
+        ),
+      }
+    : semanticRaw;
+  const semantic = contextPolicy.mode === "focused"
+    ? filterFocusedSemanticResult(q, semanticWithoutInactiveDefaultPlans)
+    : semanticWithoutInactiveDefaultPlans;
+
+  if (!contextPolicy.include_pending) {
+    pending_changes = [];
+    pending_truncated = pending_total > 0;
+    development_warnings = [];
+  }
 
   logActivity("bootstrap_context", {
     query: q || null,
@@ -160,6 +226,9 @@ export async function handleBootstrapContext(
     conventions_returned: conventions.length,
     semantic_mode: semantic?.mode ?? null,
     semantic_matches: semantic?.matches?.length ?? 0,
+    context_mode: contextPolicy.mode,
+    pending_included: contextPolicy.include_pending,
+    recent_included: contextPolicy.include_recent,
   });
 
   const outputValue = {
@@ -170,6 +239,14 @@ export async function handleBootstrapContext(
     db_path: dbPath,
     watcher_enabled: watcherEnabled,
     watcher_ready: watcherReady,
+    context_policy: {
+      mode: contextPolicy.mode,
+      include_pending: contextPolicy.include_pending,
+      include_recent: contextPolicy.include_recent,
+      max_output_chars: contextPolicy.max_output_chars,
+      compact_truncated: false,
+      current_anchor_included: items.length > 0,
+    },
     output: {
       format: args.format,
       include_content: includeContent,
@@ -188,6 +265,7 @@ export async function handleBootstrapContext(
     current_context,
     recent_notes,
     pending_total,
+    pending_included: contextPolicy.include_pending,
     pending_offset,
     pending_limit,
     pending_truncated,
@@ -199,11 +277,20 @@ export async function handleBootstrapContext(
     semantic,
   };
 
+  const compactOutput = boundCompactContext(
+    compactBootstrapText(outputValue),
+    contextPolicy.max_output_chars,
+  );
+  outputValue.context_policy = {
+    ...outputValue.context_policy,
+    compact_truncated: compactOutput.truncated,
+  };
+
   return {
     content: [
       {
         type: "text",
-        text: toolText("bootstrap_context", outputValue, compactBootstrapText(outputValue), args.format),
+        text: toolText("bootstrap_context", outputValue, compactOutput.text, args.format),
       },
     ],
   };

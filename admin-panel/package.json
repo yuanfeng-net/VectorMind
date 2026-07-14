@@ -1,0 +1,21 @@
+{
+  "name": "vectormind-admin-panel",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local VectorMind MCP management panel.",
+  "scripts": {
+    "dev": "node server/index.mjs",
+    "build": "vite build",
+    "start": "node server/index.mjs --production",
+    "check": "npm run build"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^6.0.3",
+    "better-sqlite3": "^12.5.0",
+    "express": "^5.2.1",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "vite": "^8.1.3"
+  }
+}

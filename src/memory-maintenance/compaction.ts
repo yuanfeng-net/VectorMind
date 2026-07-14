@@ -17,8 +17,8 @@ function selectCompactionCandidates(opts: {
   compactNotes: boolean;
 }): Array<MemoryItemRow & { req_status?: string | null }> {
   const kinds = opts.compactNotes
-    ? ["requirement", "change_intent", "note"]
-    : ["requirement", "change_intent"];
+    ? ["requirement", "change_intent", "note", "large_file_split_plan"]
+    : ["requirement", "change_intent", "large_file_split_plan"];
   const placeholders = kinds.map(() => "?").join(", ");
   const rows = getDb()
     .prepare(
@@ -40,6 +40,7 @@ function selectCompactionCandidates(opts: {
   return rows
     .filter((row) => !isHiddenFromDefaultRecall(row))
     .filter((row) => metadataStatus(row) !== "current" && metadataStatus(row) !== "active")
+    .filter((row) => row.kind !== "large_file_split_plan" || ["resolved", "superseded", "deferred", "abandoned"].includes(metadataStatus(row) ?? ""))
     .filter((row) => row.req_status !== "active")
     .filter((row) => row.kind !== "note" || opts.compactNotes)
     .slice(0, opts.maxMemoryItems);

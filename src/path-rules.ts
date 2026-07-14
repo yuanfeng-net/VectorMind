@@ -67,6 +67,8 @@ export const IGNORED_PATH_SEGMENT_PREFIXES = [
   ".tmp-",
   ".temp-",
   ".playwright-",
+  "_tmp-",
+  "_tmp_",
 ].map((s) => s.toLowerCase());
 
 export const NOISE_FILE_SUFFIXES = [

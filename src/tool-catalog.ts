@@ -59,7 +59,27 @@ type ToolBehavior = {
   readOnlyHint: boolean;
   idempotentHint: boolean;
   openWorldHint?: boolean;
+  advisoryOnly?: boolean;
+  workflowGate?: boolean;
 };
+
+const CORE_TOOL_ORDER = [
+  "bootstrap_context",
+  "start_requirement",
+  "preflight_change_scope",
+  "plan_large_file_split",
+  "record_large_file_split",
+  "sync_change_intent",
+  "preflight_operation_scope",
+  "read_memory_item",
+  "upsert_decision",
+  "supersede_memory",
+  "complete_requirement",
+] as const;
+
+export function resolveToolProfile(value = process.env.VECTORMIND_TOOL_PROFILE): "core" | "full" {
+  return value?.trim().toLocaleLowerCase() === "full" ? "full" : "core";
+}
 
 const DEFAULT_READ_ONLY_BEHAVIOR: ToolBehavior = {
   tags: ["read_only", "advisory_only", "bounded_output"],
@@ -69,9 +89,17 @@ const DEFAULT_READ_ONLY_BEHAVIOR: ToolBehavior = {
 };
 
 const TOOL_BEHAVIOR: Record<string, ToolBehavior> = {
-  start_requirement: { tags: ["write_memory", "requirement_boundary", "advisory_only"], readOnlyHint: false, idempotentHint: false },
+  start_requirement: { tags: ["write_memory", "requirement_boundary", "advisory_only", "duplicate_safe"], readOnlyHint: false, idempotentHint: true },
+  preflight_change_scope: {
+    tags: ["read_only", "requirement_boundary", "advisory_quality_signals", "conditional_workflow_gate", "bounded_output"],
+    readOnlyHint: true,
+    idempotentHint: true,
+    advisoryOnly: false,
+    workflowGate: true,
+  },
   sync_change_intent: { tags: ["write_memory", "change_intent", "fix_pattern", "advisory_only"], readOnlyHint: false, idempotentHint: false },
   preflight_operation_scope: { tags: ["read_only", "operation_scope", "current_constraints", "advisory_only"], readOnlyHint: true, idempotentHint: true },
+  plan_large_file_split: { tags: ["write_memory", "large_file_plan", "workflow_gate_evidence"], readOnlyHint: false, idempotentHint: false, advisoryOnly: false, workflowGate: true },
   record_large_file_split: { tags: ["write_memory", "large_file_tracking", "advisory_only"], readOnlyHint: false, idempotentHint: false },
   complete_requirement: { tags: ["write_memory", "requirement_lifecycle", "advisory_only"], readOnlyHint: false, idempotentHint: false },
   clear_activity_log: { tags: ["diagnostic_state", "non_project_memory"], readOnlyHint: false, idempotentHint: true },
@@ -105,7 +133,8 @@ function withToolBehavior(tool: ToolDefinition): ToolDefinition {
       ...tool._meta,
       "vectormind/behavior": {
         tags: behavior.tags,
-        advisory_only: true,
+        advisory_only: behavior.advisoryOnly ?? true,
+        workflow_gate: behavior.workflowGate ?? false,
         does_not_control_model_reasoning: true,
         does_not_control_host_runtime: true,
       },
@@ -118,19 +147,19 @@ export async function listToolDefinitions() {
       {
         name: "start_requirement",
         description:
-          "MUST call BEFORE editing code. Starts/activates the concrete user requirement so subsequent changes stay inside that requirement boundary and do not accumulate unrelated work. Supports scope_allow/scope_deny, allowed_paths/denied_paths, and optional requirement_items for explicit user-request mapping.",
+          "Call once for a new code-change goal. Preserve the returned requirement.id or goal_key and pass it to preflight_change_scope and sync_change_intent when multiple tasks may run in the same project. Duplicate goal keys are reused.",
         inputSchema: toJsonSchemaCompat(StartRequirementArgsSchema),
       },
       {
         name: "sync_change_intent",
         description:
-          "MUST call AFTER you edit code and save files. Archives the intent summary, links affected files to the current active requirement, and returns development_warnings for oversized files, broad change scope, or missing file targets. Optionally stores an explicit fix_pattern as advisory regression-memory; VectorMind does not infer fix patterns automatically.",
+          "Call once after edits. Pass req_id or goal_key from start_requirement when tasks can overlap. Archives one intent summary and explicit affected files; include large_file_split_deferrals for plan-free minimal bugfix/hotfix debt. complete_requirement=true also closes that selected requirement.",
         inputSchema: toJsonSchemaCompat(SyncChangeIntentArgsSchema),
       },
       {
         name: "preflight_change_scope",
         description:
-          "MUST call BEFORE editing once you know the intended files/modules. Checks planned files against the active requirement, optional generic scope_allow/scope_deny/allowed_paths/denied_paths, and optional requirement_items/planned_changes mapping. Also returns relevant fix_pattern quality_signals as advisory-only regression reminders that must not change ok/safe_to_edit or expand scope. If ok=false/safe_to_edit=false, stop before editing and narrow the plan or scope contract. For huge files, use change_mode='mechanical_modularization' only when the task is to split the file.",
+          "Call once before the first edit when the complete file/module set is known. Pass req_id or goal_key when tasks overlap. Normal mapping and large-file signals plus relevant fix_pattern quality_signals are advisory; huge_file_modularization_required requires a persisted matching split_plan_id for mechanical work. A minimal bugfix may defer planning only with adds_responsibility=false and defer_split_reason, then persist that debt in sync_change_intent.large_file_split_deferrals.",
         inputSchema: toJsonSchemaCompat(PreflightChangeScopeArgsSchema),
       },
       {
@@ -142,13 +171,13 @@ export async function listToolDefinitions() {
       {
         name: "plan_large_file_split",
         description:
-          "Plan a mechanical modularization split for a huge implementation file. Produces real semantic module names/directories and explicitly forbids generated/parts/partN files plus ordinal prefixes like 1_xxx/2_xxx. Use this before normal feature work when preflight_change_scope returns huge_file_modularization_required.",
+          "Persist or reuse a bounded-memory heuristic split plan when preflight_change_scope returns huge_file_modularization_required. Pass req_id or goal_key when tasks overlap, preserve plan_id, and pass it back to mechanical preflight. Reports low-confidence declaration coverage, target-module size constraints, source-state hash, and refinement warnings.",
         inputSchema: toJsonSchemaCompat(PlanLargeFileSplitArgsSchema),
       },
       {
         name: "record_large_file_split",
         description:
-          "Record the planned/in-progress/partial/resolved status of a huge-file mechanical modularization split so future sessions know the file is being decomposed and where modules moved.",
+          "Update a persisted large-file split plan by plan_id. Validates requirement/file identity, project-contained semantic module paths, actual remaining lines, and resolved verification evidence without creating conflicting status notes.",
         inputSchema: toJsonSchemaCompat(RecordLargeFileSplitArgsSchema),
       },
       {
@@ -160,7 +189,7 @@ export async function listToolDefinitions() {
       {
         name: "bootstrap_context",
         description:
-          "MUST call at the start of every new chat/session. Returns brain dump + pending changes + development_warnings, advisory quality_signals such as relevant fix_pattern reminders, and (if you pass query) matches from the local memory store to avoid guessing.",
+          "Call at most once for a new project goal when historical context is needed. Default focused mode returns project summary plus query-relevant matches within a compact output budget; recent history and pending files are opt-in.",
         inputSchema: toJsonSchemaCompat(BootstrapContextArgsSchema),
       },
       {
@@ -344,7 +373,13 @@ export async function listToolDefinitions() {
         inputSchema: toJsonSchemaCompat(PruneIndexArgsSchema),
       },
     ];
+  const profile = resolveToolProfile();
+  const visibleTools = profile === "core"
+    ? CORE_TOOL_ORDER.map((name) => tools.find((tool) => tool.name === name)).filter(
+        (tool): tool is ToolDefinition => tool !== undefined,
+      )
+    : tools;
   return {
-    tools: tools.map(withToolBehavior),
+    tools: visibleTools.map(withToolBehavior),
   };
 }

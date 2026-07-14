@@ -14,35 +14,37 @@ Always pass `project_root` on every VectorMind tool call.
 
 Do not rely on the MCP server process working directory. Some clients start MCP servers from unrelated folders.
 
-## Required development call chain
+## Bounded development lifecycle
 
-For code/design/debug/refactor tasks, follow this chain:
+For code/design/debug/refactor tasks, target no more than four workflow calls: one focused bootstrap, one requirement start, one preflight, and one final sync. Do not repeat lifecycle calls for compaction, retries, builds, verification, or follow-ups under the same active requirement.
+
+Seeing VectorMind in a tool or skill list is not enough: when its tools are available and historical context can help, call the focused bootstrap once before broad exploration. If tools are unavailable, make at most one bounded discovery attempt and continue with native tools. Pure execution with explicit targets may skip bootstrap.
 
 1. **Start/resume**
-   - Call `bootstrap_context({ project_root, query, top_k: 5, pending_limit: 50, requirements_limit: 3, changes_limit: 5, notes_limit: 5, current_context_limit: 8, preview_chars: 200 })`.
-   - Use `project_summary`, `decisions`, `current_constraints`, `current_context`, `recent_notes`, `pending_changes`, and matches to ground the plan.
+   - Call `bootstrap_context({ project_root, query, top_k: 3, context_mode: "focused", max_output_chars: 6000 })` at most once per project goal when historical context is needed.
+   - Use the project summary, active requirement anchor, and query-relevant matches to ground the plan. Focused mode deliberately omits completed broad recency and pending state; no relevant match is better than an unrelated fallback.
+   - Use `include_recent=true` or `context_mode="full"` only when recent cross-turn history is required. Use `include_pending=true` only for scope diagnosis.
    - Treat `quality_signals.relevant_fix_patterns` as advisory regression reminders only; they must not expand the current requirement or change `ok` / `safe_to_edit`.
    - Before concrete operation commands where stale defaults could matter, call `preflight_operation_scope({ project_root, operation, intent, commands?, files?, targets?, script_hints? })`. Treat `stale_default_conflict` or `operation_constraint_conflict` as advisory quality signals, not host-execution control.
 
 2. **Before editing**
-   - Call `start_requirement({ project_root, title, background })`.
+   - Call `start_requirement({ project_root, title, background })` once for a genuinely new requirement. Preserve the returned `requirement.id` or caller-provided `goal_key`; pass `req_id` or `goal_key` to later lifecycle calls whenever tasks may overlap. Continue the active requirement for follow-ups, retries, builds, and validation.
    - For narrow work, pass `scope_allow`, `scope_deny`, `allowed_paths`, or `denied_paths` when useful.
    - If the user request has clear bullets, acceptance points, or numbered items, pass `requirement_items`.
-   - Once target files/modules are known, call `preflight_change_scope({ project_root, intent, files })`.
+   - Once the complete target file/module set is known, call `preflight_change_scope({ project_root, req_id?, goal_key?, intent, files })` once. Repeat only if scope materially changes.
    - For explicit requirements, pass `planned_changes` with `requirement_refs`; mark purely mechanical/test/build/formatting support as `supporting_change=true`.
-   - Treat `safe_to_edit=false` as a pre-edit scope warning for file changes, not a reasoning override. Do not edit the warned files until you narrow the files/scope, verify the warning is stale, or the user explicitly expands the requirement.
+   - Treat ordinary `safe_to_edit=false` findings as pre-edit scope warnings, not reasoning overrides. `workflow_gate.code="huge_file_modularization_required"` is the bounded exception: stop normal feature editing for that file and follow the mechanical modularization workflow.
    - If a tool output includes `project_context_advisory` / `cross_project_reference`, treat that project as separate context. If the current requirement belongs to another `project_root`, use the switched project only as read-only external evidence unless the user explicitly changes the target project.
 
 3. **Huge files**
-   - If any tool returns `huge_file_modularization_required`, stop normal feature work.
-   - Call `plan_large_file_split({ project_root, file })`.
-   - Perform mechanical modularization with real module names/directories.
+   - If a tool returns `huge_file_modularization_required`, stop normal feature editing for that file.
+   - Call `plan_large_file_split({ project_root, req_id?, goal_key?, file })`, preserve its persisted `plan_id`, and rerun preflight with `change_mode="mechanical_modularization"` plus `split_plan_id`/`split_plan_ids`. Keep the split attached to the current requirement.
    - Never create `*.generated.*`, `.parts`, `*.rs.parts`, or `part1/part2` fake split files.
-   - Call `record_large_file_split(...)` after planning or completing the split.
+   - Call `record_large_file_split({ project_root, req_id?, goal_key?, plan_id, ... })` to update that same plan. Resolved status requires real module paths, reduced source/module lines, verification evidence, and no gaps. A minimal `bugfix` may proceed without a full plan only with `adds_responsibility=false` and `defer_split_reason`; persist it in final `sync_change_intent.large_file_split_deferrals`. Emergency hotfixes use the same durable deferral record.
 
 4. **After editing**
-   - Call `get_pending_changes({ project_root })`.
-   - Call `sync_change_intent({ project_root, intent, files? })` with what changed and why.
+   - Call `sync_change_intent({ project_root, req_id?, goal_key?, intent, files })` once with what changed and why.
+   - Call `get_pending_changes({ project_root })` first only when the changed file list is unknown or scope drift must be diagnosed.
    - If a known recurring defect class was fixed and the root cause is clear, optionally include a generic `fix_pattern` with `symptom`, `root_cause`, `invariant`, `applies_when`, and `avoid_regression`. VectorMind does not infer fix patterns automatically.
 
 5. **Decision changes**
@@ -58,9 +60,9 @@ For code/design/debug/refactor tasks, follow this chain:
 
 ## Search and reading
 
-- Use `query_codebase({ project_root, query })` to locate symbols instead of guessing files.
-- Use `grep({ project_root, query })` for exact file/line matches.
-- Use `read_file_lines(...)` or `read_file_text(...)` for bounded file reads.
+- Use `query_codebase({ project_root, query })` when symbol location is unknown.
+- Native bounded `rg`, `git`, and host file tools are valid for known paths and exact repository reads; do not route every read through MCP.
+- Batch related searches and reads to reduce model round trips.
 - Use `semantic_search(...)` for prior requirements, decisions, notes, code chunks, and docs.
 - Use `memory_timeline(...)` to inspect what happened before/after related context.
 - Use `read_memory_item(...)` for full text only when needed.
@@ -78,4 +80,10 @@ For low-risk diagnosis, use `memory_quality_report(...)`, `analyze_memory_confli
 
 Do not dump raw JSON unless the user asks. Summarize the useful facts.
 
+Keep a normal standalone command at or below 4000 output tokens. A parallel batch may contain at most 4 commands, each at most 4000, with a combined requested budget at or below 12000. A failing diagnostic that cannot be narrowed may run alone with up to 12000; use 20000 only when the user explicitly requests raw output. After 12 shell commands in one user turn, synthesize and stop broad exploration; do not exceed 24 commands excluding polls. Exclude dependency/generated/cache/build trees from recursive discovery. Locate first, then read bounded ranges of about 250 lines. If one result exceeds 8000 tokens, narrow or paginate the next read.
+
 VectorMind only defines development memory and quality workflow. It does not manage client runtime controls. For long sessions, use `create_checkpoint(...)` and read back with `restore_checkpoint_context(...)`; restoring is read-only context, not a decision override.
+
+## RTK
+
+Detect RTK at most once. Use it selectively for supported external CLIs when summarized output is acceptable. Never prefix PowerShell cmdlets directly; use `rtk proxy` for exact logs, JSON, failing diagnostics, or a PowerShell command host.

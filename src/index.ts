@@ -17,6 +17,7 @@ import type {
   MemoryItemRow,
   RequirementRow,
   RootSource,
+  SyncedFileStateRow,
 } from "./types.js";
 import type { ProjectContextAdvisory } from "./tool-handlers/context.js";
 import {
@@ -165,7 +166,6 @@ configureMemoryMutations({
   getDb: () => db,
   getMemoryItemByIdStatement: () => statements.getMemoryItemByIdStmt,
   getCompleteRequirementMemoryItemByReqIdStatement: () => statements.completeRequirementMemoryItemByReqIdStmt,
-  getCompleteAllActiveRequirementMemoryItemsStatement: () => statements.completeAllActiveRequirementMemoryItemsStmt,
 });
 
 configureFileIndexing({
@@ -205,6 +205,9 @@ function getFileStateHash(dbOrAbsPath: string): string | null {
 }
 
 function getLatestSyncedFileHash(dbFilePath: string): string | null {
+  const state = statements.getSyncedFileStateStmt?.get(dbFilePath) as SyncedFileStateRow | undefined;
+  if (state && typeof state.file_state_hash === "string") return state.file_state_hash;
+
   const row = statements.getLatestChangeIntentForFileStmt?.get(dbFilePath) as MemoryItemRow | undefined;
   if (!row) return null;
   const meta = parseMetadataJson(row.metadata_json);
@@ -409,7 +412,10 @@ function consumeProjectContextAdvisory(): ProjectContextAdvisory | null {
 }
 
 async function ensureInitializedForArgs(rawArgs: Record<string, unknown>): Promise<void> {
-  const fromToolArg = resolveRootFromToolArgOrThrow(rawArgs.project_root);
+  const fromToolArg = resolveRootFromToolArgOrThrow(rawArgs.project_root, {
+    preferred_root: initialized ? projectRoot : undefined,
+    mode: rawArgs.project_root_mode === "exact" ? "exact" : "canonical",
+  });
   if (fromToolArg) {
     await switchProjectRootIfNeeded(fromToolArg);
     return;

@@ -3,6 +3,27 @@ import path from "node:path";
 
 export async function runQualityGuardCases(ctx) {
   const { client, useToolProjectRoot, toolProjectRoot, readText } = ctx;
+  const expectToolError = async (request, expectedMessage) => {
+    let result;
+    try {
+      result = await client.callTool(request);
+    } catch (err) {
+      throw new Error(`unexpected MCP transport/server failure while expecting a business rejection: ${String(err)}`);
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(readText(result));
+    } catch (err) {
+      throw new Error(`expected structured JSON business rejection: ${String(err)}`);
+    }
+    if (result?.isError !== true && parsed?.ok !== false) {
+      throw new Error(`expected tool rejection, got: ${readText(result)}`);
+    }
+    if (!String(parsed?.error ?? "").includes(expectedMessage)) {
+      throw new Error(`expected error containing ${JSON.stringify(expectedMessage)}, got: ${readText(result)}`);
+    }
+    return parsed;
+  };
   const pairedFlowPath = path.join(toolProjectRoot, "src", "paired-flow", "entry.ts");
   fs.mkdirSync(path.dirname(pairedFlowPath), { recursive: true });
   fs.writeFileSync(
@@ -176,8 +197,8 @@ export async function runQualityGuardCases(ctx) {
     if (parsed?.quality_signals?.does_not_change_ok_or_safe_to_edit !== true) {
       throw new Error("expected fix_pattern quality signal not to change ok/safe_to_edit");
     }
-    if (parsed?.safe_to_edit !== false || parsed?.ok !== false) {
-      throw new Error("expected advisory fix_pattern not to override existing preflight scope warnings");
+    if (parsed?.safe_to_edit !== true || parsed?.ok !== true) {
+      throw new Error("expected advisory fix_pattern and scope warnings not to block editing");
     }
   } catch (err) {
     console.error("\n[smoke] preflight fix_pattern recall check failed:", err);
@@ -274,8 +295,8 @@ export async function runQualityGuardCases(ctx) {
   try {
     const parsed = JSON.parse(preflightBigText);
     const warnings = parsed?.development_warnings;
-    if (parsed?.safe_to_edit !== false || parsed?.ok !== false) {
-      throw new Error("expected preflight_change_scope to block editing a very large file");
+    if (parsed?.safe_to_edit !== true || parsed?.ok !== true) {
+      throw new Error("expected very_large_file to remain advisory");
     }
     if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "very_large_file")) {
       throw new Error("expected preflight_change_scope to include very_large_file development warning");
@@ -385,21 +406,42 @@ export async function runQualityGuardCases(ctx) {
   const hugeFilePath = path.join(toolProjectRoot, "src", "huge_controller.ts");
   fs.writeFileSync(
     hugeFilePath,
-    Array.from({ length: 3200 }, (_, i) => {
-      if (i % 400 === 0) return `export function loadConfigSmoke${i}() { return ${i}; }`;
-      if (i % 400 === 100) return `export function syncApiSmoke${i}() { return ${i}; }`;
-      if (i % 400 === 200) return `export function renderViewSmoke${i}() { return ${i}; }`;
-      if (i % 400 === 300) return `export function normalizePathSmoke${i}() { return ${i}; }`;
-      return `export const hugeSmokeValue${i} = ${i};`;
-    }).join("\n") + "\n",
+    Array.from({ length: 25 }, (_, domain) => [
+      `export class Domain${domain}Controller {`,
+      ...Array.from({ length: 120 }, (_, method) => `  method${method}() { return ${domain + method}; }`),
+      "}",
+    ].join("\n")).join("\n") + "\n",
+  );
+  const generatedHugePath = path.join(toolProjectRoot, "src", "generated_client.ts");
+  fs.writeFileSync(
+    generatedHugePath,
+    "// @generated - do not edit\n" + Array.from({ length: 3005 }, (_, index) => `export const generated${index} = ${index};`).join("\n") + "\n",
+    "utf8",
   );
   await new Promise((r) => setTimeout(r, 1000));
+
+  const generatedPreflight = await client.callTool({
+    name: "preflight_change_scope",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      intent: "smoke: generated source must not enter mechanical modularization",
+      files: ["src/generated_client.ts"],
+      format: "json",
+    },
+  });
+  const generatedPreflightParsed = JSON.parse(readText(generatedPreflight));
+  if (
+    generatedPreflightParsed?.safe_to_edit !== false ||
+    !generatedPreflightParsed?.development_warnings?.some((warning) => warning?.code === "generated_source_not_editable")
+  ) {
+    throw new Error("expected generated source to point to regeneration instead of huge-file modularization");
+  }
 
   const preflightHuge = await client.callTool({
     name: "preflight_change_scope",
     arguments: {
       ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
-      intent: "smoke: normal feature should be blocked on huge files",
+      intent: "smoke: normal feature should require huge-file modularization",
       files: ["src/huge_controller.ts"],
       format: "json",
     },
@@ -411,7 +453,10 @@ export async function runQualityGuardCases(ctx) {
     const parsed = JSON.parse(preflightHugeText);
     const warnings = parsed?.development_warnings;
     if (parsed?.safe_to_edit !== false || parsed?.ok !== false) {
-      throw new Error("expected normal preflight to block editing a huge file");
+      throw new Error("expected normal feature editing of a huge file to be blocked");
+    }
+    if (parsed?.advisory_only !== false || parsed?.workflow_gate?.active !== true || parsed?.workflow_gate?.required_action !== "mechanical_modularization") {
+      throw new Error("expected huge-file feature editing to expose an active mechanical-modularization workflow gate");
     }
     if (parsed?.required_action !== "mechanical_modularization") {
       throw new Error("expected required_action=mechanical_modularization for huge files");
@@ -423,6 +468,59 @@ export async function runQualityGuardCases(ctx) {
     console.error("\n[smoke] huge-file normal preflight check failed:", err);
     process.exitCode = 1;
     return;
+  }
+
+  const minimalHugeBugfix = await client.callTool({
+    name: "preflight_change_scope",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      intent: "smoke: minimal bugfix without adding responsibilities",
+      files: ["src/huge_controller.ts"],
+      change_mode: "bugfix",
+      adds_responsibility: false,
+      defer_split_reason: "Smoke verifies the bounded minimal-bugfix channel before the planned split.",
+      format: "json",
+    },
+  });
+  const minimalHugeBugfixParsed = JSON.parse(readText(minimalHugeBugfix));
+  if (minimalHugeBugfixParsed?.safe_to_edit !== true || minimalHugeBugfixParsed?.workflow_gate?.minimal_bugfix_allowed !== true) {
+    throw new Error("expected a no-new-responsibility bugfix with a durable deferral reason to avoid expanding into a split plan");
+  }
+  const smallDeferralPath = path.join(toolProjectRoot, "src", "small_deferral.ts");
+  fs.writeFileSync(smallDeferralPath, "export const smallDeferral = true;\n", "utf8");
+  await expectToolError({
+    name: "sync_change_intent",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      intent: "Smoke rejects a deferral outside the synced file set.",
+      files: ["src/huge_controller.ts"],
+      large_file_split_deferrals: [{ file: "src/small_deferral.ts", reason: "invalid unrelated deferral" }],
+    },
+  }, "must belong to this sync_change_intent file set");
+  await expectToolError({
+    name: "sync_change_intent",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      intent: "Smoke rejects a deferral for a small file without a split plan.",
+      files: ["src/small_deferral.ts"],
+      large_file_split_deferrals: [{ file: "src/small_deferral.ts", reason: "invalid small-file deferral" }],
+    },
+  }, "requires a currently huge file or an unfinished split plan");
+  const minimalBugfixSync = await client.callTool({
+    name: "sync_change_intent",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      intent: "Smoke records a minimal huge-file bugfix deferral without adding responsibilities.",
+      files: ["src/huge_controller.ts"],
+      large_file_split_deferrals: [{
+        file: "src/huge_controller.ts",
+        reason: "Smoke keeps the mechanical split as durable follow-up work.",
+      }],
+    },
+  });
+  const minimalBugfixSyncParsed = JSON.parse(readText(minimalBugfixSync));
+  if (minimalBugfixSyncParsed?.large_file_split_deferrals?.[0]?.file !== "src/huge_controller.ts") {
+    throw new Error("expected sync_change_intent to persist the minimal bugfix split deferral");
   }
 
   const preflightHugeSplit = await client.callTool({
@@ -440,12 +538,8 @@ export async function runQualityGuardCases(ctx) {
   console.log(preflightHugeSplitText);
   try {
     const parsed = JSON.parse(preflightHugeSplitText);
-    const warnings = parsed?.development_warnings;
-    if (parsed?.safe_to_edit !== true || parsed?.ok !== true) {
-      throw new Error("expected mechanical_modularization preflight to allow the split");
-    }
-    if (!Array.isArray(warnings) || !warnings.some((w) => w?.code === "huge_file_modularization_required")) {
-      throw new Error("expected huge warning to remain visible during split mode");
+    if (parsed?.safe_to_edit !== false || parsed?.workflow_gate?.required_action !== "valid_split_plan") {
+      throw new Error("expected mechanical_modularization without split_plan_id to remain blocked");
     }
   } catch (err) {
     console.error("\n[smoke] huge-file split-mode preflight check failed:", err);
@@ -459,6 +553,7 @@ export async function runQualityGuardCases(ctx) {
       ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
       file: "src/huge_controller.ts",
       intent: "smoke: mechanically split huge controller",
+      max_modules: 30,
       format: "json",
     },
   });
@@ -466,9 +561,28 @@ export async function runQualityGuardCases(ctx) {
   const hugeSplitPlanText = readText(hugeSplitPlan);
   console.log(hugeSplitPlanText);
   let splitModules = [];
+  let splitPlanId = 0;
+  let splitRequirementId = 0;
+  let deferredPlanId = 0;
   try {
     const parsed = JSON.parse(hugeSplitPlanText);
     if (parsed?.ok !== true) throw new Error("expected plan_large_file_split ok=true");
+    splitPlanId = Number(parsed?.plan_id ?? 0);
+    splitRequirementId = Number(parsed?.requirement?.id ?? 0);
+    if (
+      splitPlanId <= 0 ||
+      parsed?.coverage?.complete !== true ||
+      parsed?.analysis_mode !== "heuristic_stream" ||
+      parsed?.confidence !== "low" ||
+      parsed?.module_constraints?.satisfied !== true ||
+      parsed?.modules?.some(
+        (module) =>
+          module?.declaration_count > parsed.module_constraints.max_declarations_per_module ||
+          module?.estimated_lines >= parsed.module_constraints.max_estimated_lines_per_module,
+      )
+    ) {
+      throw new Error("expected a persisted, complete, streaming split plan");
+    }
     if (parsed?.required_action !== "mechanical_modularization") {
       throw new Error("expected split plan required_action=mechanical_modularization");
     }
@@ -495,15 +609,236 @@ export async function runQualityGuardCases(ctx) {
     return;
   }
 
+  const reusedHugeSplitPlan = await client.callTool({
+    name: "plan_large_file_split",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      file: "src/huge_controller.ts",
+      intent: "smoke: retry the same plan without duplicating memory",
+      max_modules: 30,
+      format: "json",
+    },
+  });
+  const reusedHugeSplitPlanParsed = JSON.parse(readText(reusedHugeSplitPlan));
+  if (reusedHugeSplitPlanParsed?.plan_id !== splitPlanId || reusedHugeSplitPlanParsed?.reused !== true) {
+    throw new Error("expected an unchanged source state to reuse the persisted split plan");
+  }
+  const splitPlanMemory = await client.callTool({
+    name: "read_memory_item",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      id: splitPlanId,
+      limit: 1000,
+    },
+  });
+  const splitPlanMemoryParsed = JSON.parse(readText(splitPlanMemory));
+  if (String(splitPlanMemoryParsed?.item?.metadata_json ?? "").length > 5000) {
+    throw new Error("expected large-file split metadata to remain compact");
+  }
+  const fakeRelocationPath = path.join(toolProjectRoot, "src", "fake_relocation.ts");
+  fs.writeFileSync(
+    fakeRelocationPath,
+    Array.from({ length: 3005 }, (_, index) => `export function billingOperation${index}() { return ${index}; }`).join("\n") + "\n",
+    "utf8",
+  );
+  const fakeRelocationPlan = await client.callTool({
+    name: "plan_large_file_split",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      file: "src/fake_relocation.ts",
+      intent: "Smoke must not move one god file into another god file.",
+      max_modules: 30,
+      format: "json",
+    },
+  });
+  const fakeRelocationPlanParsed = JSON.parse(readText(fakeRelocationPlan));
+  if (
+    fakeRelocationPlanParsed?.ok !== false ||
+    fakeRelocationPlanParsed?.plan_status !== "needs_refinement" ||
+    !fakeRelocationPlanParsed?.module_constraints?.oversized_modules?.length
+  ) {
+    throw new Error("expected a single oversized target module to keep the split plan in needs_refinement");
+  }
+  const fakeRelocationPlanId = Number(fakeRelocationPlanParsed?.plan_id ?? 0);
+  const adjustedFakePlan = await client.callTool({
+    name: "plan_large_file_split",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      file: "src/fake_relocation.ts",
+      max_modules: 29,
+      max_declarations_per_module: 1000,
+      max_lines_per_module: 100000,
+      format: "json",
+    },
+  });
+  const adjustedFakePlanParsed = JSON.parse(readText(adjustedFakePlan));
+  if (
+    Number(adjustedFakePlanParsed?.plan_id ?? 0) === fakeRelocationPlanId ||
+    adjustedFakePlanParsed?.module_constraints?.max_declarations_per_module !== 200 ||
+    adjustedFakePlanParsed?.module_constraints?.max_estimated_lines_per_module !== 1200
+  ) {
+    throw new Error("expected planning parameter changes to avoid stale reuse while caller limits remain capped at safe values");
+  }
+
+  await expectToolError({
+    name: "plan_large_file_split",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      file: "src/fake_relocation.ts",
+      max_modules: 30,
+      module_overrides: [{
+        module: "invalid_target",
+        target_path: "src/fake_relocation/invalid_target.txt",
+        line_ranges: [{ start: 1, end: 3005 }],
+      }],
+      format: "json",
+    },
+  }, "Invalid module override target_path");
+
+  const incompleteOverridePlan = await client.callTool({
+    name: "plan_large_file_split",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      file: "src/fake_relocation.ts",
+      max_modules: 30,
+      module_overrides: [{
+        module: "billing_subset",
+        target_path: "src/fake_relocation/billing_subset.ts",
+        line_ranges: [{ start: 1, end: 190 }],
+      }],
+      format: "json",
+    },
+  });
+  const incompleteOverridePlanParsed = JSON.parse(readText(incompleteOverridePlan));
+  if (
+    incompleteOverridePlanParsed?.plan_status !== "needs_refinement" ||
+    incompleteOverridePlanParsed?.coverage?.assigned_declarations !== 190 ||
+    incompleteOverridePlanParsed?.coverage?.detected_declarations !== 3005 ||
+    incompleteOverridePlanParsed?.coverage?.complete !== false
+  ) {
+    throw new Error("expected incomplete overrides to report the actual uniquely assigned declaration count");
+  }
+
+  const refinedOverrides = Array.from({ length: Math.ceil(3005 / 190) }, (_, index) => {
+    const start = index * 190 + 1;
+    const end = Math.min(3005, (index + 1) * 190);
+    return {
+      module: `billing_group_${index + 1}`,
+      target_path: `src/fake_relocation/billing_group_${index + 1}.ts`,
+      line_ranges: [{ start, end }],
+    };
+  });
+  const refinedFakePlan = await client.callTool({
+    name: "plan_large_file_split",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      file: "src/fake_relocation.ts",
+      max_modules: 30,
+      module_overrides: refinedOverrides,
+      format: "json",
+    },
+  });
+  const refinedFakePlanParsed = JSON.parse(readText(refinedFakePlan));
+  deferredPlanId = Number(refinedFakePlanParsed?.plan_id ?? 0);
+  if (
+    refinedFakePlanParsed?.ok !== true ||
+    refinedFakePlanParsed?.plan_status !== "planned" ||
+    refinedFakePlanParsed?.coverage?.complete !== true ||
+    deferredPlanId <= 0
+  ) {
+    throw new Error("expected module_overrides to recover needs_refinement into a complete planned split");
+  }
+  const supersededFakePlan = await client.callTool({
+    name: "read_memory_item",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      id: Number(adjustedFakePlanParsed?.plan_id ?? 0),
+      limit: 1000,
+    },
+  });
+  const supersededFakePlanParsed = JSON.parse(readText(supersededFakePlan));
+  if (JSON.parse(supersededFakePlanParsed?.item?.metadata_json ?? "{}")?.status !== "superseded") {
+    throw new Error("expected the refined plan to supersede the previous needs_refinement plan");
+  }
+
+  const originalFakeContent = fs.readFileSync(fakeRelocationPath, "utf8");
+  fs.writeFileSync(fakeRelocationPath, originalFakeContent.replace("billingOperation0", "cillingOperation0"), "utf8");
+  const changedContentPlan = await client.callTool({
+    name: "plan_large_file_split",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      file: "src/fake_relocation.ts",
+      max_modules: 30,
+      module_overrides: refinedOverrides,
+      format: "json",
+    },
+  });
+  const changedContentPlanParsed = JSON.parse(readText(changedContentPlan));
+  if (
+    Number(changedContentPlanParsed?.plan_id ?? 0) === deferredPlanId ||
+    changedContentPlanParsed?.source_content_hash === refinedFakePlanParsed?.source_content_hash ||
+    fs.statSync(fakeRelocationPath).size !== Buffer.byteLength(originalFakeContent)
+  ) {
+    throw new Error("expected same-size source content changes to invalidate a persisted split plan by SHA-256");
+  }
+  deferredPlanId = Number(changedContentPlanParsed?.plan_id ?? 0);
+
+  const splitPlanBootstrap = await client.callTool({
+    name: "bootstrap_context",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      query: "src/huge_controller.ts mechanical modularization",
+      format: "json",
+    },
+  });
+  const splitPlanBootstrapParsed = JSON.parse(readText(splitPlanBootstrap));
+  if (!splitPlanBootstrapParsed?.current_context?.some((item) => item?.id === splitPlanId)) {
+    throw new Error("expected focused bootstrap to restore the active persisted large-file split plan");
+  }
+
+  const preflightHugeWithPlan = await client.callTool({
+    name: "preflight_change_scope",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      intent: "smoke: mechanically split huge file with persisted evidence",
+      files: ["src/huge_controller.ts"],
+      change_mode: "mechanical_modularization",
+      split_plan_id: splitPlanId,
+      format: "json",
+    },
+  });
+  const preflightHugeWithPlanParsed = JSON.parse(readText(preflightHugeWithPlan));
+  if (preflightHugeWithPlanParsed?.safe_to_edit !== true || preflightHugeWithPlanParsed?.split_plan_validation?.valid !== true) {
+    throw new Error("expected a matching persisted split plan to satisfy the huge-file workflow gate");
+  }
+
+  const minimalHugeBugfixWithPlan = await client.callTool({
+    name: "preflight_change_scope",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      intent: "smoke: minimal bugfix with persisted split deferral",
+      files: ["src/huge_controller.ts"],
+      change_mode: "bugfix",
+      split_plan_id: splitPlanId,
+      adds_responsibility: false,
+      defer_split_reason: "Smoke verifies that the persisted split remains scheduled after the minimal bugfix.",
+      format: "json",
+    },
+  });
+  const minimalHugeBugfixWithPlanParsed = JSON.parse(readText(minimalHugeBugfixWithPlan));
+  if (minimalHugeBugfixWithPlanParsed?.safe_to_edit !== true || minimalHugeBugfixWithPlanParsed?.workflow_gate?.minimal_bugfix_allowed !== true) {
+    throw new Error("expected a plan-backed no-new-responsibility bugfix to use the bounded channel");
+  }
+
   const recordOrdinalSplit = await client.callTool({
     name: "record_large_file_split",
     arguments: {
       ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      plan_id: splitPlanId,
       file: "src/huge_controller.ts",
       status: "planned",
       summary: "Smoke should reject ordinal-prefixed module paths.",
       modules: ["src/huge_controller/1_config.ts"],
-      remaining_lines: 3200,
     },
   });
   console.log("\n--- record_large_file_split (ordinal prefix rejected) ---\n");
@@ -520,15 +855,30 @@ export async function runQualityGuardCases(ctx) {
     return;
   }
 
+  const missingInProgressModule = await client.callTool({
+    name: "record_large_file_split",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      plan_id: splitPlanId,
+      file: "src/huge_controller.ts",
+      status: "in_progress",
+      summary: "Smoke rejects nonexistent in-progress module evidence.",
+      modules: [splitModules[0].target_path],
+    },
+  });
+  const missingInProgressModuleParsed = JSON.parse(readText(missingInProgressModule));
+  if (missingInProgressModuleParsed?.ok !== false || !String(missingInProgressModuleParsed?.error ?? "").includes("must exist")) {
+    throw new Error("expected in-progress module paths to exist before recording them");
+  }
+
   const recordHugeSplit = await client.callTool({
     name: "record_large_file_split",
     arguments: {
       ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      plan_id: splitPlanId,
       file: "src/huge_controller.ts",
-      status: "planned",
-      summary: "Smoke planned mechanical split into real modules.",
-      modules: splitModules.slice(0, 4).map((m) => m.target_path),
-      remaining_lines: 3200,
+      status: "in_progress",
+      summary: "Smoke started the planned mechanical split.",
     },
   });
   console.log("\n--- record_large_file_split ---\n");
@@ -543,6 +893,133 @@ export async function runQualityGuardCases(ctx) {
     console.error("\n[smoke] record_large_file_split check failed:", err);
     process.exitCode = 1;
     return;
+  }
+  await expectToolError({
+    name: "plan_large_file_split",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      file: "src/huge_controller.ts",
+      max_modules: 29,
+      format: "json",
+    },
+  }, "already owns this requirement/file");
+
+  const regressedHugeSplit = await client.callTool({
+    name: "record_large_file_split",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      plan_id: splitPlanId,
+      file: "src/huge_controller.ts",
+      status: "planned",
+      summary: "Smoke must reject state regression.",
+    },
+  });
+  const regressedHugeSplitParsed = JSON.parse(readText(regressedHugeSplit));
+  if (regressedHugeSplitParsed?.ok !== false || !String(regressedHugeSplitParsed?.error ?? "").includes("Invalid split plan status transition")) {
+    throw new Error("expected in_progress -> planned status regression to be rejected");
+  }
+
+  for (const module of splitModules) {
+    const modulePath = path.join(toolProjectRoot, module.target_path);
+    fs.mkdirSync(path.dirname(modulePath), { recursive: true });
+    fs.writeFileSync(modulePath, `export const splitSmoke = ${JSON.stringify(module.module)};\n`, "utf8");
+  }
+  fs.writeFileSync(
+    hugeFilePath,
+    Array.from({ length: 20 }, (_, index) => `export const orchestration${index} = ${index};`).join("\n") + "\n",
+    "utf8",
+  );
+  const resolvedHugeSplit = await client.callTool({
+    name: "record_large_file_split",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      plan_id: splitPlanId,
+      file: "src/huge_controller.ts",
+      status: "resolved",
+      summary: "Smoke completed the persisted mechanical split.",
+      modules: splitModules.map((module) => module.target_path),
+      verification: ["formatter passed", "build passed", "relevant tests passed"],
+      verification_gaps: [],
+    },
+  });
+  const resolvedHugeSplitParsed = JSON.parse(readText(resolvedHugeSplit));
+  if (resolvedHugeSplitParsed?.ok !== true || resolvedHugeSplitParsed?.plan?.id !== splitPlanId || resolvedHugeSplitParsed?.status !== "resolved") {
+    throw new Error("expected resolved split verification to update the same persisted plan entity");
+  }
+
+  await client.callTool({
+    name: "complete_requirement",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      req_id: splitRequirementId,
+    },
+  });
+  const deferredPlanMemory = await client.callTool({
+    name: "read_memory_item",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      id: deferredPlanId,
+      limit: 1000,
+    },
+  });
+  const deferredPlanMemoryParsed = JSON.parse(readText(deferredPlanMemory));
+  const deferredPlanMetadata = JSON.parse(deferredPlanMemoryParsed?.item?.metadata_json ?? "{}");
+  if (deferredPlanMetadata?.status !== "deferred" || !deferredPlanMetadata?.deferred_reason) {
+    throw new Error("expected requirement completion to mark unfinished split plans deferred");
+  }
+  const defaultDeferredSearch = await client.callTool({
+    name: "semantic_search",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      query: "fake_relocation billing_group",
+      top_k: 20,
+      format: "json",
+    },
+  });
+  const defaultDeferredSearchParsed = JSON.parse(readText(defaultDeferredSearch));
+  if (defaultDeferredSearchParsed?.matches?.some((match) => match?.item?.id === deferredPlanId)) {
+    throw new Error("expected deferred split plans to stay out of default semantic recall");
+  }
+  const explicitDeferredSearch = await client.callTool({
+    name: "semantic_search",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      query: "fake_relocation billing_group",
+      kinds: ["large_file_split_plan"],
+      top_k: 20,
+      format: "json",
+    },
+  });
+  const explicitDeferredSearchParsed = JSON.parse(readText(explicitDeferredSearch));
+  if (!explicitDeferredSearchParsed?.matches?.some((match) => match?.item?.id === deferredPlanId)) {
+    throw new Error("expected explicitly requested deferred split plans to remain searchable");
+  }
+  const defaultDeferredBootstrap = await client.callTool({
+    name: "bootstrap_context",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      query: "fake_relocation billing_group",
+      top_k: 20,
+      format: "json",
+    },
+  });
+  const defaultDeferredBootstrapParsed = JSON.parse(readText(defaultDeferredBootstrap));
+  if (defaultDeferredBootstrapParsed?.semantic?.matches?.some((match) => match?.item?.id === deferredPlanId)) {
+    throw new Error("expected deferred split plans to stay out of default bootstrap recall");
+  }
+  const explicitDeferredBootstrap = await client.callTool({
+    name: "bootstrap_context",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      query: "fake_relocation billing_group",
+      kinds: ["large_file_split_plan"],
+      top_k: 20,
+      format: "json",
+    },
+  });
+  const explicitDeferredBootstrapParsed = JSON.parse(readText(explicitDeferredBootstrap));
+  if (!explicitDeferredBootstrapParsed?.semantic?.matches?.some((match) => match?.item?.id === deferredPlanId)) {
+    throw new Error("expected explicitly requested deferred split plans to remain available to bootstrap recall");
   }
 
 

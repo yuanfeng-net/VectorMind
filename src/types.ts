@@ -3,15 +3,25 @@ export type RequirementRow = {
   title: string;
   status: string;
   context_data: string | null;
+  goal_key?: string | null;
   created_at: string;
 };
 
 export type ChangeLogRow = {
   id: number;
   req_id: number;
-  file_path: string;
+  file_path: string | null;
   intent_summary: string;
+  files_json?: string | null;
+  file_count?: number | null;
   timestamp: string;
+};
+
+export type SyncedFileStateRow = {
+  file_path: string;
+  file_state_hash: string | null;
+  source_change_id: number | null;
+  updated_at: string;
 };
 
 export type SymbolRow = {
