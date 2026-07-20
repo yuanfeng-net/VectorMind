@@ -25,6 +25,17 @@ import { purgeHiddenMemory } from "./purge.js";
 import { checkpointWal, getDbSize, kvGet, kvSet, optimizeFts } from "./sqlite.js";
 import type { MaintenanceResult } from "./types.js";
 
+let autoMaintenanceSuppressionDepth = 0;
+
+export async function withAutoMaintenanceSuppressed<T>(task: () => Promise<T>): Promise<T> {
+  autoMaintenanceSuppressionDepth += 1;
+  try {
+    return await task();
+  } finally {
+    autoMaintenanceSuppressionDepth -= 1;
+  }
+}
+
 export function runMemoryMaintenance(
   args: MaintainMemoryArgs,
   trigger: "manual" | "auto" = "manual",
@@ -165,7 +176,7 @@ export function runMemoryMaintenance(
 }
 
 export function runAutoMaintenanceIfDue(): void {
-  if (!MAINTENANCE_AUTO_ENABLED || !hasDb()) return;
+  if (autoMaintenanceSuppressionDepth > 0 || !MAINTENANCE_AUTO_ENABLED || !hasDb()) return;
   const lastRaw = kvGet("maintenance.last_auto_at");
   const last = lastRaw ? Date.parse(lastRaw) : 0;
   const dueMs = MAINTENANCE_INTERVAL_HOURS * 3_600_000;

@@ -3,30 +3,43 @@
   "version": "1.1.0",
   "description": "VectorMind MCP: requirement-driven context memory linking file changes to developer intent.",
   "type": "module",
+  "engines": {
+    "node": ">=20.19.0"
+  },
   "bin": {
     "vector-mind": "./dist/index.js",
+    "vector-mind-admin": "./admin-panel/server/index.mjs",
     "rtk": "./dist/rtk-shim.js"
   },
   "files": [
     "dist",
     "docs",
-    "skills"
+    "skills",
+    "admin-panel/server",
+    "admin-panel/dist/client",
+    "admin-panel/package.json",
+    "admin-panel/README.md"
   ],
   "scripts": {
-    "admin": "npm --prefix admin-panel run dev",
+    "admin": "npm run admin:start",
+    "admin:dev": "npm run build && npm --prefix admin-panel run dev",
     "admin:build": "npm --prefix admin-panel run build",
     "admin:start": "npm --prefix admin-panel run start",
     "build": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\" && tsc && node --input-type=module -e \"import { chmodSync } from 'node:fs'; for (const f of ['dist/index.js','dist/rtk-shim.js']) try { chmodSync(f, 0o755); } catch {}\"",
-    "smoke": "node scripts/smoke.mjs",
-    "prepublishOnly": "npm run build"
+    "smoke": "npm run build && npm run smoke:run",
+    "smoke:run": "node scripts/smoke/security-regression-cases.mjs && node scripts/smoke/checkpoint-regression-cases.mjs && node scripts/smoke/operation-regression-cases.mjs && node scripts/smoke.mjs",
+    "verify": "npm run build && npm --prefix admin-panel run check && npm run smoke:run",
+    "prepublishOnly": "npm run verify"
   },
   "publishConfig": {
     "access": "public"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.25.1",
+    "@modelcontextprotocol/sdk": "1.29.0",
     "better-sqlite3": "12.5.0",
     "chokidar": "5.0.0",
+    "express": "5.2.1",
+    "safe-regex2": "5.1.1",
     "zod": "4.2.1"
   },
   "devDependencies": {

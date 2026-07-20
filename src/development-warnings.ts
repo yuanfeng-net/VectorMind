@@ -616,6 +616,15 @@ export function mergeScopeContracts(
   };
 }
 
+export function scopeContractHasRules(contract: RequirementScopeContract | null | undefined): boolean {
+  return !!contract && (
+    contract.allow_terms.length > 0 ||
+    contract.deny_terms.length > 0 ||
+    contract.allowed_paths.length > 0 ||
+    contract.denied_paths.length > 0
+  );
+}
+
 export function buildScopeDriftWarnings(args: {
   requirement?: RequirementRow;
   contract?: RequirementScopeContract | null;
@@ -625,12 +634,7 @@ export function buildScopeDriftWarnings(args: {
 }): DevelopmentWarning[] {
   const requirementContract = args.requirement ? getRequirementScopeContract(args.requirement.id) : null;
   const contract = mergeScopeContracts(requirementContract, args.contract);
-  const hasScopeRules = !!contract && (
-    contract.allow_terms.length > 0 ||
-    contract.deny_terms.length > 0 ||
-    contract.allowed_paths.length > 0 ||
-    contract.denied_paths.length > 0
-  );
+  const hasScopeRules = scopeContractHasRules(contract);
 
   const warnings: DevelopmentWarning[] = [];
   if (!contract || !hasScopeRules) {

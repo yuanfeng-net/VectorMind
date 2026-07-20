@@ -3,6 +3,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 
 import Database from "better-sqlite3";
+import safeRegex from "safe-regex2";
 
 import {
   RIPGREP_MAX_BUFFER_BYTES,
@@ -485,6 +486,10 @@ export function runIndexedGrepSearch(opts: {
     throw new Error(
       "Regex has no sufficiently long literal anchor for indexed narrowing. Provide literal_hint (>= 3 chars) or narrow with include_paths.",
     );
+  }
+
+  if (opts.mode === "regex" && !safeRegex(opts.query)) {
+    throw new Error("Unsafe regex rejected for indexed fallback because it may cause catastrophic backtracking.");
   }
 
   let re: RegExp;

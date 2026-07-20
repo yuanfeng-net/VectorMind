@@ -74,11 +74,29 @@ function isProbablyGitRepository(): boolean {
 
 function normalizeGitStatusPath(raw: string): string {
   const first = raw.split("\0")[0] ?? "";
-  return first.trim().replace(/\\/g, "/").replace(/^"(.*)"$/, "$1");
+  return first.replace(/\\/g, "/");
 }
 
-function collectGitPendingChanges(limit: number): PendingChangeRow[] {
-  if (limit <= 0 || !isProbablyGitRepository()) return [];
+export function parseGitStatusPorcelainZ(stdout: string): Array<{ status: string; filePath: string }> {
+  const parts = stdout.split("\0").filter((part) => part.length > 0);
+  const parsed: Array<{ status: string; filePath: string }> = [];
+  for (let i = 0; i < parts.length; i += 1) {
+    const record = parts[i] ?? "";
+    if (record.length < 3) continue;
+    const status = record.slice(0, 2);
+    const filePath = normalizeGitStatusPath(record.slice(3));
+    if (status.startsWith("R") || status.startsWith("C")) {
+      // Porcelain v1 -z reverses the human-readable order: the first path is
+      // the destination and the following NUL field is the source.
+      i += 1;
+    }
+    if (filePath) parsed.push({ status, filePath });
+  }
+  return parsed;
+}
+
+function collectGitPendingChanges(): PendingChangeRow[] {
+  if (!isProbablyGitRepository()) return [];
   const git = spawnSync("git", ["status", "--porcelain=v1", "-z", "--untracked-files=normal"], {
     cwd: getProjectRoot(),
     encoding: "utf8",
@@ -88,18 +106,8 @@ function collectGitPendingChanges(limit: number): PendingChangeRow[] {
   });
   if (git.error || git.status !== 0 || !git.stdout) return [];
 
-  const parts = git.stdout.split("\0").filter(Boolean);
   const rows: PendingChangeRow[] = [];
-  for (let i = 0; i < parts.length && rows.length < limit; i++) {
-    const rec = parts[i] ?? "";
-    const status = rec.slice(0, 2);
-    let rawPath = rec.slice(3);
-    if (status.startsWith("R") || status.startsWith("C")) {
-      // Porcelain -z rename/copy records include the destination in the next NUL field.
-      rawPath = parts[i + 1] ?? rawPath;
-      i += 1;
-    }
-    const filePath = normalizeGitStatusPath(rawPath);
+  for (const { status, filePath } of parseGitStatusPorcelainZ(git.stdout)) {
     if (!filePath || filePath === ".vectormind" || filePath.startsWith(".vectormind/")) continue;
     if (shouldIgnoreDbFilePath(filePath)) continue;
     rows.push({
@@ -117,14 +125,14 @@ function collectGitPendingChanges(limit: number): PendingChangeRow[] {
 export function mergePendingWithGit(
   pending: PendingChangeRow[],
   opts: { offset: number; limit: number },
-): { total: number; page: PendingChangeRow[]; truncated: boolean } {
+): { total: number; page: PendingChangeRow[]; remaining: number; truncated: boolean } {
   const byPath = new Map<string, PendingChangeRow>();
   for (const p of pending) {
     if (shouldIgnoreDbFilePath(p.file_path)) continue;
     byPath.set(p.file_path, { ...p, source: p.source ?? "watcher" });
   }
 
-  const gitRows = collectGitPendingChanges(Math.max(500, opts.offset + opts.limit * 4));
+  const gitRows = collectGitPendingChanges();
   for (const g of gitRows) {
     if (shouldIgnoreDbFilePath(g.file_path)) continue;
     const latestSyncedHash = getLatestSyncedFileHash(g.file_path);
@@ -149,7 +157,8 @@ export function mergePendingWithGit(
     return a.file_path.localeCompare(b.file_path);
   });
   const page = all.slice(opts.offset, opts.offset + opts.limit);
-  return { total: all.length, page, truncated: all.length > opts.offset + opts.limit };
+  const remaining = Math.max(0, all.length - opts.offset - page.length);
+  return { total: all.length, page, remaining, truncated: remaining > 0 };
 }
 
 function pruneIgnoredPendingChanges(): void {

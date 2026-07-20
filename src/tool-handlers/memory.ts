@@ -16,9 +16,37 @@ import { compactBootstrapText, compactBrainDumpText, compactSemanticSearchText, 
 import { collectCurrentConstraintsForBootstrap } from "./operations.js";
 import {
   boundCompactContext,
+  detectOperationIntent,
   filterFocusedSemanticResult,
+  focusedTextIsRelevant,
+  isObviouslyCorruptedText,
   resolveBootstrapContextPolicy,
 } from "../context-governance.js";
+
+function focusedRequirementRelevanceScore(query: string, requirement: RequirementRow): number {
+  const normalize = (value: string | null | undefined) =>
+    (value ?? "").normalize("NFKC").toLocaleLowerCase().replace(/\s+/g, " ").trim();
+  const normalizedQuery = normalize(query);
+  const title = normalize(requirement.title);
+  const context = normalize(requirement.context_data);
+  const goalKey = normalize(requirement.goal_key);
+  const combined = `${title}\n${context}\n${goalKey}`;
+  if (normalizedQuery && combined.includes(normalizedQuery)) return 1_000_000;
+
+  const rawSegments = normalizedQuery.match(/[a-z0-9_./:@#-]+|\p{Script=Han}+/gu) ?? [];
+  const segments = rawSegments.flatMap((segment) => {
+    if (!/\p{Script=Han}/u.test(segment) || segment.length <= 2) return [segment];
+    return Array.from({ length: segment.length - 1 }, (_, index) => segment.slice(index, index + 2));
+  });
+  let score = 0;
+  for (const segment of new Set(segments.filter((segment) => segment.length >= 2))) {
+    if (title.includes(segment)) score += segment.length * 4;
+    if (goalKey.includes(segment)) score += segment.length * 3;
+    if (context.includes(segment)) score += segment.length;
+  }
+  return score;
+}
+
 function getVisibleRecentNotePreviews(
   db: Database.Database,
   limit: number,
@@ -88,6 +116,7 @@ export async function handleBootstrapContext(
   const watcherReady = context.isWatcherReady();
   const {
     getActiveRequirementStmt,
+    listActiveRequirementsStmt,
     listPendingChangesStmt,
     getProjectSummaryStmt,
     listRecentRequirementsStmt,
@@ -97,6 +126,7 @@ export async function handleBootstrapContext(
   const args = BootstrapContextArgsSchema.parse(rawArgs);
   const contextPolicy = resolveBootstrapContextPolicy(rawArgs, args);
   flushPendingChangeBuffer();
+  const q = args.query?.trim() ?? "";
 
   const previewChars = args.preview_chars;
   const includeContent = args.include_content;
@@ -108,12 +138,35 @@ export async function handleBootstrapContext(
   const decisionsLimit = args.decisions_limit;
   const currentContextLimit = args.current_context_limit;
 
-  const activeRequirement = getActiveRequirementStmt.get() as RequirementRow | undefined;
+  const activeCandidateLimit = Math.max(50, requirementsLimit);
+  const activeRequirements = listActiveRequirementsStmt.all(activeCandidateLimit) as RequirementRow[];
+  const exactGoalRequirement = contextPolicy.mode === "focused" && q
+    ? context.getDb().prepare(
+        `SELECT id, title, status, context_data, goal_key, created_at
+           FROM requirements WHERE status = 'active' AND goal_key = ? LIMIT 1`,
+      ).get(q) as RequirementRow | undefined
+    : undefined;
+  const relevantActiveRequirements = contextPolicy.mode === "focused" && q
+    ? activeRequirements.filter((requirement) =>
+        focusedTextIsRelevant(q, requirement.title, requirement.context_data, requirement.goal_key),
+      ).sort((left, right) =>
+        focusedRequirementRelevanceScore(q, right) - focusedRequirementRelevanceScore(q, left) ||
+        right.id - left.id,
+      )
+    : activeRequirements.slice(0, requirementsLimit);
+  const focusedActiveRequirements = exactGoalRequirement
+    ? [exactGoalRequirement, ...relevantActiveRequirements.filter((requirement) => requirement.id !== exactGoalRequirement.id)]
+    : relevantActiveRequirements;
+  const activeRequirement = focusedActiveRequirements[0]
+    ?? activeRequirements[0]
+    ?? getActiveRequirementStmt.get() as RequirementRow | undefined;
   const recent = contextPolicy.include_recent
     ? listRecentRequirementsStmt.all(requirementsLimit) as RequirementRow[]
-    : activeRequirement
-      ? [activeRequirement]
-      : [];
+    : focusedActiveRequirements.length
+      ? focusedActiveRequirements.slice(0, requirementsLimit)
+      : activeRequirement
+        ? [activeRequirement]
+        : [];
   let items = recent.map((req) => {
     const changes = listChangeLogsForRequirementStmt.all(req.id, changesLimit) as ChangeLogRow[];
     return {
@@ -122,7 +175,7 @@ export async function handleBootstrapContext(
     };
   });
   const projectSummaryRow = getProjectSummaryStmt.get() as MemoryItemRow | undefined;
-  const project_summary = projectSummaryRow
+  let project_summary = projectSummaryRow
     ? toMemoryItemPreview(projectSummaryRow, includeContent, previewChars, contentMaxChars)
     : null;
   let recent_notes = contextPolicy.include_recent
@@ -133,7 +186,7 @@ export async function handleBootstrapContext(
     previewChars,
     contentMaxChars,
   );
-  const conventions = contextPolicy.include_recent
+  let conventions = contextPolicy.include_recent
     ? getConventionPreviews(conventionsLimit, previewChars, contentMaxChars)
     : [];
   let current_context = contextPolicy.include_recent
@@ -178,7 +231,7 @@ export async function handleBootstrapContext(
       : []),
   ];
 
-  const q = args.query?.trim() ?? "";
+  const operationIntent = detectOperationIntent(q);
   const semanticKinds = args.kinds?.length ? args.kinds : BOOTSTRAP_DEFAULT_CONTEXT_KINDS;
   const semanticRaw =
     q
@@ -209,6 +262,38 @@ export async function handleBootstrapContext(
   const semantic = contextPolicy.mode === "focused"
     ? filterFocusedSemanticResult(q, semanticWithoutInactiveDefaultPlans)
     : semanticWithoutInactiveDefaultPlans;
+  const semanticSearchStatus = !q
+    ? "skipped_no_query"
+    : semanticRaw == null
+      ? "timeout_or_unavailable"
+      : semantic?.matches?.length
+        ? "matches"
+        : "no_matches";
+
+  const previewIsClean = (item: { title?: string | null; preview?: string | null; file_path?: string | null }) =>
+    !isObviouslyCorruptedText(item.title, item.preview, item.file_path);
+  if (project_summary && !previewIsClean(project_summary)) project_summary = null;
+  items = items.filter((item) =>
+    !isObviouslyCorruptedText(item.requirement.title, item.requirement.context_preview),
+  );
+  recent_notes = recent_notes.filter(previewIsClean);
+  decisions = decisions.filter(previewIsClean);
+  conventions = conventions.filter(previewIsClean);
+  current_context = current_context.filter(previewIsClean);
+  current_constraints = current_constraints.filter((constraint) =>
+    !isObviouslyCorruptedText(constraint.title, constraint.preview),
+  );
+  if (contextPolicy.mode === "focused" && !contextPolicy.include_recent) {
+    decisions = decisions.filter((item) =>
+      focusedTextIsRelevant(q, item.title, item.preview, item.file_path),
+    );
+    current_context = current_context.filter((item) =>
+      focusedTextIsRelevant(q, item.title, item.preview, item.file_path),
+    );
+    current_constraints = current_constraints.filter((constraint) =>
+      focusedTextIsRelevant(q, constraint.title, constraint.preview),
+    );
+  }
 
   if (!contextPolicy.include_pending) {
     pending_changes = [];
@@ -229,6 +314,8 @@ export async function handleBootstrapContext(
     context_mode: contextPolicy.mode,
     pending_included: contextPolicy.include_pending,
     recent_included: contextPolicy.include_recent,
+    operation_intent_detected: operationIntent.detected,
+    operation_intent_terms: operationIntent.matched_terms,
   });
 
   const outputValue = {
@@ -239,6 +326,11 @@ export async function handleBootstrapContext(
     db_path: dbPath,
     watcher_enabled: watcherEnabled,
     watcher_ready: watcherReady,
+    index_state: {
+      watcher: !watcherEnabled ? "off" : watcherReady ? "ready" : "warming",
+      fts_available: context.isFtsAvailable(),
+      semantic_search: semanticSearchStatus,
+    },
     context_policy: {
       mode: contextPolicy.mode,
       include_pending: contextPolicy.include_pending,
@@ -246,6 +338,16 @@ export async function handleBootstrapContext(
       max_output_chars: contextPolicy.max_output_chars,
       compact_truncated: false,
       current_anchor_included: items.length > 0,
+    },
+    operation_preflight: {
+      detected: operationIntent.detected,
+      required_before_commands: operationIntent.detected,
+      tool: "preflight_operation_scope",
+      bootstrap_is_not_operation_preflight: true,
+      matched_terms: operationIntent.matched_terms,
+      action: operationIntent.detected
+        ? "Call preflight_operation_scope once immediately before the first concrete operation command. Do not treat bootstrap_context as satisfying operation preflight."
+        : null,
     },
     output: {
       format: args.format,

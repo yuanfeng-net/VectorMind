@@ -5,6 +5,7 @@ import { MAX_DECISIONS_LIMIT } from "./tool-schemas.js";
 import type { ChangeLogRow, MemoryItemRow, RequirementRow } from "./types.js";
 import { shouldIgnoreDbFilePath } from "./path-rules.js";
 import { safeJson, sliceTextForOutput } from "./tool-output.js";
+import { isObviouslyCorruptedText } from "./context-governance.js";
 
 export const MEMORY_ITEMS_FTS_TABLE = "memory_items_fts";
 
@@ -388,6 +389,7 @@ function filterAndRankSemanticRows(
     .map((r) => ({ row: r, score: adjustSemanticScore(r, scoreOf(r)) }))
     .filter(({ row }) => {
       if (isHiddenFromDefaultRecall(row)) return false;
+      if (isObviouslyCorruptedText(row.title, row.content, row.file_path)) return false;
       if (row.kind === "fix_pattern" && !explicitKinds.has("fix_pattern")) return false;
       if (
         row.kind === "large_file_split_plan" &&
@@ -821,6 +823,7 @@ function tokenSearchInternal(opts: SemanticSearchOpts): SemanticSearchResult {
       (
         CASE kind
           WHEN 'decision' THEN 9
+          WHEN 'memory_compaction' THEN 8
           WHEN 'convention' THEN 7
           WHEN 'project_summary' THEN 6
           WHEN 'note' THEN 5

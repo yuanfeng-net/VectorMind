@@ -289,6 +289,7 @@ function initWatcher(): void {
     ignored: (p) => shouldIgnorePath(p, projectRoot),
     // Avoid indexing the entire tree on startup; track changes after the server is running.
     ignoreInitial: true,
+    followSymlinks: false,
     persistent: true,
     awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
   });

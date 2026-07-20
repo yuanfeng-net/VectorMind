@@ -376,6 +376,16 @@ export async function runMemoryRecallCases(ctx) {
     if (parsed?.snapshot?.note && !String(parsed.snapshot.note).includes("does not mutate")) {
       throw new Error("expected checkpoint snapshot to be advisory-only context");
     }
+    if (!String(parsed?.snapshot?.summary ?? "").includes(token)) {
+      throw new Error("expected checkpoint summary to be stored in the snapshot");
+    }
+    if (JSON.stringify(parsed?.snapshot ?? {}).length > 26_000) {
+      throw new Error("expected checkpoint snapshot to stay within its shared output budget");
+    }
+    const checkpointMetadata = JSON.parse(parsed?.checkpoint?.metadata_json ?? "{}");
+    if (Object.prototype.hasOwnProperty.call(checkpointMetadata, "snapshot")) {
+      throw new Error("expected checkpoint preview metadata to omit the embedded snapshot");
+    }
   } catch (err) {
     console.error("\n[smoke] create_checkpoint check failed:", err);
     process.exitCode = 1;
@@ -417,11 +427,31 @@ export async function runMemoryRecallCases(ctx) {
     if (!JSON.stringify(parsed?.snapshot ?? {}).includes(token)) {
       throw new Error("expected restored checkpoint snapshot to include smoke token");
     }
+    if (JSON.stringify(parsed?.snapshot ?? {}).length > 26_000) {
+      throw new Error("expected restored checkpoint snapshot to stay within its shared output budget");
+    }
+    const restoredMetadata = JSON.parse(parsed?.checkpoint?.metadata_json ?? "{}");
+    if (Object.prototype.hasOwnProperty.call(restoredMetadata, "snapshot")) {
+      throw new Error("expected restored checkpoint preview metadata to omit the embedded snapshot");
+    }
   } catch (err) {
     console.error("\n[smoke] restore_checkpoint_context check failed:", err);
     process.exitCode = 1;
     return;
   }
+
+  const changedDecision = await client.callTool({
+    name: "upsert_decision",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      key: "smoke-current-rule",
+      title: "Smoke current rule",
+      content: `Current smoke rule changed after checkpoint while preserving token: ${staleDecisionToken}`,
+      tags: ["smoke", "checkpoint-change"],
+    },
+  });
+  console.log("\n--- upsert_decision (after checkpoint) ---\n");
+  console.log(readText(changedDecision));
 
   const duplicateTitle = "smoke-duplicate-diagnostic";
   for (const suffix of ["A", "B"]) {
@@ -502,12 +532,40 @@ export async function runMemoryRecallCases(ctx) {
   console.log(checkpointDiffText);
   try {
     const parsed = JSON.parse(checkpointDiffText);
-    if (parsed?.ok !== true || parsed?.read_only !== true || parsed?.advisory_only !== true) {
+    if (
+      parsed?.ok !== true
+      || parsed?.read_only !== true
+      || parsed?.advisory_only !== true
+      || parsed?.comparable !== true
+    ) {
       throw new Error("expected compare_checkpoint_context to be read-only advisory output");
+    }
+    if (parsed?.window_mismatch !== false) {
+      throw new Error("expected checkpoint comparison to reuse the saved snapshot window by default");
+    }
+    if (checkpointDiffText.length >= 100_000) {
+      throw new Error("expected checkpoint comparison to stay below the global output fallback threshold");
+    }
+    const diffCheckpointMetadata = JSON.parse(parsed?.checkpoint?.metadata_json ?? "{}");
+    if (Object.prototype.hasOwnProperty.call(diffCheckpointMetadata, "snapshot")) {
+      throw new Error("expected checkpoint comparison preview metadata to omit the embedded snapshot");
+    }
+    const nestedCheckpoint = Array.isArray(parsed?.current_snapshot?.recent_memory)
+      && parsed.current_snapshot.recent_memory.some((item) => item?.kind === "checkpoint");
+    if (nestedCheckpoint) {
+      throw new Error("expected checkpoint snapshots to exclude nested checkpoint records");
     }
     const added = Array.isArray(parsed?.diff?.recent_memory_added) ? parsed.diff.recent_memory_added : [];
     if (!JSON.stringify(added).includes(duplicateTitle)) {
       throw new Error("expected checkpoint diff to include memory added after checkpoint");
+    }
+    const changed = Array.isArray(parsed?.diff?.decisions_changed) ? parsed.diff.decisions_changed : [];
+    if (!changed.some((item) => item?.id === currentDecisionId)) {
+      throw new Error("expected checkpoint diff to include a decision updated after checkpoint");
+    }
+    const pendingChanged = Array.isArray(parsed?.diff?.pending_changed) ? parsed.diff.pending_changed : [];
+    if (pendingChanged.length !== 0) {
+      throw new Error("expected unchanged pending files not to be reported as changed");
     }
   } catch (err) {
     console.error("\n[smoke] compare_checkpoint_context check failed:", err);

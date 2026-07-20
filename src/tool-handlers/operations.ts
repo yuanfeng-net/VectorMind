@@ -8,6 +8,7 @@ import { compactPreflightOperationScopeText } from "../tool-output.js";
 import { toolCompactOrJson } from "../token-savings.js";
 import { flushPendingChangeBuffer } from "../file-indexing.js";
 import { logActivity } from "../activity-log.js";
+import { focusedTextIsRelevant, isObviouslyCorruptedText } from "../context-governance.js";
 
 function memoryForRequirement(context: ToolHandlerContext, req: RequirementRow): MemoryItemRow | undefined {
   const { getRequirementMemoryItemIdStmt, getMemoryItemByIdStmt } = context.getStatements();
@@ -21,10 +22,17 @@ function getCurrentConstraintsForOperation(context: ToolHandlerContext, limit: n
     listConventionsStmt,
     listActiveRequirementsStmt,
   } = context.getStatements();
-  const currentDecisions = listCurrentDecisionsStmt.all(Math.max(limit, 12)) as MemoryItemRow[];
-  const conventions = listConventionsStmt.all(Math.min(Math.max(limit, 12), 50)) as MemoryItemRow[];
+  const cleanMemory = (row: MemoryItemRow) =>
+    !isObviouslyCorruptedText(row.title, row.content, row.file_path);
+  const currentDecisions = (listCurrentDecisionsStmt.all(Math.max(limit, 12)) as MemoryItemRow[])
+    .filter(cleanMemory);
+  const conventions = (listConventionsStmt.all(Math.min(Math.max(limit, 12), 50)) as MemoryItemRow[])
+    .filter(cleanMemory);
   const activeRequirements = (listActiveRequirementsStmt.all(10) as RequirementRow[])
-    .map((requirement) => ({ requirement, memory: memoryForRequirement(context, requirement) }));
+    .map((requirement) => ({ requirement, memory: memoryForRequirement(context, requirement) }))
+    .filter(({ requirement, memory }) =>
+      !isObviouslyCorruptedText(requirement.title, requirement.context_data, memory?.content),
+    );
   const recentNotes = context.getDb().prepare(
     `SELECT id, kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at
      FROM memory_items
@@ -36,7 +44,7 @@ function getCurrentConstraintsForOperation(context: ToolHandlerContext, limit: n
     currentDecisions,
     conventions,
     activeRequirements,
-    recentNotes,
+    recentNotes: recentNotes.filter(cleanMemory),
     limit,
     previewChars,
   });
@@ -52,21 +60,40 @@ export async function handlePreflightOperationScope(
 ): Promise<CallToolResult> {
   const args = PreflightOperationScopeArgsSchema.parse(rawArgs);
   flushPendingChangeBuffer();
-  const currentConstraints = getCurrentConstraintsForOperation(context, args.constraints_limit, args.preview_chars);
-  const result = evaluateOperationScope({
+  const allCurrentConstraints = getCurrentConstraintsForOperation(context, args.constraints_limit, args.preview_chars);
+  const plan = {
     operation: args.operation,
     intent: args.intent,
     commands: args.commands,
     files: args.files,
     targets: args.targets,
     script_hints: args.script_hints,
-  }, currentConstraints);
+  };
+  const result = evaluateOperationScope(plan, allCurrentConstraints);
+  const operationQuery = [
+    args.operation,
+    args.intent,
+    ...(args.commands ?? []),
+    ...(args.files ?? []),
+    ...(args.targets ?? []),
+    ...(args.script_hints ?? []),
+  ].join("\n");
+  const warningConstraintIds = new Set(
+    result.warnings.flatMap((warning) => warning.evidence ?? []).map((evidence) => evidence.constraint_id),
+  );
+  result.current_constraints = allCurrentConstraints
+    .filter((constraint) =>
+      warningConstraintIds.has(constraint.id) ||
+      focusedTextIsRelevant(operationQuery, constraint.title, constraint.preview),
+    )
+    .slice(0, args.constraints_limit);
 
   logActivity("preflight_operation_scope", {
     operation: args.operation,
     warnings: result.warnings.length,
     blockers: result.warnings.filter((w) => w.severity === "blocker").length,
-    constraints: currentConstraints.length,
+    constraints_checked: allCurrentConstraints.length,
+    constraints_returned: result.current_constraints.length,
   });
 
   return {

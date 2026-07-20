@@ -475,12 +475,25 @@ export function compactBootstrapText(data: {
   root_source: RootSource;
   watcher_enabled: boolean;
   watcher_ready: boolean;
+  index_state?: {
+    watcher: string;
+    fts_available: boolean;
+    semantic_search: string;
+  };
   context_policy?: {
     mode: "focused" | "full";
     include_pending: boolean;
     include_recent: boolean;
     max_output_chars: number;
     compact_truncated?: boolean;
+  };
+  operation_preflight?: {
+    detected: boolean;
+    required_before_commands: boolean;
+    tool: string;
+    bootstrap_is_not_operation_preflight: boolean;
+    matched_terms: string[];
+    action: string | null;
   };
   project_summary: CompactMemoryItemPreview | null;
   decisions: Array<CompactMemoryItemPreview>;
@@ -504,9 +517,14 @@ export function compactBootstrapText(data: {
 }): string {
   const lines: string[] = [];
   lines.push(
-    `ok ctx ${data.root_source} mode=${data.context_policy?.mode ?? "full"} watcher=${data.watcher_enabled ? (data.watcher_ready ? "ready" : "starting") : "off"} root=${data.project_root}`,
+    `ok ctx ${data.root_source} mode=${data.context_policy?.mode ?? "full"} watcher=${data.index_state?.watcher ?? (data.watcher_enabled ? (data.watcher_ready ? "ready" : "warming") : "off")} semantic=${data.index_state?.semantic_search ?? "unknown"} root=${data.project_root}`,
   );
   if (data.project_summary) lines.push(`summary ${compactMemoryLabel(data.project_summary, 140)}`);
+  if (data.operation_preflight?.required_before_commands) {
+    lines.push(
+      `operation preflight required tool=${data.operation_preflight.tool} matched=${data.operation_preflight.matched_terms.join(",") || "operation"}; bootstrap_context does not satisfy this step`,
+    );
+  }
   if (data.semantic) {
     lines.push(`semantic ${data.semantic.mode} ${data.semantic.matches.length}/${data.semantic.top_k} for "${oneLine(data.semantic.query, 80)}":`);
     if (data.semantic.focused_no_match) {

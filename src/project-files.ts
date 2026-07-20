@@ -5,22 +5,20 @@ import * as readline from "node:readline";
 import { getAllowedCodexTextRoots, parseFileUriToPath } from "./root.js";
 import { shouldIgnoreDbFilePath } from "./path-rules.js";
 import { passesPathFilters } from "./path-filters.js";
+import { resolvePathWithinRoot } from "./path-containment.js";
 
 export function resolveProjectPathUnderRoot(
   projectRoot: string,
   normalizeToDbPath: (inputPath: string) => string,
   inputPath: string,
-  opts: { allowRoot?: boolean } = {},
+  opts: { allowRoot?: boolean; allowMissing?: boolean } = {},
 ): { absPath: string; dbFilePath: string } {
   const normalizedInput = inputPath.trim() || ".";
-  const abs = path.isAbsolute(normalizedInput) ? normalizedInput : path.join(projectRoot, normalizedInput);
-  const absPath = path.resolve(abs);
+  const absPath = resolvePathWithinRoot(projectRoot, normalizedInput, {
+    allowMissing: opts.allowMissing ?? true,
+  });
   const root = path.resolve(projectRoot);
   const rel = path.relative(root, absPath);
-  const insideRoot = rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
-  if (!insideRoot) {
-    throw new Error(`[VectorMind] Path must be under project_root: ${inputPath}`);
-  }
   if (rel === "" && !opts.allowRoot) {
     throw new Error(`[VectorMind] Path must not be the project_root itself: ${inputPath}`);
   }
@@ -35,17 +33,25 @@ export function resolveReadPathUnderProjectRoot(
   normalizeToDbPath: (inputPath: string) => string,
   inputPath: string,
 ): { absPath: string; dbFilePath: string } {
-  return resolveProjectPathUnderRoot(projectRoot, normalizeToDbPath, inputPath, { allowRoot: false });
+  return resolveProjectPathUnderRoot(projectRoot, normalizeToDbPath, inputPath, {
+    allowRoot: false,
+    allowMissing: false,
+  });
 }
 
 export function resolveCodexTextPath(inputPath: string): { absPath: string; displayPath: string; allowedRoot: string } {
   const trimmed = inputPath.trim();
   if (!trimmed) throw new Error("[VectorMind] path is required");
   const uriPath = trimmed.startsWith("file:") ? parseFileUriToPath(trimmed) : null;
-  const absPath = path.resolve(uriPath ?? trimmed);
+  const requestedPath = uriPath ?? trimmed;
+  let absPath = "";
   const allowedRoot = getAllowedCodexTextRoots().find((root) => {
-    const rel = path.relative(root, absPath);
-    return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+    try {
+      absPath = resolvePathWithinRoot(root, requestedPath);
+      return true;
+    } catch {
+      return false;
+    }
   });
   if (!allowedRoot) {
     throw new Error(
@@ -204,6 +210,7 @@ export function listProjectFilesInternal(opts: {
       const child = dirEntries[idx];
       if (!child) continue;
       if (!opts.includeHidden && isHiddenBaseName(child.name)) continue;
+      if (child.isSymbolicLink()) continue;
 
       const childAbs = path.join(current.absPath, child.name);
       const childRel = opts.normalizeToDbPath(childAbs);

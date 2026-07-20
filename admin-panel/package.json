@@ -4,11 +4,15 @@
   "private": true,
   "type": "module",
   "description": "Local VectorMind MCP management panel.",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
   "scripts": {
-    "dev": "node server/index.mjs",
+    "dev": "node server/index.mjs --development",
     "build": "vite build",
     "start": "node server/index.mjs --production",
-    "check": "npm run build"
+    "test": "node --test server/*.test.mjs",
+    "check": "npm run test && npm run build"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^6.0.3",

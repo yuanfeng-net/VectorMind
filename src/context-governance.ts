@@ -21,52 +21,118 @@ const QUERY_STOPWORDS = new Set([
   "smoke", "test", "context", "current", "please", "check", "verify",
 ]);
 
+const OPERATION_INTENT_PATTERNS: Array<{ label: string; pattern: RegExp }> = [
+  { label: "deploy", pattern: /部署|发布|上线|\bdeploy(?:ment)?\b|\bpublish\b|\brelease\b/iu },
+  { label: "build", pattern: /构建|编译|打包|\bbuild\b|\bcompile\b|\bpackage\b/iu },
+  { label: "test", pattern: /运行测试|执行测试|测试命令|\b(?:run|execute)\s+(?:the\s+)?tests?\b|\b(?:pytest|vitest|jest)\b/iu },
+  { label: "migrate", pattern: /数据库迁移|迁移数据库|\bmigrat(?:e|ion)\b/iu },
+  { label: "service", pattern: /启动服务|停止服务|重启服务|\b(?:start|stop|restart)\s+(?:the\s+)?service\b/iu },
+  { label: "git", pattern: /提交并推送|推送代码|拉取代码|合并分支|创建提交|\bgit\s+(?:commit|push|pull|merge|rebase|tag)\b/iu },
+  { label: "dependencies", pattern: /安装依赖|升级依赖|\b(?:npm|pnpm|yarn|pip|uv|cargo)\s+(?:install|add|update|upgrade)\b/iu },
+  { label: "rollback", pattern: /回滚|\brollback\b/iu },
+  { label: "container", pattern: /\bdocker(?:\s+compose)?\b|\bkubectl\b|\bhelm\b/iu },
+  { label: "command", pattern: /\b(?:npm|pnpm|yarn)\s+run\b|\bdotnet\s+(?:build|test|run|publish)\b|\bgo\s+(?:test|run|build)\b|\bcargo\s+(?:test|run|build)\b/iu },
+];
+
 function normalizeSearchText(value: string): string {
   return value.normalize("NFKC").toLocaleLowerCase();
 }
 
-function focusedQueryTokens(query: string): string[] {
-  const normalized = normalizeSearchText(query);
-  const tokens = new Set<string>();
-  for (const token of normalized.match(/[a-z0-9_./:@#-]{2,}/g) ?? []) {
-    if (!QUERY_STOPWORDS.has(token)) tokens.add(token);
-    for (const part of token.split(/[^a-z0-9]+/).filter((item) => item.length >= 3)) {
-      if (!QUERY_STOPWORDS.has(part)) tokens.add(part);
+export function detectOperationIntent(value: string): {
+  detected: boolean;
+  matched_terms: string[];
+} {
+  const normalized = normalizeSearchText(value);
+  const matched_terms = OPERATION_INTENT_PATTERNS
+    .filter(({ pattern }) => pattern.test(normalized))
+    .map(({ label }) => label);
+  return { detected: matched_terms.length > 0, matched_terms };
+}
+
+export function isObviouslyCorruptedText(...values: Array<string | null | undefined>): boolean {
+  return values.some((value) => {
+    const compact = (value ?? "").replace(/\s+/g, "");
+    if (!compact) return false;
+    if (compact.includes("\uFFFD") || /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(compact)) return true;
+    const questionMarks = compact.match(/\?/g)?.length ?? 0;
+    return questionMarks >= 4 && questionMarks / compact.length >= 0.2;
+  });
+}
+
+function focusedEvidenceCoverage(query: string, haystack: string): {
+  total_chars: number;
+  matched_chars: number;
+  coverage: number;
+  independent_runs: number;
+  technical_anchor: boolean;
+} {
+  const segments = normalizeSearchText(query).match(/[a-z0-9_./:@#-]+|\p{Script=Han}+/gu) ?? [];
+  let totalChars = 0;
+  let matchedChars = 0;
+  let independentRuns = 0;
+  let technicalAnchor = false;
+
+  for (const segment of segments) {
+    if (/^[a-z0-9_./:@#-]+$/.test(segment)) {
+      if (QUERY_STOPWORDS.has(segment)) continue;
+      totalChars += segment.length;
+      if (!haystack.includes(segment)) continue;
+      matchedChars += segment.length;
+      independentRuns += 1;
+      if (segment.length >= 3 && (/\d/.test(segment) || /[_.\/@:#-]/.test(segment))) {
+        technicalAnchor = true;
+      }
+      continue;
     }
-  }
-  for (const sequence of normalized.match(/\p{Script=Han}+/gu) ?? []) {
-    if (sequence.length >= 2) tokens.add(sequence);
-    for (const width of [2, 3, 4]) {
-      for (let index = 0; index <= sequence.length - width; index += 1) {
-        tokens.add(sequence.slice(index, index + width));
+
+    totalChars += segment.length;
+    const covered = Array.from({ length: segment.length }, () => false);
+    const maxWidth = Math.min(6, segment.length);
+    for (let width = maxWidth; width >= 2; width -= 1) {
+      for (let index = 0; index <= segment.length - width; index += 1) {
+        if (!haystack.includes(segment.slice(index, index + width))) continue;
+        for (let offset = index; offset < index + width; offset += 1) covered[offset] = true;
       }
     }
+    matchedChars += covered.filter(Boolean).length;
+    for (let index = 0; index < covered.length; index += 1) {
+      if (covered[index] && (index === 0 || !covered[index - 1])) independentRuns += 1;
+    }
   }
-  return [...tokens].sort((a, b) => b.length - a.length).slice(0, 40);
+
+  return {
+    total_chars: totalChars,
+    matched_chars: matchedChars,
+    coverage: totalChars > 0 ? matchedChars / totalChars : 0,
+    independent_runs: independentRuns,
+    technical_anchor: technicalAnchor,
+  };
+}
+
+export function focusedTextIsRelevant(
+  query: string,
+  ...values: Array<string | null | undefined>
+): boolean {
+  const normalizedQuery = normalizeSearchText(query).trim();
+  if (!normalizedQuery) return false;
+  if (isObviouslyCorruptedText(...values)) return false;
+  const haystack = normalizeSearchText(values.filter(Boolean).join("\n"));
+  if (haystack.includes(normalizedQuery)) return true;
+
+  const evidence = focusedEvidenceCoverage(query, haystack);
+  if (evidence.technical_anchor) return true;
+  if (evidence.total_chars <= 4) return evidence.coverage === 1;
+  return evidence.coverage >= 0.58 ||
+    (evidence.coverage >= 0.42 && evidence.matched_chars >= 6 && evidence.independent_runs >= 2);
 }
 
 function focusedMatchIsRelevant(query: string, match: SemanticMatchLike): boolean {
-  const normalizedQuery = normalizeSearchText(query).trim();
-  if (!normalizedQuery) return false;
-  const haystack = normalizeSearchText([
-    match.item.title ?? "",
-    match.item.preview ?? "",
-    match.item.file_path ?? "",
-  ].join("\n"));
-  if (haystack.includes(normalizedQuery)) return true;
-
-  const tokens = focusedQueryTokens(query);
-  if (!tokens.length) return false;
-  const matched = tokens.filter((token) => haystack.includes(token));
-  const strongTokens = tokens.filter((token) =>
-    /\d/.test(token) ||
-    token.length >= 8 ||
-    (/\p{Script=Han}/u.test(token) && token.length >= 4),
+  return focusedTextIsRelevant(
+    query,
+    match.item.title,
+    match.item.preview,
+    match.item.file_path,
   );
-  if (strongTokens.some((token) => haystack.includes(token))) return true;
-
-  const requiredMatches = tokens.length <= 2 ? 1 : 2;
-  return matched.length >= requiredMatches && matched.length / tokens.length >= 0.3;
 }
 
 export function filterFocusedSemanticResult<T extends { matches: SemanticMatchLike[] }>(
@@ -141,8 +207,7 @@ export function sameRequirement(
   active: { title: string; context_data?: string | null; goal_key?: string | null },
   next: { title: string; background?: string | null; goal_key?: string | null },
 ): boolean {
-  const normalize = (value: string | null | undefined) =>
-    (value ?? "").normalize("NFKC").trim().replace(/\s+/g, " ").toLocaleLowerCase();
+  const normalize = normalizeRequirementText;
   const activeGoalKey = normalize(active.goal_key);
   const nextGoalKey = normalize(next.goal_key);
   if (activeGoalKey && nextGoalKey) {
@@ -154,30 +219,18 @@ export function sameRequirement(
   const nextTitle = normalize(next.title);
   const activeBackground = normalize(active.context_data);
   const nextBackground = normalize(next.background);
-  if (activeTitle === nextTitle && activeBackground === nextBackground) return true;
+  return activeTitle === nextTitle && activeBackground === nextBackground;
+}
 
-  const tokens = (value: string): Set<string> => {
-    const result = new Set(value.match(/[a-z0-9_./:@#-]{2,}/g) ?? []);
-    const compact = value.replace(/\s+/g, "");
-    for (const sequence of compact.match(/\p{Script=Han}+/gu) ?? []) {
-      for (let index = 0; index < sequence.length - 1; index += 1) result.add(sequence.slice(index, index + 2));
-    }
-    return result;
-  };
-  const similarity = (left: string, right: string): number => {
-    const a = tokens(left);
-    const b = tokens(right);
-    if (!a.size || !b.size) return 0;
-    let overlap = 0;
-    for (const token of a) if (b.has(token)) overlap += 1;
-    return (2 * overlap) / (a.size + b.size);
-  };
-  const titleSimilarity = similarity(activeTitle, nextTitle);
-  const backgroundSimilarity = similarity(activeBackground, nextBackground);
-  const titleContains = Math.min(activeTitle.length, nextTitle.length) >= 8 &&
-    (activeTitle.includes(nextTitle) || nextTitle.includes(activeTitle));
-  return (titleSimilarity >= 0.78 || titleContains) &&
-    (!activeBackground || !nextBackground || backgroundSimilarity >= 0.55);
+function normalizeRequirementText(value: string | null | undefined): string {
+  return (value ?? "").normalize("NFKC").trim().replace(/\s+/g, " ").toLocaleLowerCase();
+}
+
+export function sameRootRequirement(
+  active: { title: string; context_data?: string | null; goal_key?: string | null },
+  next: { title: string; background?: string | null; goal_key?: string | null },
+): boolean {
+  return sameRequirement(active, next);
 }
 
 export function normalizeRequirementGoalIdentity(title: string, background?: string | null): string {

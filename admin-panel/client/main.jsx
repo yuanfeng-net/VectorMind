@@ -3,7 +3,28 @@ import { createRoot } from "react-dom/client";
 import "./styles.css";
 
 const API = "";
-let adminSessionToken = "";
+const SESSION_TOKEN_KEY = "vectormind.admin.session-token";
+
+function readStoredAdminToken() {
+  try {
+    return window.sessionStorage.getItem(SESSION_TOKEN_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+let adminSessionToken = readStoredAdminToken();
+
+function setAdminSessionToken(token, persist = false) {
+  adminSessionToken = String(token ?? "").trim();
+  if (!persist) return;
+  try {
+    if (adminSessionToken) window.sessionStorage.setItem(SESSION_TOKEN_KEY, adminSessionToken);
+    else window.sessionStorage.removeItem(SESSION_TOKEN_KEY);
+  } catch {
+    // The in-memory token still works when session storage is unavailable.
+  }
+}
 
 const FILTERS = [
   { id: "all", label: "全部" },
@@ -47,20 +68,27 @@ function shortTime(value) {
 }
 
 function apiFetch(path, options = {}) {
+  const { headers: optionHeaders, ...fetchOptions } = options;
   return fetch(`${API}${path}`, {
+    ...fetchOptions,
     headers: {
       "Content-Type": "application/json",
       ...(adminSessionToken ? { "X-VectorMind-Admin-Token": adminSessionToken } : {}),
-      ...(options.headers ?? {}),
+      ...(optionHeaders ?? {}),
     },
-    ...options,
   }).then(async (response) => {
     const data = await response.json().catch(() => ({}));
     if (!response.ok || data.ok === false) {
-      throw new Error(data.error || `请求失败：${response.status}`);
+      const error = new Error(data.error || `请求失败：${response.status}`);
+      error.status = response.status;
+      throw error;
     }
     return data;
   });
+}
+
+function isAbortError(error) {
+  return error?.name === "AbortError";
 }
 
 function Icon({ name, className }) {
@@ -160,11 +188,66 @@ function Toast({ message, type = "info", onClose }) {
   );
 }
 
-function TopBar({ config, onRefresh, query, onQueryChange, busy }) {
+function TokenAccess({ authentication, busy, onAuthenticate, onClear }) {
+  const [token, setToken] = useState("");
+  const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  if (authentication?.mode !== "explicit") return null;
+  if (authentication.authenticated) {
+    return (
+      <div className="token-session" aria-label="显式令牌已验证">
+        <Icon name="shield" />
+        <span>令牌已验证</span>
+        <button type="button" onClick={onClear} disabled={busy}>
+          清除
+        </button>
+      </div>
+    );
+  }
+
+  async function submit(event) {
+    event.preventDefault();
+    setSubmitting(true);
+    setError("");
+    try {
+      await onAuthenticate(token);
+      setToken("");
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <form className="token-access" onSubmit={submit}>
+      <label>
+        <span className="sr-only">管理面板令牌</span>
+        <Icon name="shield" />
+        <input
+          type="password"
+          value={token}
+          onChange={(event) => setToken(event.target.value)}
+          placeholder="输入管理令牌"
+          autoComplete="current-password"
+          required
+        />
+      </label>
+      <button type="submit" disabled={submitting || !token.trim()}>
+        {submitting ? "验证中" : "连接"}
+      </button>
+      {error ? <span className="token-error" role="alert">{error}</span> : null}
+    </form>
+  );
+}
+
+function TopBar({ config, onRefresh, query, onQueryChange, busy, onAuthenticate, onClearAuthentication }) {
   const copyPath = async () => {
     if (!config?.indexFile) return;
     await navigator.clipboard?.writeText(config.indexFile);
   };
+  const authenticated = Boolean(config?.authentication?.authenticated);
 
   return (
     <header className="topbar">
@@ -184,15 +267,23 @@ function TopBar({ config, onRefresh, query, onQueryChange, busy }) {
           服务状态：运行中
         </span>
         <span className="status-pill">端口 {config?.port ?? 16860}</span>
-        <button className="path-pill" type="button" onClick={copyPath} title="复制索引文件路径">
-          <span>数据文件：</span>
-          <strong>{config?.indexFile ?? "加载中…"}</strong>
-          <Icon name="copy" />
-        </button>
+        {config?.indexFile ? (
+          <button className="path-pill" type="button" onClick={copyPath} title="复制索引文件路径">
+            <span>数据文件：</span>
+            <strong>{config.indexFile}</strong>
+            <Icon name="copy" />
+          </button>
+        ) : null}
       </div>
 
       <div className="topbar-actions">
-        <button className="ghost-button" type="button" onClick={onRefresh} disabled={busy}>
+        <TokenAccess
+          authentication={config?.authentication}
+          busy={busy}
+          onAuthenticate={onAuthenticate}
+          onClear={onClearAuthentication}
+        />
+        <button className="ghost-button" type="button" onClick={onRefresh} disabled={busy || !authenticated}>
           <Icon name="refresh" className={busy ? "spin" : ""} />
           刷新索引
         </button>
@@ -203,6 +294,7 @@ function TopBar({ config, onRefresh, query, onQueryChange, busy }) {
             onChange={(event) => onQueryChange(event.target.value)}
             placeholder="搜索项目、日志、记忆…"
             aria-label="搜索项目、日志、记忆"
+            disabled={!authenticated}
           />
           <kbd>Ctrl K</kbd>
         </label>
@@ -822,57 +914,159 @@ function App() {
   const [selectedId, setSelectedId] = useState("");
   const [memory, setMemory] = useState(null);
   const [memoryAudit, setMemoryAudit] = useState(null);
+  const [memoryAuditProjectId, setMemoryAuditProjectId] = useState("");
   const [query, setQuery] = useState("");
   const [busy, setBusy] = useState(false);
   const [auditBusy, setAuditBusy] = useState(false);
   const [repairBusy, setRepairBusy] = useState(false);
   const [toast, setToast] = useState(null);
+  const selectedIdRef = useRef("");
+  const memoryRequestRef = useRef({ controller: null, sequence: 0 });
+  const auditRequestRef = useRef({ controller: null, sequence: 0 });
+  const repairRequestRef = useRef({ controller: null, sequence: 0 });
 
   const selectedProject = useMemo(
-    () => projects.find((project) => project.id === selectedId) ?? projects[0] ?? null,
+    () => projects.find((project) => project.id === selectedId) ?? null,
     [projects, selectedId],
   );
+  const visibleMemoryAudit = memoryAuditProjectId === selectedProject?.id ? memoryAudit : null;
+
+  function beginRequest(requestRef) {
+    requestRef.current.controller?.abort();
+    const controller = new AbortController();
+    const sequence = requestRef.current.sequence + 1;
+    requestRef.current = { controller, sequence };
+    return { controller, sequence };
+  }
+
+  function requestIsCurrent(requestRef, sequence) {
+    return requestRef.current.sequence === sequence;
+  }
+
+  function cancelRequest(requestRef) {
+    requestRef.current.controller?.abort();
+    requestRef.current = { controller: null, sequence: requestRef.current.sequence + 1 };
+  }
+
+  function selectProject(nextId) {
+    const normalizedId = nextId ?? "";
+    if (selectedIdRef.current !== normalizedId) {
+      cancelRequest(memoryRequestRef);
+      cancelRequest(auditRequestRef);
+      cancelRequest(repairRequestRef);
+      setMemory(null);
+      setMemoryAudit(null);
+      setMemoryAuditProjectId("");
+      setAuditBusy(false);
+      setRepairBusy(false);
+    }
+    selectedIdRef.current = normalizedId;
+    setSelectedId(normalizedId);
+  }
+
+  function clearProtectedState() {
+    cancelRequest(memoryRequestRef);
+    cancelRequest(auditRequestRef);
+    cancelRequest(repairRequestRef);
+    selectedIdRef.current = "";
+    setProjects([]);
+    setSelectedId("");
+    setMemory(null);
+    setMemoryAudit(null);
+    setMemoryAuditProjectId("");
+    setAuditBusy(false);
+    setRepairBusy(false);
+  }
 
   async function loadConfig() {
     const data = await apiFetch("/api/config");
-    adminSessionToken = data.sessionToken ?? "";
-    setConfig(data);
-  }
-
-  async function loadProjects(preferredId = selectedId) {
-    const data = await apiFetch("/api/projects");
-    setProjects(data.projects ?? []);
-    if (preferredId && data.projects?.some((project) => project.id === preferredId)) {
-      setSelectedId(preferredId);
-    } else if (!selectedId && data.projects?.length) {
-      setSelectedId(data.projects[0].id);
-    } else if (selectedId && !data.projects?.some((project) => project.id === selectedId)) {
-      setSelectedId(data.projects?.[0]?.id ?? "");
+    if (data.sessionToken) setAdminSessionToken(data.sessionToken);
+    if (data.authentication?.mode === "explicit" && !data.authentication.authenticated && adminSessionToken) {
+      setAdminSessionToken("", true);
     }
+    setConfig(data);
+    return data;
   }
 
-  async function loadSelected(projectId = selectedProject?.id) {
+  async function loadProjects(preferredId = selectedIdRef.current) {
+    const data = await apiFetch("/api/projects");
+    const nextProjects = data.projects ?? [];
+    const nextId = nextProjects.some((project) => project.id === preferredId)
+      ? preferredId
+      : nextProjects.some((project) => project.id === selectedIdRef.current)
+        ? selectedIdRef.current
+        : (nextProjects[0]?.id ?? "");
+    setProjects(nextProjects);
+    selectProject(nextId);
+    return nextId;
+  }
+
+  async function loadSelected(projectId = selectedIdRef.current) {
     if (!projectId) {
       setMemory(null);
       setMemoryAudit(null);
-      return;
+      setMemoryAuditProjectId("");
+      return false;
     }
-    const data = await apiFetch(`/api/projects/${projectId}/memory`);
-    setMemory(data.memory);
-    setMemoryAudit(null);
+    const { controller, sequence } = beginRequest(memoryRequestRef);
+    try {
+      const data = await apiFetch(`/api/projects/${projectId}/memory`, { signal: controller.signal });
+      if (!requestIsCurrent(memoryRequestRef, sequence) || selectedIdRef.current !== projectId) return false;
+      setMemory(data.memory);
+      setMemoryAudit(null);
+      setMemoryAuditProjectId("");
+      return true;
+    } catch (err) {
+      if (isAbortError(err)) return false;
+      throw err;
+    } finally {
+      if (requestIsCurrent(memoryRequestRef, sequence)) {
+        memoryRequestRef.current = { controller: null, sequence };
+      }
+    }
   }
 
-  async function refreshAll() {
+  async function refreshAll(showToast = true) {
     setBusy(true);
     try {
-      await loadConfig();
-      await loadProjects(selectedProject?.id);
-      await loadSelected(selectedProject?.id);
-      setToast({ type: "success", message: "索引已刷新。" });
+      const nextConfig = await loadConfig();
+      if (!nextConfig.authentication?.authenticated) {
+        clearProtectedState();
+        if (showToast) setToast({ type: "info", message: "请输入管理令牌后连接。" });
+        return;
+      }
+      const nextId = await loadProjects(selectedIdRef.current);
+      if (nextId) await loadSelected(nextId);
+      if (showToast) setToast({ type: "success", message: "索引已刷新。" });
     } catch (err) {
-      setToast({ type: "error", message: err.message });
+      if (!isAbortError(err)) setToast({ type: "error", message: err.message });
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function authenticate(token) {
+    const candidate = String(token ?? "").trim();
+    if (!candidate) throw new Error("请输入管理令牌。");
+    setAdminSessionToken(candidate, true);
+    const nextConfig = await loadConfig();
+    if (!nextConfig.authentication?.authenticated) {
+      throw new Error("管理令牌无效。");
+    }
+    const nextId = await loadProjects(selectedIdRef.current);
+    if (nextId) await loadSelected(nextId);
+    setToast({ type: "success", message: "管理令牌已验证。" });
+  }
+
+  async function clearAuthentication() {
+    try {
+      setAdminSessionToken("", true);
+      const nextConfig = await loadConfig();
+      setConfig(nextConfig);
+      clearProtectedState();
+      setToast({ type: "info", message: "当前标签页的管理令牌已清除。" });
+    } catch (err) {
+      setToast({ type: "error", message: err.message });
     }
   }
 
@@ -881,9 +1075,10 @@ function App() {
       method: "POST",
       body: JSON.stringify(payload),
     });
-    await loadProjects(data.project.id);
-    setSelectedId(data.project.id);
-    await loadSelected(data.project.id);
+    const projectId = data.project.id;
+    await loadProjects(projectId);
+    selectProject(projectId);
+    await loadSelected(projectId);
     setToast({ type: "success", message: "项目已加入本地索引。" });
   }
 
@@ -894,10 +1089,11 @@ function App() {
         method: "POST",
         body: JSON.stringify({ root: root || config?.homeDir, maxDepth: 5 }),
       });
-      await loadProjects(selectedProject?.id);
+      const nextId = await loadProjects(selectedIdRef.current);
+      if (nextId) await loadSelected(nextId);
       setToast({ type: "success", message: `扫描完成：发现 ${data.found} 个记忆项目。` });
     } catch (err) {
-      setToast({ type: "error", message: err.message });
+      if (!isAbortError(err)) setToast({ type: "error", message: err.message });
     } finally {
       setBusy(false);
     }
@@ -910,67 +1106,94 @@ function App() {
     if (!keep) return;
     try {
       await apiFetch(`/api/projects/${id}`, { method: "DELETE" });
-      const next = projects.find((item) => item.id !== id);
-      setSelectedId(next?.id ?? "");
-      await loadProjects(next?.id);
-      if (next?.id) await loadSelected(next.id);
-      else setMemory(null);
+      const nextId = await loadProjects(projects.find((item) => item.id !== id)?.id ?? "");
+      if (nextId) await loadSelected(nextId);
+      else clearProtectedState();
       setToast({ type: "success", message: "已从索引移除，原项目未删除。" });
     } catch (err) {
-      setToast({ type: "error", message: err.message });
+      if (!isAbortError(err)) setToast({ type: "error", message: err.message });
     }
   }
 
-  async function auditSelectedMemory(projectId = selectedProject?.id) {
-    if (!projectId) return;
+  async function auditSelectedMemory(projectId = selectedIdRef.current) {
+    if (!projectId || selectedIdRef.current !== projectId) return;
+    const { controller, sequence } = beginRequest(auditRequestRef);
     setAuditBusy(true);
     try {
-      const data = await apiFetch(`/api/projects/${projectId}/memory/audit`);
+      const data = await apiFetch(`/api/projects/${projectId}/memory/audit`, { signal: controller.signal });
+      if (!requestIsCurrent(auditRequestRef, sequence) || selectedIdRef.current !== projectId) return;
       setMemoryAudit(data.audit);
+      setMemoryAuditProjectId(projectId);
       setToast({
         type: data.audit?.needsRepair ? "error" : "success",
         message: data.audit?.summary ?? "记忆检测完成。",
       });
     } catch (err) {
-      setToast({ type: "error", message: err.message });
+      if (!isAbortError(err) && requestIsCurrent(auditRequestRef, sequence)) {
+        setToast({ type: "error", message: err.message });
+      }
     } finally {
-      setAuditBusy(false);
+      if (requestIsCurrent(auditRequestRef, sequence)) {
+        auditRequestRef.current = { controller: null, sequence };
+        setAuditBusy(false);
+      }
     }
   }
 
-  async function repairSelectedMemory(projectId = selectedProject?.id) {
-    if (!projectId) return;
-    const confirmed = window.confirm("将先备份 SQLite 记忆库，然后合并历史重复日志并补齐新索引结构。继续修复？");
-    if (!confirmed) return;
+  async function repairSelectedMemory(projectId = selectedIdRef.current) {
+    if (!projectId || selectedIdRef.current !== projectId) return;
+    const project = projects.find((item) => item.id === projectId);
+    if (!project || memoryAuditProjectId !== projectId) {
+      setToast({ type: "error", message: "请先重新检测当前项目，再执行修复。" });
+      return;
+    }
+    const confirmed = window.confirm(
+      `将修复「${project.name}」并先备份其 SQLite 记忆库。\n\n${project.path}\n\n继续修复？`,
+    );
+    if (!confirmed || selectedIdRef.current !== projectId) return;
+    const { controller, sequence } = beginRequest(repairRequestRef);
     setRepairBusy(true);
     try {
-      const data = await apiFetch(`/api/projects/${projectId}/memory/repair`, { method: "POST" });
+      const data = await apiFetch(`/api/projects/${projectId}/memory/repair`, {
+        method: "POST",
+        signal: controller.signal,
+      });
+      const stillSelected = selectedIdRef.current === projectId && requestIsCurrent(repairRequestRef, sequence);
+      if (!stillSelected) return;
       setMemoryAudit(data.after);
+      setMemoryAuditProjectId(projectId);
       setMemory(data.memory);
-      await loadProjects(projectId);
       setToast({
         type: "success",
-        message: `修复完成，备份已保存：${data.backupPath}`,
+        message: `「${project.name}」修复完成，备份已保存：${data.backupPath}`,
       });
     } catch (err) {
-      setToast({ type: "error", message: err.message });
+      if (!isAbortError(err) && requestIsCurrent(repairRequestRef, sequence)) {
+        setToast({ type: "error", message: err.message });
+      }
     } finally {
-      setRepairBusy(false);
+      if (requestIsCurrent(repairRequestRef, sequence)) {
+        repairRequestRef.current = { controller: null, sequence };
+        setRepairBusy(false);
+      }
     }
   }
 
   useEffect(() => {
-    refreshAll();
+    refreshAll(false);
+    return () => {
+      cancelRequest(memoryRequestRef);
+      cancelRequest(auditRequestRef);
+      cancelRequest(repairRequestRef);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    if (!selectedProject?.id) {
-      setMemory(null);
-      setMemoryAudit(null);
-      return;
-    }
-    loadSelected(selectedProject.id).catch((err) => setToast({ type: "error", message: err.message }));
+    if (!selectedProject?.id || !config?.authentication?.authenticated) return;
+    loadSelected(selectedProject.id).catch((err) => {
+      if (!isAbortError(err)) setToast({ type: "error", message: err.message });
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedProject?.id]);
 
@@ -990,30 +1213,42 @@ function App() {
       <a className="skip-link" href="#main-content">
         跳到主内容
       </a>
-      <TopBar config={config} onRefresh={refreshAll} query={query} onQueryChange={setQuery} busy={busy} />
+      <TopBar
+        config={config}
+        onRefresh={refreshAll}
+        query={query}
+        onQueryChange={setQuery}
+        busy={busy}
+        onAuthenticate={authenticate}
+        onClearAuthentication={clearAuthentication}
+      />
       <div className="main-grid">
         <Sidebar
           projects={projects}
           selectedId={selectedProject?.id ?? ""}
-          onSelect={setSelectedId}
+          onSelect={selectProject}
           onAddProject={addProject}
           onDiscover={discover}
           onDelete={deleteProject}
           query={query}
           config={config}
-          busy={busy}
+          busy={busy || repairBusy}
         />
         <Workspace selectedProject={selectedProject} memory={memory} query={query} />
         <Inspector
           selectedProject={selectedProject}
           memory={memory}
-          memoryAudit={memoryAudit}
+          memoryAudit={visibleMemoryAudit}
           auditBusy={auditBusy}
           repairBusy={repairBusy}
           onAuditMemory={() => auditSelectedMemory(selectedProject?.id)}
           onRepairMemory={() => repairSelectedMemory(selectedProject?.id)}
           onDelete={deleteProject}
-          onRefreshSelected={() => loadSelected(selectedProject?.id)}
+          onRefreshSelected={() =>
+            loadSelected(selectedProject?.id).catch((err) => {
+              if (!isAbortError(err)) setToast({ type: "error", message: err.message });
+            })
+          }
         />
       </div>
       <BottomBar config={config} projects={projects} selectedProject={selectedProject} memory={memory} />

@@ -87,38 +87,60 @@ export function deferIncompleteLargeFileSplitPlansByReqId(
   return updated;
 }
 
-export function completeRequirementMemoryItemsByReqId(reqId: number): void {
+export function completeRequirementMemoryItemsByReqId(reqId: number): boolean {
   const transaction = getDb().transaction(() => {
-    getDb().prepare(`UPDATE requirements SET status = 'completed' WHERE id = ?`).run(reqId);
+    const updated = getDb().prepare(
+      `UPDATE requirements
+          SET status = 'completed', updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'active'`,
+    ).run(reqId);
+    if (updated.changes === 0) return false;
     deferIncompleteLargeFileSplitPlansByReqId(reqId);
     getCompleteRequirementMemoryItemByReqIdStatement().run("completed", reqId);
+    return true;
   });
-  transaction();
+  return transaction();
 }
 
 export function completeAllActiveRequirementMemoryItems(): number[] {
-  const activeRows = getDb().prepare(
-    `SELECT id FROM requirements WHERE status = 'active' ORDER BY created_at DESC, id DESC`,
-  ).all() as Array<{ id: number }>;
   const transaction = getDb().transaction(() => {
+    const activeRows = getDb().prepare(
+      `SELECT id FROM requirements WHERE status = 'active' ORDER BY created_at DESC, id DESC`,
+    ).all() as Array<{ id: number }>;
+    const completed: number[] = [];
     for (const row of activeRows) {
-      getDb().prepare(`UPDATE requirements SET status = 'completed' WHERE id = ?`).run(row.id);
+      const updated = getDb().prepare(
+        `UPDATE requirements
+            SET status = 'completed', updated_at = CURRENT_TIMESTAMP
+          WHERE id = ? AND status = 'active'`,
+      ).run(row.id);
+      if (updated.changes !== 1) continue;
       deferIncompleteLargeFileSplitPlansByReqId(row.id);
       getCompleteRequirementMemoryItemByReqIdStatement().run("completed", row.id);
+      completed.push(row.id);
     }
+    return completed;
   });
-  transaction();
-  return activeRows.map((row) => row.id);
+  return transaction.immediate();
 }
 
-function patchMemoryItemMetadata(id: number, patch: Record<string, unknown>): void {
-  const row = getMemoryItemByIdStatement().get(id) as MemoryItemRow | undefined;
-  if (!row) return;
-  const meta = { ...parseMetadataJson(row.metadata_json), ...patch };
-  getDb().prepare(`UPDATE memory_items SET metadata_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(
-    safeJson(meta),
-    id,
-  );
+function patchMemoryItemMetadata(id: number, patch: Record<string, unknown>): boolean {
+  const entries = Object.entries(patch).filter(([, value]) => value !== undefined);
+  if (!entries.length) return false;
+  const sqlArgs = entries.flatMap(([key, value]) => [`$.${key}`, safeJson(value)]);
+  const info = getDb().prepare(
+    `UPDATE memory_items
+        SET metadata_json = json_set(
+              CASE
+                WHEN json_valid(COALESCE(metadata_json, '{}')) THEN COALESCE(metadata_json, '{}')
+                ELSE '{}'
+              END,
+              ${entries.map(() => "?, json(?)").join(", ")}
+            ),
+            updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?`,
+  ).run(...sqlArgs, id);
+  return info.changes > 0;
 }
 
 export function supersedeMemoryItemIds(
@@ -126,21 +148,22 @@ export function supersedeMemoryItemIds(
   replacement: { req_id?: number; memory_id?: number; decision_id?: number; reason: string },
 ): number[] {
   const updated: number[] = [];
-  for (const id of Array.from(new Set(ids)).filter((n) => Number.isFinite(n) && n > 0)) {
-    const row = getMemoryItemByIdStatement().get(id) as MemoryItemRow | undefined;
-    if (!row) continue;
-    patchMemoryItemMetadata(id, {
-      ...parseMetadataJson(row.metadata_json),
-      status: "superseded",
-      superseded: true,
-      superseded_at: new Date().toISOString(),
-      superseded_reason: replacement.reason,
-      superseded_by_req_id: replacement.req_id ?? null,
-      superseded_by_memory_id: replacement.memory_id ?? null,
-      superseded_by_decision_id: replacement.decision_id ?? null,
-    });
-    updated.push(id);
-  }
+  const uniqueIds = Array.from(new Set(ids)).filter((n) => Number.isFinite(n) && n > 0);
+  const supersededAt = new Date().toISOString();
+  getDb().transaction(() => {
+    for (const id of uniqueIds) {
+      const changed = patchMemoryItemMetadata(id, {
+        status: "superseded",
+        superseded: true,
+        superseded_at: supersededAt,
+        superseded_reason: replacement.reason,
+        superseded_by_req_id: replacement.req_id ?? null,
+        superseded_by_memory_id: replacement.memory_id ?? null,
+        superseded_by_decision_id: replacement.decision_id ?? null,
+      });
+      if (changed) updated.push(id);
+    }
+  })();
   return updated;
 }
 
@@ -149,16 +172,21 @@ export function supersedeRequirementIds(
   replacement: { req_id?: number; memory_id?: number; decision_id?: number; reason: string },
 ): number[] {
   const updatedReqs: number[] = [];
-  for (const reqId of Array.from(new Set(reqIds)).filter((n) => Number.isFinite(n) && n > 0)) {
-    const info = getDb().prepare(`UPDATE requirements SET status = 'superseded' WHERE id = ?`).run(reqId);
-    if (info.changes > 0) updatedReqs.push(reqId);
-    const rows = getDb()
-      .prepare(`SELECT id FROM memory_items WHERE req_id = ? OR (kind = 'requirement' AND req_id = ?)`)
-      .all(reqId, reqId) as Array<{ id: number }>;
-    supersedeMemoryItemIds(
-      rows.map((r) => r.id),
-      replacement,
-    );
-  }
+  const uniqueReqIds = Array.from(new Set(reqIds)).filter((n) => Number.isFinite(n) && n > 0);
+  getDb().transaction(() => {
+    for (const reqId of uniqueReqIds) {
+      const info = getDb().prepare(
+        `UPDATE requirements SET status = 'superseded', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      ).run(reqId);
+      if (info.changes > 0) updatedReqs.push(reqId);
+      const rows = getDb()
+        .prepare(`SELECT id FROM memory_items WHERE req_id = ? OR (kind = 'requirement' AND req_id = ?)`)
+        .all(reqId, reqId) as Array<{ id: number }>;
+      supersedeMemoryItemIds(
+        rows.map((r) => r.id),
+        replacement,
+      );
+    }
+  })();
   return updatedReqs;
 }

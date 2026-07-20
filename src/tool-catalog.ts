@@ -12,6 +12,7 @@ import {
   GetActivitySummaryArgsSchema,
   GetBrainDumpArgsSchema,
   GetPendingChangesArgsSchema,
+  GetRequirementStatusArgsSchema,
   GetTokenSavingsArgsSchema,
   GrepArgsSchema,
   InstallRtkArgsSchema,
@@ -31,10 +32,12 @@ import {
   ReadMemoryItemArgsSchema,
   RecordLargeFileSplitArgsSchema,
   RestoreCheckpointContextArgsSchema,
+  ResumeRequirementArgsSchema,
   SemanticSearchArgsSchema,
   StartRequirementArgsSchema,
   SupersedeMemoryArgsSchema,
   SyncChangeIntentArgsSchema,
+  UpdateRequirementVerificationArgsSchema,
   UpsertConventionArgsSchema,
   UpsertDecisionArgsSchema,
   UpsertProjectSummaryArgsSchema,
@@ -57,6 +60,7 @@ type ToolDefinition = {
 type ToolBehavior = {
   tags: string[];
   readOnlyHint: boolean;
+  destructiveHint?: boolean;
   idempotentHint: boolean;
   openWorldHint?: boolean;
   advisoryOnly?: boolean;
@@ -66,10 +70,13 @@ type ToolBehavior = {
 const CORE_TOOL_ORDER = [
   "bootstrap_context",
   "start_requirement",
+  "get_requirement_status",
+  "resume_requirement",
   "preflight_change_scope",
   "plan_large_file_split",
   "record_large_file_split",
   "sync_change_intent",
+  "update_requirement_verification",
   "preflight_operation_scope",
   "read_memory_item",
   "upsert_decision",
@@ -89,7 +96,9 @@ const DEFAULT_READ_ONLY_BEHAVIOR: ToolBehavior = {
 };
 
 const TOOL_BEHAVIOR: Record<string, ToolBehavior> = {
-  start_requirement: { tags: ["write_memory", "requirement_boundary", "advisory_only", "duplicate_safe"], readOnlyHint: false, idempotentHint: true },
+  start_requirement: { tags: ["write_memory", "requirement_boundary", "advisory_only", "duplicate_safe"], readOnlyHint: false, destructiveHint: true, idempotentHint: true },
+  get_requirement_status: { tags: ["read_only", "requirement_lifecycle", "recovery"], readOnlyHint: true, idempotentHint: true },
+  resume_requirement: { tags: ["write_memory", "requirement_lifecycle", "recovery"], readOnlyHint: false, destructiveHint: true, idempotentHint: true },
   preflight_change_scope: {
     tags: ["read_only", "requirement_boundary", "advisory_quality_signals", "conditional_workflow_gate", "bounded_output"],
     readOnlyHint: true,
@@ -97,26 +106,31 @@ const TOOL_BEHAVIOR: Record<string, ToolBehavior> = {
     advisoryOnly: false,
     workflowGate: true,
   },
-  sync_change_intent: { tags: ["write_memory", "change_intent", "fix_pattern", "advisory_only"], readOnlyHint: false, idempotentHint: false },
+  sync_change_intent: { tags: ["write_memory", "change_intent", "fix_pattern", "advisory_only", "explicit_idempotency_key"], readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+  update_requirement_verification: { tags: ["write_memory", "requirement_lifecycle", "verification_evidence", "advisory_only"], readOnlyHint: false, destructiveHint: true, idempotentHint: false },
   preflight_operation_scope: { tags: ["read_only", "operation_scope", "current_constraints", "advisory_only"], readOnlyHint: true, idempotentHint: true },
-  plan_large_file_split: { tags: ["write_memory", "large_file_plan", "workflow_gate_evidence"], readOnlyHint: false, idempotentHint: false, advisoryOnly: false, workflowGate: true },
-  record_large_file_split: { tags: ["write_memory", "large_file_tracking", "advisory_only"], readOnlyHint: false, idempotentHint: false },
-  complete_requirement: { tags: ["write_memory", "requirement_lifecycle", "advisory_only"], readOnlyHint: false, idempotentHint: false },
-  clear_activity_log: { tags: ["diagnostic_state", "non_project_memory"], readOnlyHint: false, idempotentHint: true },
-  install_rtk: { tags: ["optional_setup", "dry_run_by_default"], readOnlyHint: false, idempotentHint: false, openWorldHint: true },
-  upsert_project_summary: { tags: ["write_memory", "project_summary", "advisory_only"], readOnlyHint: false, idempotentHint: true },
+  plan_large_file_split: { tags: ["write_memory", "large_file_plan", "workflow_gate_evidence"], readOnlyHint: false, destructiveHint: true, idempotentHint: false, advisoryOnly: false, workflowGate: true },
+  record_large_file_split: { tags: ["write_memory", "large_file_tracking", "advisory_only"], readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+  complete_requirement: { tags: ["write_memory", "requirement_lifecycle", "advisory_only"], readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+  clear_activity_log: { tags: ["diagnostic_state", "non_project_memory"], readOnlyHint: false, destructiveHint: true, idempotentHint: true },
+  install_rtk: { tags: ["optional_setup", "dry_run_by_default"], readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  upsert_project_summary: { tags: ["write_memory", "project_summary", "advisory_only"], readOnlyHint: false, destructiveHint: true, idempotentHint: true },
   add_note: { tags: ["write_memory", "project_note", "advisory_only"], readOnlyHint: false, idempotentHint: false },
-  upsert_decision: { tags: ["write_memory", "current_decision", "advisory_only"], readOnlyHint: false, idempotentHint: true },
-  supersede_memory: { tags: ["write_memory", "stale_memory_control", "advisory_only"], readOnlyHint: false, idempotentHint: false },
-  upsert_convention: { tags: ["write_memory", "project_convention", "advisory_only"], readOnlyHint: false, idempotentHint: true },
-  maintain_memory: { tags: ["memory_maintenance", "dry_run_by_default", "advisory_only"], readOnlyHint: false, idempotentHint: false },
-  prune_index: { tags: ["index_maintenance", "dry_run_by_default", "advisory_only"], readOnlyHint: false, idempotentHint: false },
+  upsert_decision: { tags: ["write_memory", "current_decision", "advisory_only"], readOnlyHint: false, destructiveHint: true, idempotentHint: true },
+  supersede_memory: { tags: ["write_memory", "stale_memory_control", "advisory_only"], readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+  upsert_convention: { tags: ["write_memory", "project_convention", "advisory_only"], readOnlyHint: false, destructiveHint: true, idempotentHint: true },
+  maintain_memory: { tags: ["memory_maintenance", "dry_run_by_default", "advisory_only"], readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+  prune_index: { tags: ["index_maintenance", "dry_run_by_default", "advisory_only"], readOnlyHint: false, destructiveHint: true, idempotentHint: false },
   create_checkpoint: { tags: ["write_memory", "checkpoint", "advisory_only"], readOnlyHint: false, idempotentHint: false },
   restore_checkpoint_context: { tags: ["read_only", "checkpoint_context", "advisory_only"], readOnlyHint: true, idempotentHint: true },
   analyze_memory_conflicts: { tags: ["read_only", "memory_diagnostics", "advisory_only"], readOnlyHint: true, idempotentHint: true },
   memory_quality_report: { tags: ["read_only", "memory_quality", "advisory_only"], readOnlyHint: true, idempotentHint: true },
   compare_checkpoint_context: { tags: ["read_only", "checkpoint_diff", "advisory_only"], readOnlyHint: true, idempotentHint: true },
 };
+
+export function isToolReadOnly(toolName: string): boolean {
+  return (TOOL_BEHAVIOR[toolName] ?? DEFAULT_READ_ONLY_BEHAVIOR).readOnlyHint;
+}
 
 function withToolBehavior(tool: ToolDefinition): ToolDefinition {
   const behavior = TOOL_BEHAVIOR[tool.name] ?? DEFAULT_READ_ONLY_BEHAVIOR;
@@ -125,7 +139,7 @@ function withToolBehavior(tool: ToolDefinition): ToolDefinition {
     annotations: {
       title: tool.name,
       readOnlyHint: behavior.readOnlyHint,
-      destructiveHint: false,
+      destructiveHint: behavior.readOnlyHint ? false : (behavior.destructiveHint ?? false),
       idempotentHint: behavior.idempotentHint,
       openWorldHint: behavior.openWorldHint ?? false,
     },
@@ -147,14 +161,30 @@ export async function listToolDefinitions() {
       {
         name: "start_requirement",
         description:
-          "Call once for a new code-change goal. Preserve the returned requirement.id or goal_key and pass it to preflight_change_scope and sync_change_intent when multiple tasks may run in the same project. Duplicate goal keys are reused.",
+          "Call once for a new code-change goal. The default serial workflow closes the previous active requirement; pass close_previous=false only for intentional parallel work. Preserve requirement.id or goal_key because explicit identities can finish preflight/sync after another goal becomes active.",
         inputSchema: toJsonSchemaCompat(StartRequirementArgsSchema),
+      },
+      {
+        name: "get_requirement_status",
+        description: "Read one requirement by req_id or goal_key, including whether it is active and resumable.",
+        inputSchema: toJsonSchemaCompat(GetRequirementStatusArgsSchema),
+      },
+      {
+        name: "resume_requirement",
+        description: "Explicitly reactivate a completed requirement by req_id or goal_key without closing other active requirements. Superseded requirements cannot be resumed.",
+        inputSchema: toJsonSchemaCompat(ResumeRequirementArgsSchema),
       },
       {
         name: "sync_change_intent",
         description:
-          "Call once after edits. Pass req_id or goal_key from start_requirement when tasks can overlap. Archives one intent summary and explicit affected files; include large_file_split_deferrals for plan-free minimal bugfix/hotfix debt. complete_requirement=true also closes that selected requirement.",
+          "Call once after edits. Pass req_id or goal_key from start_requirement when tasks can overlap. For transport/client retries, provide one stable explicit idempotency_key and reuse it only for that same logical call; calls without a key intentionally create new history. Pending files are consumed in bounded batches, and complete_requirement=true is accepted only when that batch leaves no pending entries. Include large_file_split_deferrals for plan-free minimal bugfix/hotfix debt.",
         inputSchema: toJsonSchemaCompat(SyncChangeIntentArgsSchema),
+      },
+      {
+        name: "update_requirement_verification",
+        description:
+          "Update verification evidence on the latest change_intent for an active or completed requirement without reopening it. By default verification entries merge while verification_gaps are replaced, so later authoritative test results can clear stale gaps. Superseded requirements are rejected, and each update creates a linked verification_update audit record.",
+        inputSchema: toJsonSchemaCompat(UpdateRequirementVerificationArgsSchema),
       },
       {
         name: "preflight_change_scope",
@@ -165,7 +195,7 @@ export async function listToolDefinitions() {
       {
         name: "preflight_operation_scope",
         description:
-          "Call BEFORE running concrete operation commands such as deploy/publish/build/test/migrate/service/git/batch scripts. It compares the planned operation/commands/files/targets against current_constraints from decisions, conventions, active requirements, and recent notes. Reports stale_default_conflict or operation_constraint_conflict as advisory quality signals only; it does not control host execution or model reasoning.",
+          "Call ONCE immediately BEFORE the first concrete deploy/publish/build/test/migrate/service/git/batch command, including commands discovered after bootstrap_context. Pass the actual planned commands and targets. bootstrap_context is historical recall and never substitutes for this operation preflight. It compares the operation against current constraints and reports advisory conflicts without controlling host execution or model reasoning.",
         inputSchema: toJsonSchemaCompat(PreflightOperationScopeArgsSchema),
       },
       {
@@ -189,7 +219,7 @@ export async function listToolDefinitions() {
       {
         name: "bootstrap_context",
         description:
-          "Call at most once for a new project goal when historical context is needed. Default focused mode returns project summary plus query-relevant matches within a compact output budget; recent history and pending files are opt-in.",
+          "Call at most once for a new project goal when historical context is needed. Default focused mode returns project summary plus query-relevant matches within a compact output budget; recent history and pending files are opt-in. When operation_preflight.required_before_commands=true, call preflight_operation_scope immediately before concrete commands; bootstrap_context does not satisfy that step.",
         inputSchema: toJsonSchemaCompat(BootstrapContextArgsSchema),
       },
       {

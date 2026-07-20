@@ -5,6 +5,9 @@ import { fileURLToPath } from "node:url";
 
 import type { RtkDetection } from "./types.js";
 import type { InstallRtkArgs } from "./tool-schemas.js";
+import { RTK_COMMIT_SHA } from "./rtk-integrity.js";
+
+type SecureRtkInstallMethod = "package_shim" | "cargo" | "brew" | "unavailable";
 
 function oneLine(input: string | null | undefined, max = 120): string {
   const normalized = String(input ?? "").replace(/\s+/g, " ").trim();
@@ -132,7 +135,7 @@ function commandExists(command: string): boolean {
   return result.status === 0;
 }
 
-function runInstallStep(command: string, args: string[], timeoutMs: number): {
+function runInstallStep(command: string, args: string[], timeoutMs: number, env?: NodeJS.ProcessEnv): {
   command: string;
   status: number | null;
   ok: boolean;
@@ -143,6 +146,7 @@ function runInstallStep(command: string, args: string[], timeoutMs: number): {
     timeout: timeoutMs,
     windowsHide: true,
     shell: false,
+    env,
   });
   const output = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
   return {
@@ -193,19 +197,28 @@ function appendRtkInitStep(
   if (init === "codex_local") steps.push(runDetectedRtkStep(detected, ["init", "--codex"], timeoutMs));
 }
 
-function chooseRtkInstallMethod(method: "auto" | "cargo" | "brew" | "shell_script"): "cargo" | "brew" | "shell_script" {
-  if (method !== "auto") return method;
+function chooseRtkInstallMethod(method: "auto" | "cargo" | "brew" | "shell_script"): SecureRtkInstallMethod {
+  const shimPath = getPackageRtkShimPath();
+  if (method === "cargo" || method === "brew") return method;
+  if (method === "shell_script") {
+    if (shimPath) return "package_shim";
+    if (commandExists("cargo")) return "cargo";
+    return "unavailable";
+  }
+  if (shimPath) return "package_shim";
   if (process.platform === "darwin" && commandExists("brew")) return "brew";
   if (commandExists("cargo")) return "cargo";
-  return "shell_script";
+  return "unavailable";
 }
 
-function buildRtkInstallPlan(args: InstallRtkArgs): {
-  method: "cargo" | "brew" | "shell_script";
+export function buildRtkInstallPlan(args: InstallRtkArgs): {
+  method: SecureRtkInstallMethod;
+  shimPath: string | null;
   commands: string[];
   notes: string[];
 } {
   const method = chooseRtkInstallMethod(args.method);
+  const shimPath = getPackageRtkShimPath();
   const commands: string[] = [];
   const notes: string[] = [];
 
@@ -217,31 +230,38 @@ function buildRtkInstallPlan(args: InstallRtkArgs): {
   if (method === "brew") {
     commands.push("brew install rtk");
   } else if (method === "cargo") {
-    commands.push("cargo install --git https://github.com/rtk-ai/rtk");
+    commands.push(`cargo install --locked --git https://github.com/rtk-ai/rtk --rev ${RTK_COMMIT_SHA}`);
+  } else if (method === "package_shim" && shimPath) {
+    commands.push(`${shellQuoteArg(process.execPath)} ${shellQuoteArg(shimPath)} --version`);
+    notes.push("The bundled RTK shim installs a pinned release asset only after SHA-256 verification.");
   } else {
-    if (process.platform === "win32") {
-      notes.push("shell_script install is Linux/macOS-oriented; on Windows prefer method=cargo after installing Rust/Cargo.");
-      commands.push("cargo install --git https://github.com/rtk-ai/rtk");
-    } else {
-      commands.push("curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/master/install.sh | sh");
-    }
+    notes.push("No verified package shim, Cargo, or Homebrew installer is available. Refusing to execute a mutable remote shell script.");
   }
 
-  commands.push("rtk --version");
-  commands.push("rtk gain");
+  const verifyCommand = method === "package_shim" && shimPath
+    ? `${shellQuoteArg(process.execPath)} ${shellQuoteArg(shimPath)}`
+    : "rtk";
+  if (method !== "unavailable") {
+    if (method !== "package_shim") commands.push(`${verifyCommand} --version`);
+    commands.push(`${verifyCommand} gain`);
+  }
 
-  if (args.init === "global_no_patch") commands.push("rtk init -g --no-patch");
-  if (args.init === "global_auto_patch") commands.push("rtk init -g --auto-patch");
-  if (args.init === "global_hook_only") commands.push("rtk init -g --hook-only --no-patch");
-  if (args.init === "local") commands.push("rtk init");
-  if (args.init === "codex_global") commands.push("rtk init -g --codex");
-  if (args.init === "codex_local") commands.push("rtk init --codex");
+  if (method !== "unavailable") {
+    if (args.init === "global_no_patch") commands.push(`${verifyCommand} init -g --no-patch`);
+    if (args.init === "global_auto_patch") commands.push(`${verifyCommand} init -g --auto-patch`);
+    if (args.init === "global_hook_only") commands.push(`${verifyCommand} init -g --hook-only --no-patch`);
+    if (args.init === "local") commands.push(`${verifyCommand} init`);
+    if (args.init === "codex_global") commands.push(`${verifyCommand} init -g --codex`);
+    if (args.init === "codex_local") commands.push(`${verifyCommand} init --codex`);
+  } else if (args.init !== "none") {
+    notes.push("RTK init cannot run because no verified installer is available.");
+  }
 
   if (args.init !== "none") {
     notes.push("rtk init may modify Claude/RTK configuration. Use init=none for binary-only installation.");
   }
 
-  return { method, commands, notes };
+  return { method, shimPath, commands, notes };
 }
 
 export function installRtk(args: InstallRtkArgs): {
@@ -281,7 +301,7 @@ export function installRtk(args: InstallRtkArgs): {
   if (args.dry_run) {
     notes.push("dry_run=true: no command was executed. Call install_rtk with dry_run=false to install.");
     return {
-      ok: true,
+      ok: plan.method !== "unavailable",
       dry_run: true,
       already_available: false,
       method: plan.method,
@@ -292,23 +312,27 @@ export function installRtk(args: InstallRtkArgs): {
     };
   }
 
-  if (plan.method === "brew") {
+  if (args.uninstall_wrong_cargo_rtk) {
+    steps.push(runInstallStep("cargo", ["uninstall", "rtk"], args.timeout_ms));
+  }
+
+  if (plan.method === "package_shim" && plan.shimPath) {
+    steps.push(runInstallStep(
+      process.execPath,
+      [plan.shimPath, "--version"],
+      args.timeout_ms,
+      { ...process.env, VECTORMIND_RTK_NO_AUTO_INSTALL: "0" },
+    ));
+  } else if (plan.method === "brew") {
     steps.push(runInstallStep("brew", ["install", "rtk"], args.timeout_ms));
   } else if (plan.method === "cargo") {
-    if (args.uninstall_wrong_cargo_rtk) {
-      steps.push(runInstallStep("cargo", ["uninstall", "rtk"], args.timeout_ms));
-    }
-    steps.push(runInstallStep("cargo", ["install", "--git", "https://github.com/rtk-ai/rtk"], args.timeout_ms));
-  } else if (process.platform === "win32") {
-    notes.push("Windows fallback uses Cargo because the upstream shell installer targets POSIX shells.");
-    if (args.uninstall_wrong_cargo_rtk) {
-      steps.push(runInstallStep("cargo", ["uninstall", "rtk"], args.timeout_ms));
-    }
-    steps.push(runInstallStep("cargo", ["install", "--git", "https://github.com/rtk-ai/rtk"], args.timeout_ms));
+    steps.push(runInstallStep(
+      "cargo",
+      ["install", "--locked", "--git", "https://github.com/rtk-ai/rtk", "--rev", RTK_COMMIT_SHA],
+      args.timeout_ms,
+    ));
   } else {
-    const script =
-      "curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/master/install.sh | sh";
-    steps.push(runInstallStep("sh", ["-c", script], args.timeout_ms));
+    notes.push("Installation was not attempted because no verified installer is available.");
   }
 
   const detectedAfterInstall = detectRtk();

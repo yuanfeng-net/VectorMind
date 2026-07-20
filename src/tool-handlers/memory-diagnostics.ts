@@ -4,21 +4,47 @@ import path from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
 import type { ToolHandlerContext } from "./context.js";
-import type { MemoryItemRow, PendingChangeRow, RequirementRow } from "../types.js";
+import type { ChangeLogRow, MemoryItemRow, PendingChangeRow, RequirementRow } from "../types.js";
 import {
   AnalyzeMemoryConflictsArgsSchema,
   CompareCheckpointContextArgsSchema,
   MemoryQualityReportArgsSchema,
 } from "../tool-schemas.js";
-import { flushPendingChangeBuffer } from "../file-indexing.js";
+import { peekPendingChangeBuffer } from "../file-indexing.js";
 import { isHiddenFromDefaultRecall, parseMetadataJson, toMemoryItemPreview, toRequirementPreview } from "../memory-recall.js";
 import { mergePendingWithGit } from "../pending-changes.js";
 import { fixPatternFromRow } from "../fix-patterns.js";
 import { logActivity } from "../activity-log.js";
 import { oneLine, toolJson } from "../tool-output.js";
 import { toolCompactOrJson } from "../token-savings.js";
+import {
+  LEGACY_CHECKPOINT_MEMORY_KINDS,
+  checkpointSnapshotBasis,
+  checkpointSnapshotFromMetadata,
+  getVisibleCheckpointDecisions,
+  getVisibleCheckpointMemory,
+  normalizeCheckpointSnapshot,
+  readCheckpointBasis,
+  toCheckpointChangePreview,
+  toCheckpointRecordPreview,
+  toCheckpointSnapshotMemoryPreview,
+} from "../checkpoint-snapshot.js";
 
 type MemoryPreview = ReturnType<typeof toMemoryItemPreview>;
+type CheckpointDiffPreview = Pick<MemoryPreview, "id" | "kind" | "title" | "file_path" | "req_id" | "preview" | "updated_at">;
+type CheckpointChangeDiffPreview = {
+  id: number;
+  file_path: string | null;
+  file_count?: number;
+  timestamp: string;
+  intent_preview: string;
+};
+type PendingDiffPreview = {
+  file_path: string;
+  last_event?: string;
+  source?: string;
+  git_status?: string;
+};
 
 type ConflictItem = {
   id?: number;
@@ -107,13 +133,18 @@ function compactCheckpointDiffText(data: {
   diff: {
     active_requirement_changed: boolean;
     project_summary_changed: boolean;
-    decisions_added: MemoryPreview[];
-    decisions_removed: MemoryPreview[];
-    decisions_changed: MemoryPreview[];
-    recent_memory_added: MemoryPreview[];
-    recent_memory_no_longer_recent: MemoryPreview[];
+    decisions_added: CheckpointDiffPreview[];
+    decisions_removed: CheckpointDiffPreview[];
+    decisions_changed: CheckpointDiffPreview[];
+    recent_memory_added: CheckpointDiffPreview[];
+    recent_memory_no_longer_recent: CheckpointDiffPreview[];
+    recent_memory_changed: CheckpointDiffPreview[];
+    recent_changes_added: CheckpointChangeDiffPreview[];
+    recent_changes_removed: CheckpointChangeDiffPreview[];
+    recent_changes_changed: CheckpointChangeDiffPreview[];
     pending_added: string[];
     pending_removed: string[];
+    pending_changed: PendingDiffPreview[];
   };
 }): string {
   const d = data.diff;
@@ -121,12 +152,15 @@ function compactCheckpointDiffText(data: {
     `checkpoint_diff #${data.checkpoint.id} ${oneLine(data.checkpoint.title ?? "checkpoint", 100)} read_only=${data.read_only}`,
     `active_changed=${d.active_requirement_changed} summary_changed=${d.project_summary_changed}`,
     `decisions added=${d.decisions_added.length} removed=${d.decisions_removed.length} changed=${d.decisions_changed.length}`,
-    `recent_memory added=${d.recent_memory_added.length} no_longer_recent=${d.recent_memory_no_longer_recent.length}`,
-    `pending added=${d.pending_added.length} removed=${d.pending_removed.length}`,
+    `recent_memory added=${d.recent_memory_added.length} no_longer_recent=${d.recent_memory_no_longer_recent.length} changed=${d.recent_memory_changed.length}`,
+    `recent_changes added=${d.recent_changes_added.length} removed=${d.recent_changes_removed.length} changed=${d.recent_changes_changed.length}`,
+    `pending added=${d.pending_added.length} removed=${d.pending_removed.length} changed=${d.pending_changed.length}`,
   ];
   for (const item of d.decisions_added.slice(0, 5)) lines.push(`- decision_added: #${item.id} ${oneLine(item.title ?? "", 100)}`);
   for (const item of d.decisions_removed.slice(0, 5)) lines.push(`- decision_removed: #${item.id} ${oneLine(item.title ?? "", 100)}`);
   for (const item of d.recent_memory_added.slice(0, 5)) lines.push(`- memory_added: #${item.id} ${item.kind} ${oneLine(item.title ?? "", 100)}`);
+  for (const item of d.recent_memory_changed.slice(0, 5)) lines.push(`- memory_changed: #${item.id} ${item.kind} ${oneLine(item.title ?? "", 100)}`);
+  for (const item of d.recent_changes_added.slice(0, 5)) lines.push(`- change_added: #${item.id} ${oneLine(item.intent_preview, 120)}`);
   for (const p of d.pending_added.slice(0, 5)) lines.push(`- pending_added: ${p}`);
   lines.push("hint: checkpoint diff is read-only; it does not restore, mutate, or expand the current requirement");
   return lines.join("\n");
@@ -190,42 +224,84 @@ function getCoreMemoryRows(context: ToolHandlerContext, args: {
     .all(...params) as MemoryItemRow[];
 }
 
-function getCurrentSnapshot(context: ToolHandlerContext, recentLimit: number, pendingLimit: number) {
-  flushPendingChangeBuffer();
+function getCurrentSnapshot(
+  context: ToolHandlerContext,
+  requestedBasis: ReturnType<typeof checkpointSnapshotBasis>,
+  excludeMemoryIds: readonly number[] = [],
+) {
   const db = context.getDb();
   const {
     getActiveRequirementStmt,
     getProjectSummaryStmt,
-    listCurrentDecisionsStmt,
+    listChangeLogsForRequirementStmt,
     listPendingChangesStmt,
   } = context.getStatements();
+  const basis = {
+    ...requestedBasis,
+    recent_limit: Math.min(50, requestedBasis.recent_limit),
+    decision_limit: Math.min(100, requestedBasis.decision_limit),
+    recent_change_limit: Math.min(100, requestedBasis.recent_change_limit),
+    pending_limit: Math.min(2_000, requestedBasis.pending_limit),
+  };
   const active = getActiveRequirementStmt.get() as RequirementRow | undefined;
   const projectSummary = getProjectSummaryStmt.get() as MemoryItemRow | undefined;
-  const decisions = (listCurrentDecisionsStmt.all(20) as MemoryItemRow[])
-    .filter((row) => !isHiddenFromDefaultRecall(row))
-    .map((row) => toMemoryItemPreview(row, false, 180, 1200));
-  const recentMemory = db
-    .prepare(
-      `SELECT id, kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at
-       FROM memory_items
-       WHERE kind IN ('requirement', 'change_intent', 'note', 'decision', 'checkpoint', 'memory_compaction', 'project_summary', 'convention', 'fix_pattern')
-       ORDER BY updated_at DESC, id DESC
-       LIMIT ?`,
-    )
-    .all(Math.max(recentLimit * 4, recentLimit)) as MemoryItemRow[];
-  const visibleRecent = recentMemory
-    .filter((row) => !isHiddenFromDefaultRecall(row))
-    .slice(0, recentLimit)
-    .map((row) => toMemoryItemPreview(row, false, 180, 1200));
-  const pendingRows = listPendingChangesStmt.all() as PendingChangeRow[];
-  const pending = pendingLimit > 0 ? mergePendingWithGit(pendingRows, { offset: 0, limit: pendingLimit }).page : [];
-  return {
+  const decisionWindow = getVisibleCheckpointDecisions(db, basis.decision_limit);
+  const decisions = decisionWindow.rows.map(toCheckpointSnapshotMemoryPreview);
+  const recentWindow = getVisibleCheckpointMemory(db, basis.recent_limit, excludeMemoryIds, basis.included_kinds);
+  const visibleRecent = recentWindow.rows.map(toCheckpointSnapshotMemoryPreview);
+  const pendingRows = [
+    ...(listPendingChangesStmt.all() as PendingChangeRow[]),
+    ...peekPendingChangeBuffer(),
+  ];
+  const pendingResult = basis.pending_limit > 0
+    ? mergePendingWithGit(pendingRows, { offset: 0, limit: basis.pending_limit })
+    : { total: 0, page: [], remaining: 0, truncated: false };
+  const recentChangeRows = active
+    ? listChangeLogsForRequirementStmt.all(active.id, basis.recent_change_limit + 1) as ChangeLogRow[]
+    : [];
+  const recentChanges = recentChangeRows.slice(0, basis.recent_change_limit).map(toCheckpointChangePreview);
+  return normalizeCheckpointSnapshot({
+    snapshot_version: basis.snapshot_version,
+    created_at: new Date().toISOString(),
+    advisory_only: true,
+    note: "Current context is read-only comparison evidence and does not mutate requirements or files.",
+    basis,
     active_requirement: active ? toRequirementPreview(active, false, 180, 1200) : null,
-    project_summary: projectSummary ? toMemoryItemPreview(projectSummary, false, 180, 1200) : null,
+    project_summary: projectSummary ? toCheckpointSnapshotMemoryPreview(projectSummary) : null,
     decisions,
     recent_memory: visibleRecent,
-    pending_changes: pending,
-  };
+    recent_changes: recentChanges,
+    pending_changes: pendingResult.page,
+    collections: {
+      decisions: {
+        total: decisions.length + (decisionWindow.truncated ? 1 : 0),
+        returned: decisions.length,
+        truncated: decisionWindow.truncated,
+        window_truncated: decisionWindow.truncated,
+        total_is_lower_bound: decisionWindow.truncated,
+      },
+      recent_memory: {
+        total: visibleRecent.length + (recentWindow.truncated ? 1 : 0),
+        returned: visibleRecent.length,
+        truncated: recentWindow.truncated,
+        window_truncated: recentWindow.truncated,
+        total_is_lower_bound: recentWindow.truncated,
+      },
+      recent_changes: {
+        total: recentChangeRows.length,
+        returned: recentChanges.length,
+        truncated: recentChangeRows.length > recentChanges.length,
+        window_truncated: recentChangeRows.length > recentChanges.length,
+        total_is_lower_bound: recentChangeRows.length > recentChanges.length,
+      },
+      pending_changes: {
+        total: pendingResult.total,
+        returned: pendingResult.page.length,
+        truncated: pendingResult.truncated,
+        window_truncated: pendingResult.truncated,
+      },
+    },
+  }, { fallbackBasis: basis });
 }
 
 function previewArrayById(items: unknown): Map<number, MemoryPreview> {
@@ -238,28 +314,125 @@ function previewArrayById(items: unknown): Map<number, MemoryPreview> {
   return result;
 }
 
+function toCheckpointDiffPreview(item: MemoryPreview): CheckpointDiffPreview {
+  return {
+    id: item.id,
+    kind: item.kind,
+    title: item.title ? oneLine(item.title, 240) : null,
+    file_path: item.file_path ? oneLine(item.file_path, 500) : null,
+    req_id: item.req_id,
+    preview: oneLine(item.preview, 240),
+    updated_at: item.updated_at,
+  };
+}
+
 function diffPreviewMaps(before: Map<number, MemoryPreview>, after: Map<number, MemoryPreview>) {
-  const added: MemoryPreview[] = [];
-  const removed: MemoryPreview[] = [];
-  const changed: MemoryPreview[] = [];
+  const added: CheckpointDiffPreview[] = [];
+  const removed: CheckpointDiffPreview[] = [];
+  const changed: CheckpointDiffPreview[] = [];
   for (const [id, item] of after) {
     const old = before.get(id);
-    if (!old) added.push(item);
-    else if ((old.preview ?? "") !== (item.preview ?? "") || old.updated_at !== item.updated_at) changed.push(item);
+    if (!old) added.push(toCheckpointDiffPreview(item));
+    else if (JSON.stringify(old) !== JSON.stringify(item)) {
+      changed.push(toCheckpointDiffPreview(item));
+    }
   }
   for (const [id, item] of before) {
-    if (!after.has(id)) removed.push(item);
+    if (!after.has(id)) removed.push(toCheckpointDiffPreview(item));
   }
   return { added, removed, changed };
 }
 
-function pendingPaths(items: unknown): Set<string> {
-  const result = new Set<string>();
+type CheckpointChangePreviewRecord = {
+  id: number;
+  file_path?: string | null;
+  file_count?: number;
+  timestamp?: string;
+  intent_preview?: string;
+};
+
+function changeArrayById(items: unknown): Map<number, CheckpointChangePreviewRecord> {
+  const result = new Map<number, CheckpointChangePreviewRecord>();
   if (!Array.isArray(items)) return result;
-  for (const item of items as Array<{ file_path?: unknown }>) {
-    if (typeof item.file_path === "string") result.add(item.file_path);
+  for (const raw of items) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const item = raw as CheckpointChangePreviewRecord;
+    if (typeof item.id === "number") result.set(item.id, item);
   }
   return result;
+}
+
+function toCheckpointChangeDiffPreview(item: CheckpointChangePreviewRecord): CheckpointChangeDiffPreview {
+  return {
+    id: item.id,
+    file_path: item.file_path ? oneLine(item.file_path, 500) : null,
+    file_count: typeof item.file_count === "number" ? item.file_count : undefined,
+    timestamp: oneLine(item.timestamp ?? "", 100),
+    intent_preview: oneLine(item.intent_preview ?? "", 240),
+  };
+}
+
+function diffChangeMaps(
+  before: Map<number, CheckpointChangePreviewRecord>,
+  after: Map<number, CheckpointChangePreviewRecord>,
+) {
+  const added: CheckpointChangeDiffPreview[] = [];
+  const removed: CheckpointChangeDiffPreview[] = [];
+  const changed: CheckpointChangeDiffPreview[] = [];
+  for (const [id, item] of after) {
+    const old = before.get(id);
+    if (!old) added.push(toCheckpointChangeDiffPreview(item));
+    else if (JSON.stringify(old) !== JSON.stringify(item)) changed.push(toCheckpointChangeDiffPreview(item));
+  }
+  for (const [id, item] of before) {
+    if (!after.has(id)) removed.push(toCheckpointChangeDiffPreview(item));
+  }
+  return { added, removed, changed };
+}
+
+type PendingPreviewRecord = {
+  file_path: string;
+  last_event?: string;
+  source?: string;
+  git_status?: string;
+  file_state_hash?: string;
+};
+
+function pendingByPath(items: unknown): Map<string, PendingPreviewRecord> {
+  const result = new Map<string, PendingPreviewRecord>();
+  if (!Array.isArray(items)) return result;
+  for (const raw of items) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const item = raw as Record<string, unknown>;
+    if (typeof item.file_path !== "string") continue;
+    result.set(item.file_path, {
+      file_path: item.file_path,
+      last_event: typeof item.last_event === "string" ? item.last_event : undefined,
+      source: typeof item.source === "string" ? item.source : undefined,
+      git_status: typeof item.git_status === "string" ? item.git_status : undefined,
+      file_state_hash: typeof item.file_state_hash === "string" ? item.file_state_hash : undefined,
+    });
+  }
+  return result;
+}
+
+function toPendingDiffPreview(item: PendingPreviewRecord): PendingDiffPreview {
+  return {
+    file_path: oneLine(item.file_path, 500),
+    last_event: item.last_event ? oneLine(item.last_event, 80) : undefined,
+    source: item.source ? oneLine(item.source, 40) : undefined,
+    git_status: item.git_status ? oneLine(item.git_status, 40) : undefined,
+  };
+}
+
+function snapshotCollectionsComplete(snapshot: Record<string, unknown>): boolean {
+  const collections = snapshot.collections;
+  if (!collections || typeof collections !== "object" || Array.isArray(collections)) return false;
+  return Object.values(collections as Record<string, unknown>).every((value) => {
+    return !!value && typeof value === "object" && !Array.isArray(value)
+      && (value as { truncated?: unknown }).truncated !== true
+      && (value as { window_truncated?: unknown }).window_truncated !== true;
+  });
 }
 
 export async function handleAnalyzeMemoryConflicts(
@@ -587,9 +760,60 @@ export async function handleCompareCheckpointContext(
     };
   }
 
-  const meta = parseMetadataJson(row.metadata_json);
-  const checkpointSnapshot = (meta.snapshot && typeof meta.snapshot === "object" ? meta.snapshot : {}) as Record<string, unknown>;
-  const currentSnapshot = getCurrentSnapshot(context, args.recent_limit, args.pending_limit);
+  const fallbackBasis = checkpointSnapshotBasis(args.recent_limit, args.pending_limit);
+  const stored = checkpointSnapshotFromMetadata(row.metadata_json, fallbackBasis);
+  const checkpoint = toCheckpointRecordPreview(row, false, args.preview_chars, args.content_max_chars);
+  if (!stored.valid) {
+    const outputValue = {
+      ok: true,
+      read_only: true,
+      advisory_only: true,
+      comparable: false,
+      diff_complete: false,
+      reason: "checkpoint snapshot is missing or invalid",
+      checkpoint,
+    };
+    return {
+      content: [{
+        type: "text",
+        text: toolCompactOrJson(
+          "compare_checkpoint_context",
+          outputValue,
+          `checkpoint_diff #${row.id} ${oneLine(row.title ?? "checkpoint", 100)} comparable=false reason=missing_or_invalid_snapshot`,
+          args.format,
+        ),
+      }],
+    };
+  }
+
+  const checkpointSnapshot = stored.snapshot;
+  const sourceSnapshotVersion = Number(checkpointSnapshot.source_snapshot_version ?? 1);
+  const basisKnown = sourceSnapshotVersion >= 2;
+  const inferredLegacyBasis = {
+    ...fallbackBasis,
+    recent_limit: Array.isArray(checkpointSnapshot.recent_memory) ? checkpointSnapshot.recent_memory.length : 0,
+    decision_limit: Array.isArray(checkpointSnapshot.decisions) ? checkpointSnapshot.decisions.length : 0,
+    recent_change_limit: Array.isArray(checkpointSnapshot.recent_changes) ? checkpointSnapshot.recent_changes.length : 0,
+    pending_limit: Array.isArray(checkpointSnapshot.pending_changes) ? checkpointSnapshot.pending_changes.length : 0,
+    included_kinds: [...LEGACY_CHECKPOINT_MEMORY_KINDS],
+  };
+  const storedBasis = basisKnown
+    ? readCheckpointBasis(checkpointSnapshot.basis, fallbackBasis)
+    : inferredLegacyBasis;
+  const recentLimitExplicit = Object.prototype.hasOwnProperty.call(rawArgs, "recent_limit");
+  const pendingLimitExplicit = Object.prototype.hasOwnProperty.call(rawArgs, "pending_limit");
+  const effectiveBasis = {
+    ...storedBasis,
+    recent_limit: recentLimitExplicit ? args.recent_limit : storedBasis.recent_limit,
+    pending_limit: pendingLimitExplicit ? args.pending_limit : storedBasis.pending_limit,
+  };
+  const detectedWindowMismatch = effectiveBasis.recent_limit !== storedBasis.recent_limit
+    || effectiveBasis.pending_limit !== storedBasis.pending_limit
+    || effectiveBasis.decision_limit !== storedBasis.decision_limit
+    || effectiveBasis.recent_change_limit !== storedBasis.recent_change_limit
+    || JSON.stringify(effectiveBasis.included_kinds) !== JSON.stringify(storedBasis.included_kinds);
+  const windowMismatch = basisKnown ? detectedWindowMismatch : detectedWindowMismatch ? true : null;
+  const currentSnapshot = getCurrentSnapshot(context, effectiveBasis, [row.id]);
 
   const beforeDecisions = previewArrayById(checkpointSnapshot.decisions);
   const afterDecisions = previewArrayById(currentSnapshot.decisions);
@@ -597,20 +821,30 @@ export async function handleCompareCheckpointContext(
   const beforeRecent = previewArrayById(checkpointSnapshot.recent_memory);
   const afterRecent = previewArrayById(currentSnapshot.recent_memory);
   const recentDiff = diffPreviewMaps(beforeRecent, afterRecent);
-  const beforePending = pendingPaths(checkpointSnapshot.pending_changes);
-  const afterPending = pendingPaths(currentSnapshot.pending_changes);
-  const pendingAdded = Array.from(afterPending).filter((p) => !beforePending.has(p));
-  const pendingRemoved = Array.from(beforePending).filter((p) => !afterPending.has(p));
+  const beforeChanges = changeArrayById(checkpointSnapshot.recent_changes);
+  const afterChanges = changeArrayById(currentSnapshot.recent_changes);
+  const recentChangeDiff = diffChangeMaps(beforeChanges, afterChanges);
+  const beforePending = pendingByPath(checkpointSnapshot.pending_changes);
+  const afterPending = pendingByPath(currentSnapshot.pending_changes);
+  const pendingAdded = Array.from(afterPending.keys()).filter((filePath) => !beforePending.has(filePath));
+  const pendingRemoved = Array.from(beforePending.keys()).filter((filePath) => !afterPending.has(filePath));
+  const pendingChanged = Array.from(afterPending.entries())
+    .filter(([filePath, item]) => {
+      const old = beforePending.get(filePath);
+      return old && JSON.stringify(old) !== JSON.stringify(item);
+    })
+    .map(([, item]) => toPendingDiffPreview(item));
 
-  const checkpointActive = checkpointSnapshot.active_requirement as { id?: number; title?: string; status?: string } | null | undefined;
-  const currentActive = currentSnapshot.active_requirement as { id?: number; title?: string; status?: string } | null | undefined;
+  const checkpointActive = checkpointSnapshot.active_requirement as { id?: number; title?: string; status?: string; context_preview?: string } | null | undefined;
+  const currentActive = currentSnapshot.active_requirement as { id?: number; title?: string; status?: string; context_preview?: string } | null | undefined;
   const checkpointSummary = checkpointSnapshot.project_summary as { id?: number; preview?: string; updated_at?: string } | null | undefined;
   const currentSummary = currentSnapshot.project_summary as { id?: number; preview?: string; updated_at?: string } | null | undefined;
   const diff = {
     active_requirement_changed:
       (checkpointActive?.id ?? null) !== (currentActive?.id ?? null) ||
       (checkpointActive?.title ?? "") !== (currentActive?.title ?? "") ||
-      (checkpointActive?.status ?? "") !== (currentActive?.status ?? ""),
+      (checkpointActive?.status ?? "") !== (currentActive?.status ?? "") ||
+      (checkpointActive?.context_preview ?? "") !== (currentActive?.context_preview ?? ""),
     project_summary_changed:
       (checkpointSummary?.id ?? null) !== (currentSummary?.id ?? null) ||
       (checkpointSummary?.preview ?? "") !== (currentSummary?.preview ?? "") ||
@@ -620,15 +854,31 @@ export async function handleCompareCheckpointContext(
     decisions_changed: decisionDiff.changed,
     recent_memory_added: recentDiff.added,
     recent_memory_no_longer_recent: recentDiff.removed,
+    recent_memory_changed: recentDiff.changed,
+    recent_changes_added: recentChangeDiff.added,
+    recent_changes_removed: recentChangeDiff.removed,
+    recent_changes_changed: recentChangeDiff.changed,
     pending_added: pendingAdded,
     pending_removed: pendingRemoved,
+    pending_changed: pendingChanged,
   };
+
+  const diffComplete = basisKnown
+    && windowMismatch === false
+    && snapshotCollectionsComplete(checkpointSnapshot)
+    && snapshotCollectionsComplete(currentSnapshot);
 
   const outputValue = {
     ok: true,
     read_only: true,
     advisory_only: true,
-    checkpoint: toMemoryItemPreview(row, false, args.preview_chars, args.content_max_chars),
+    comparable: true,
+    diff_complete: diffComplete,
+    basis_inferred: !basisKnown,
+    window_mismatch: windowMismatch,
+    window_mismatch_known: windowMismatch !== null,
+    comparison_basis: effectiveBasis,
+    checkpoint,
     checkpoint_snapshot: checkpointSnapshot,
     current_snapshot: currentSnapshot,
     diff,

@@ -122,67 +122,70 @@ function initMemoryItemsFts(): void {
   ftsAvailable = false;
 
   try {
-    const existed = db
-      .prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`)
-      .get(FTS_TABLE_NAME);
-    const alreadyExists = !!existed;
+    const initializeFts = db.transaction(() => {
+      const existed = db
+        .prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`)
+        .get(FTS_TABLE_NAME);
+      const alreadyExists = !!existed;
 
-    if (!alreadyExists) {
-      try {
-        db.exec(`
-          CREATE VIRTUAL TABLE ${FTS_TABLE_NAME} USING fts5(
-            kind,
-            title,
-            content,
-            file_path,
-            metadata_json,
-            content='memory_items',
-            content_rowid='id',
-            tokenize='trigram'
-          );
-        `);
-      } catch {
-        db.exec(`
-          CREATE VIRTUAL TABLE ${FTS_TABLE_NAME} USING fts5(
-            kind,
-            title,
-            content,
-            file_path,
-            metadata_json,
-            content='memory_items',
-            content_rowid='id'
-          );
-        `);
+      if (!alreadyExists) {
+        try {
+          db.exec(`
+            CREATE VIRTUAL TABLE ${FTS_TABLE_NAME} USING fts5(
+              kind,
+              title,
+              content,
+              file_path,
+              metadata_json,
+              content='memory_items',
+              content_rowid='id',
+              tokenize='trigram'
+            );
+          `);
+        } catch {
+          db.exec(`
+            CREATE VIRTUAL TABLE ${FTS_TABLE_NAME} USING fts5(
+              kind,
+              title,
+              content,
+              file_path,
+              metadata_json,
+              content='memory_items',
+              content_rowid='id'
+            );
+          `);
+        }
+
+        try {
+          db.exec(`INSERT INTO ${FTS_TABLE_NAME}(${FTS_TABLE_NAME}) VALUES('rebuild');`);
+        } catch (err) {
+          console.error("[vectormind] fts rebuild failed:", err);
+        }
       }
 
-      try {
-        db.exec(`INSERT INTO ${FTS_TABLE_NAME}(${FTS_TABLE_NAME}) VALUES('rebuild');`);
-      } catch (err) {
-        console.error("[vectormind] fts rebuild failed:", err);
-      }
-    }
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS vectormind_memory_items_fts_ai
+        AFTER INSERT ON memory_items BEGIN
+          INSERT INTO ${FTS_TABLE_NAME}(rowid, kind, title, content, file_path, metadata_json)
+          VALUES (new.id, new.kind, new.title, new.content, new.file_path, new.metadata_json);
+        END;
 
-    db.exec(`
-      CREATE TRIGGER IF NOT EXISTS vectormind_memory_items_fts_ai
-      AFTER INSERT ON memory_items BEGIN
-        INSERT INTO ${FTS_TABLE_NAME}(rowid, kind, title, content, file_path, metadata_json)
-        VALUES (new.id, new.kind, new.title, new.content, new.file_path, new.metadata_json);
-      END;
+        CREATE TRIGGER IF NOT EXISTS vectormind_memory_items_fts_ad
+        AFTER DELETE ON memory_items BEGIN
+          INSERT INTO ${FTS_TABLE_NAME}(${FTS_TABLE_NAME}, rowid, kind, title, content, file_path, metadata_json)
+          VALUES ('delete', old.id, old.kind, old.title, old.content, old.file_path, old.metadata_json);
+        END;
 
-      CREATE TRIGGER IF NOT EXISTS vectormind_memory_items_fts_ad
-      AFTER DELETE ON memory_items BEGIN
-        INSERT INTO ${FTS_TABLE_NAME}(${FTS_TABLE_NAME}, rowid, kind, title, content, file_path, metadata_json)
-        VALUES ('delete', old.id, old.kind, old.title, old.content, old.file_path, old.metadata_json);
-      END;
-
-      CREATE TRIGGER IF NOT EXISTS vectormind_memory_items_fts_au
-      AFTER UPDATE ON memory_items BEGIN
-        INSERT INTO ${FTS_TABLE_NAME}(${FTS_TABLE_NAME}, rowid, kind, title, content, file_path, metadata_json)
-        VALUES ('delete', old.id, old.kind, old.title, old.content, old.file_path, old.metadata_json);
-        INSERT INTO ${FTS_TABLE_NAME}(rowid, kind, title, content, file_path, metadata_json)
-        VALUES (new.id, new.kind, new.title, new.content, new.file_path, new.metadata_json);
-      END;
-    `);
+        CREATE TRIGGER IF NOT EXISTS vectormind_memory_items_fts_au
+        AFTER UPDATE ON memory_items BEGIN
+          INSERT INTO ${FTS_TABLE_NAME}(${FTS_TABLE_NAME}, rowid, kind, title, content, file_path, metadata_json)
+          VALUES ('delete', old.id, old.kind, old.title, old.content, old.file_path, old.metadata_json);
+          INSERT INTO ${FTS_TABLE_NAME}(rowid, kind, title, content, file_path, metadata_json)
+          VALUES (new.id, new.kind, new.title, new.content, new.file_path, new.metadata_json);
+        END;
+      `);
+    });
+    initializeFts.immediate();
 
     db.prepare(`SELECT rowid FROM ${FTS_TABLE_NAME} LIMIT 1`).get();
     ftsAvailable = true;
@@ -730,25 +733,44 @@ export function openDatabaseRuntime(projectRoot: string): DatabaseRuntime {
     );
   `);
 
-  if (!columnExists("requirements", "updated_at")) {
-    db.exec(`ALTER TABLE requirements ADD COLUMN updated_at DATETIME`);
-    db.exec(`UPDATE requirements SET updated_at = COALESCE(created_at, CURRENT_TIMESTAMP) WHERE updated_at IS NULL`);
-  }
-  if (!columnExists("requirements", "goal_key")) {
-    db.exec(`ALTER TABLE requirements ADD COLUMN goal_key TEXT`);
-  }
-  if (!columnExists("change_logs", "files_json")) {
-    db.exec(`ALTER TABLE change_logs ADD COLUMN files_json TEXT`);
-  }
-  if (!columnExists("change_logs", "file_count")) {
-    db.exec(`ALTER TABLE change_logs ADD COLUMN file_count INTEGER DEFAULT 1`);
-    db.exec(`UPDATE change_logs SET file_count = 1 WHERE file_count IS NULL`);
-  }
+  const migrateLegacyColumns = db.transaction(() => {
+    if (!columnExists("requirements", "updated_at")) {
+      db.exec(`ALTER TABLE requirements ADD COLUMN updated_at DATETIME`);
+      db.exec(`UPDATE requirements SET updated_at = COALESCE(created_at, CURRENT_TIMESTAMP) WHERE updated_at IS NULL`);
+    }
+    if (!columnExists("requirements", "goal_key")) {
+      db.exec(`ALTER TABLE requirements ADD COLUMN goal_key TEXT`);
+    }
+    if (!columnExists("change_logs", "files_json")) {
+      db.exec(`ALTER TABLE change_logs ADD COLUMN files_json TEXT`);
+    }
+    if (!columnExists("change_logs", "file_count")) {
+      db.exec(`ALTER TABLE change_logs ADD COLUMN file_count INTEGER DEFAULT 1`);
+      db.exec(`UPDATE change_logs SET file_count = 1 WHERE file_count IS NULL`);
+    }
+  });
+  migrateLegacyColumns.immediate();
   db.transaction(() => {
     db.exec(`
       UPDATE requirements SET updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP) WHERE updated_at IS NULL;
       UPDATE requirements
-         SET status = 'superseded'
+         SET updated_at = (
+           SELECT MAX(mi.updated_at)
+             FROM memory_items mi
+            WHERE mi.kind = 'requirement' AND mi.req_id = requirements.id
+         )
+       WHERE (
+           SELECT MAX(mi.updated_at)
+             FROM memory_items mi
+            WHERE mi.kind = 'requirement' AND mi.req_id = requirements.id
+         ) IS NOT NULL
+         AND datetime((
+           SELECT MAX(mi.updated_at)
+             FROM memory_items mi
+            WHERE mi.kind = 'requirement' AND mi.req_id = requirements.id
+         )) > datetime(COALESCE(requirements.updated_at, requirements.created_at, '1970-01-01 00:00:00'));
+      UPDATE requirements
+         SET status = 'superseded', updated_at = CURRENT_TIMESTAMP
        WHERE status = 'active'
          AND goal_key IS NOT NULL
          AND EXISTS (
@@ -803,10 +825,10 @@ export function openDatabaseRuntime(projectRoot: string): DatabaseRuntime {
     `INSERT INTO requirements (title, context_data, goal_key, status) VALUES (?, ?, ?, 'active')`,
   );
   completeAllActiveRequirementsStmt = db.prepare(
-    `UPDATE requirements SET status = 'completed' WHERE status = 'active'`,
+    `UPDATE requirements SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE status = 'active'`,
   );
   completeRequirementByIdStmt = db.prepare(
-    `UPDATE requirements SET status = 'completed' WHERE id = ?`,
+    `UPDATE requirements SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
   );
   getActiveRequirementStmt = db.prepare(
     `SELECT id, title, status, context_data, goal_key, created_at

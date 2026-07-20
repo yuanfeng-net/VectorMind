@@ -3,6 +3,7 @@ import { CallToolRequestSchema, type CallToolResult } from "@modelcontextprotoco
 
 import type { ProjectContextAdvisory, ToolHandler, ToolHandlerContext } from "./tool-handlers/context.js";
 import { handleStartRequirement, handlePreflightChangeScope, handleSyncChangeIntent, handleGetPendingChanges, handleCompleteRequirement } from "./tool-handlers/requirements.js";
+import { handleGetRequirementStatus, handleResumeRequirement, handleUpdateRequirementVerification } from "./tool-handlers/requirement-status.js";
 import { handlePruneIndex, handleMaintainMemory } from "./tool-handlers/maintenance.js";
 import { handlePlanLargeFileSplit, handleRecordLargeFileSplit } from "./tool-handlers/large-files.js";
 import { handleBootstrapContext, handleGetBrainDump, handleReadMemoryItem, handleSemanticSearch } from "./tool-handlers/memory.js";
@@ -12,12 +13,15 @@ import { handleGetActivityLog, handleGetActivitySummary, handleClearActivityLog,
 import { handleCreateCheckpoint, handleListCheckpoints, handleMemoryTimeline, handleRestoreCheckpointContext } from "./tool-handlers/context-recovery.js";
 import { handleAnalyzeMemoryConflicts, handleCompareCheckpointContext, handleMemoryQualityReport } from "./tool-handlers/memory-diagnostics.js";
 import { handlePreflightOperationScope } from "./tool-handlers/operations.js";
-import { runAutoMaintenanceIfDue } from "./memory-maintenance.js";
+import { runAutoMaintenanceIfDue, withAutoMaintenanceSuppressed } from "./memory-maintenance/runner.js";
+import { isToolReadOnly } from "./tool-catalog.js";
 import { oneLine, toolJson } from "./tool-output.js";
 
 export type { ToolHandlerContext } from "./tool-handlers/context.js";
 const TOOL_HANDLERS: Record<string, ToolHandler> = {
   start_requirement: handleStartRequirement,
+  get_requirement_status: handleGetRequirementStatus,
+  resume_requirement: handleResumeRequirement,
   prune_index: handlePruneIndex,
   maintain_memory: handleMaintainMemory,
   preflight_change_scope: handlePreflightChangeScope,
@@ -25,6 +29,7 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
   plan_large_file_split: handlePlanLargeFileSplit,
   record_large_file_split: handleRecordLargeFileSplit,
   sync_change_intent: handleSyncChangeIntent,
+  update_requirement_verification: handleUpdateRequirementVerification,
   bootstrap_context: handleBootstrapContext,
   get_brain_dump: handleGetBrainDump,
   get_pending_changes: handleGetPendingChanges,
@@ -105,41 +110,136 @@ function maxToolOutputChars(): number {
   return Number.isFinite(configured) ? Math.max(4_000, Math.min(500_000, Math.trunc(configured))) : 100_000;
 }
 
+const BOUNDED_RESULT_KEYS = [
+  "project_root",
+  "db_path",
+  "requirement_id",
+  "req_id",
+  "goal_key",
+  "change_log_id",
+  "memory_id",
+  "plan_id",
+  "checkpoint_id",
+  "status",
+  "safe_to_edit",
+  "safe_to_proceed",
+  "read_only",
+  "dry_run",
+  "total",
+  "count",
+  "file_count",
+] as const;
+
+const BOUNDED_NESTED_IDENTITY_KEYS = new Set([
+  "id",
+  "title",
+  "name",
+  "key",
+  "kind",
+  "status",
+  "file_count",
+  "total",
+  "count",
+]);
+
+function boundedNestedIdentities(parsed: Record<string, unknown> | null): Record<string, unknown> {
+  if (!parsed) return {};
+  const result: Record<string, unknown> = {};
+  for (const [containerKey, containerValue] of Object.entries(parsed)) {
+    if (!containerValue || typeof containerValue !== "object" || Array.isArray(containerValue)) continue;
+    const identity: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(containerValue as Record<string, unknown>)) {
+      const preserveKey = BOUNDED_NESTED_IDENTITY_KEYS.has(key) || key.endsWith("_id");
+      if (!preserveKey) continue;
+      if (typeof value === "string") identity[key] = oneLine(value, 240);
+      else if (typeof value === "number" || typeof value === "boolean" || value === null) identity[key] = value;
+    }
+    if (Object.keys(identity).length) result[containerKey] = identity;
+  }
+  return result;
+}
+
+function boundedStructuredSummary(
+  toolName: string,
+  parsedValue: unknown,
+  originalChars: number,
+  limit: number,
+  failed: boolean,
+): Record<string, unknown> {
+  const parsed = parsedValue && typeof parsedValue === "object" && !Array.isArray(parsedValue)
+    ? parsedValue as Record<string, unknown>
+    : null;
+  const preserved: Record<string, unknown> = {};
+  for (const key of BOUNDED_RESULT_KEYS) {
+    const value = parsed?.[key];
+    if (typeof value === "string") preserved[key] = oneLine(value, 240);
+    else if (typeof value === "number" || typeof value === "boolean" || value === null) preserved[key] = value;
+  }
+  const resultShape = Array.isArray(parsedValue)
+    ? { result_type: "array", result_items: parsedValue.length }
+    : { result_type: parsed ? "object" : typeof parsedValue };
+  const common = {
+    ok: !failed,
+    tool: toolName,
+    output_truncated: true,
+    original_chars: originalChars,
+    max_output_chars: limit,
+    ...resultShape,
+    ...(parsed ? { result_keys: Object.keys(parsed).slice(0, 40) } : {}),
+    ...preserved,
+    ...boundedNestedIdentities(parsed),
+  };
+  if (!failed) {
+    return {
+      ...common,
+      summary: "The tool completed successfully, but its structured result exceeded the configured output budget. Narrow the query or use pagination for full details.",
+    };
+  }
+  const originalError = typeof parsed?.error === "string"
+    ? parsed.error
+    : typeof parsed?.message === "string"
+      ? parsed.message
+      : "The structured tool result failed and exceeded the configured output budget.";
+  return {
+    ...common,
+    error: oneLine(originalError, 800),
+  };
+}
+
 export function boundToolResult(toolName: string, result: CallToolResult): CallToolResult {
   const limit = maxToolOutputChars();
-  let structuredTruncated = false;
+  let failedStructuredTruncated = false;
   const content = result.content?.map((item) => {
     if (item.type !== "text" || typeof item.text !== "string" || item.text.length <= limit) return item;
     const originalChars = item.text.length;
     const trimmed = item.text.trim();
     if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-      structuredTruncated = true;
-      let parsed: Record<string, unknown> | null = null;
+      let parsedValue: unknown = null;
+      let parsedSuccessfully = false;
       try {
-        const value = JSON.parse(trimmed);
-        parsed = value && typeof value === "object" && !Array.isArray(value)
-          ? value as Record<string, unknown>
-          : null;
+        parsedValue = JSON.parse(trimmed);
+        parsedSuccessfully = true;
       } catch {
-        parsed = null;
+        parsedValue = null;
       }
+      const parsed = parsedValue && typeof parsedValue === "object" && !Array.isArray(parsedValue)
+        ? parsedValue as Record<string, unknown>
+        : null;
+      const failed = result.isError === true || !parsedSuccessfully || parsed?.ok === false;
+      if (failed) failedStructuredTruncated = true;
       return {
         ...item,
-        text: toolJson({
-          ok: false,
-          error: "Structured tool output exceeded the configured context budget. Narrow the query, lower limits, or use pagination.",
-          tool: toolName,
-          output_truncated: true,
-          original_chars: originalChars,
-          max_output_chars: limit,
-          project_root: typeof parsed?.project_root === "string" ? parsed.project_root : undefined,
-        }),
+        text: toolJson(boundedStructuredSummary(toolName, parsedValue, originalChars, limit, failed)),
       };
     }
     const suffix = "\noutput budget: truncated; narrow the query or use pagination";
     return { ...item, text: `${item.text.slice(0, Math.max(0, limit - suffix.length)).trimEnd()}${suffix}` };
   });
-  return { ...result, ...(structuredTruncated ? { isError: true } : {}), content };
+  return { ...result, ...(failedStructuredTruncated ? { isError: true } : {}), content };
+}
+
+export function shouldRunAutoMaintenanceForTool(toolName: string): boolean {
+  return toolName !== "maintain_memory" && !isToolReadOnly(toolName);
 }
 
 function persistMcpToolMetric(
@@ -460,8 +560,12 @@ export function registerToolHandlers(server: Server, context: ToolHandlerContext
     const startedAt = performance.now();
 
     try {
-      await context.ensureInitializedForArgs(rawArgs);
-      if (toolName !== "maintain_memory") runAutoMaintenanceIfDue();
+      if (isToolReadOnly(toolName)) {
+        await withAutoMaintenanceSuppressed(() => context.ensureInitializedForArgs(rawArgs));
+      } else {
+        await context.ensureInitializedForArgs(rawArgs);
+      }
+      if (shouldRunAutoMaintenanceForTool(toolName)) runAutoMaintenanceIfDue();
 
       const handler = TOOL_HANDLERS[toolName];
       if (!handler) {

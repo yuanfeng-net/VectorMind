@@ -5,8 +5,8 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { ToolHandlerContext } from "./context.js";
 import type { MemoryItemRow, RequirementRow } from "../types.js";
 import type { ChangeMode } from "../development-warnings.js";
-import { CompleteRequirementArgsSchema, GetPendingChangesArgsSchema, MAX_PENDING_LIMIT, PreflightChangeScopeArgsSchema, StartRequirementArgsSchema, SyncChangeIntentArgsSchema } from "../tool-schemas.js";
-import { buildDevelopmentWarnings, buildRequirementMappingWarnings, buildRequirementScopeContract, buildRequirementStartWarnings, buildScopeDriftWarnings, getRequirementItems, getRequirementScopeContract, isDevelopmentWarningBlockingForChangeMode, mergeScopeContracts, normalizeRequirementItems } from "../development-warnings.js";
+import { CompleteRequirementArgsSchema, GetPendingChangesArgsSchema, PreflightChangeScopeArgsSchema, StartRequirementArgsSchema, SyncChangeIntentArgsSchema } from "../tool-schemas.js";
+import { buildDevelopmentWarnings, buildRequirementMappingWarnings, buildRequirementScopeContract, buildRequirementStartWarnings, buildScopeDriftWarnings, getRequirementItems, getRequirementScopeContract, isDevelopmentWarningBlockingForChangeMode, mergeScopeContracts, normalizeRequirementItems, scopeContractHasRules } from "../development-warnings.js";
 import { mergePendingWithGit } from "../pending-changes.js";
 import { toolCompactOrJson } from "../token-savings.js";
 import { flushPendingChangeBuffer, indexFile } from "../file-indexing.js";
@@ -18,10 +18,75 @@ import { compactPreflightChangeScopeText, safeJson, toolJson } from "../tool-out
 import { normalizeRequirementGoalIdentity, sameRequirement } from "../context-governance.js";
 import { DEVELOPMENT_HUGE_FILE_LINES } from "../config.js";
 import { hashFileContentStreaming } from "../large-file-split.js";
-
-let sessionActiveRequirement: { project_root: string; id: number } | null = null;
+import { resolvePathWithinRoot } from "../path-containment.js";
 
 const UNFINISHED_SPLIT_PLAN_STATUSES = new Set(["planned", "in_progress", "partial", "needs_refinement"]);
+const MAX_SYNC_RESPONSE_ITEMS = 100;
+const MAX_SYNC_RESPONSE_ARRAY_CHARS = 12_000;
+type CachedPreflightValue = Parameters<typeof compactPreflightChangeScopeText>[0] & Record<string, unknown>;
+type StartRequirementWriteOutcome =
+  | { kind: "created"; id: number; memoryId: number; closedPrevious: boolean }
+  | { kind: "reused"; requirement: RequirementRow; reuseReason: string; closedPrevious: boolean }
+  | { kind: "error"; error: string; activeRequirements?: RequirementRow[]; activeCount?: number };
+const preflightResultCache = new Map<string, CachedPreflightValue>();
+
+function normalizeIdentityText(value: string | null | undefined): string {
+  return (value ?? "").normalize("NFKC").trim().replace(/\s+/g, " ").toLocaleLowerCase();
+}
+
+function canonicalizeIdentity(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalizeIdentity);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, canonicalizeIdentity(item)]),
+  );
+}
+
+function sortedUniqueStrings(values: Array<string | null | undefined>): string[] {
+  return [...new Set(values.map((value) => normalizeIdentityText(value)).filter(Boolean))].sort();
+}
+
+function createSyncResponseBudget() {
+  let remainingChars = MAX_SYNC_RESPONSE_ARRAY_CHARS;
+  return function boundItems<T>(items: T[]): { page: T[]; total: number; truncated: boolean } {
+    const page: T[] = [];
+    for (const item of items) {
+      if (page.length >= MAX_SYNC_RESPONSE_ITEMS) break;
+      const itemChars = JSON.stringify(item).length + (page.length ? 1 : 0);
+      if (itemChars > remainingChars) break;
+      page.push(item);
+      remainingChars -= itemChars;
+    }
+    return { page, total: items.length, truncated: page.length < items.length };
+  };
+}
+
+function rememberPreflight(key: string, value: CachedPreflightValue): void {
+  preflightResultCache.set(key, value);
+  if (preflightResultCache.size <= 200) return;
+  const oldest = preflightResultCache.keys().next().value as string | undefined;
+  if (oldest) preflightResultCache.delete(oldest);
+}
+
+function renderPreflight(
+  value: CachedPreflightValue,
+  format: "compact" | "json",
+): CallToolResult {
+  return {
+    content: [{
+      type: "text",
+      text: toolCompactOrJson(
+        "preflight_change_scope",
+        value,
+        compactPreflightChangeScopeText(value),
+        format,
+      ),
+    }],
+  };
+}
 
 function fileReachesLineThreshold(absPath: string, threshold: number): boolean {
   const fd = fs.openSync(absPath, "r");
@@ -65,38 +130,53 @@ function hasUnfinishedLargeFileSplitPlan(
 function resolveActiveRequirement(
   context: ToolHandlerContext,
   args: { req_id?: number; goal_key?: string },
-): { requirement: RequirementRow | undefined; ambiguous: boolean; active_count: number } {
-  const {
-    getActiveRequirementByIdStmt,
-    getActiveRequirementByGoalKeyStmt,
-    listActiveRequirementsStmt,
-  } = context.getStatements();
+): {
+  requirement: RequirementRow | undefined;
+  ambiguous: boolean;
+  active_count: number;
+  requested_status: string | null;
+  found: boolean;
+} {
+  const { listActiveRequirementsStmt } = context.getStatements();
+  const activeCount = Number((context.getDb().prepare(
+    `SELECT COUNT(*) AS count FROM requirements WHERE status = 'active'`,
+  ).get() as { count: number } | undefined)?.count ?? 0);
   if (args.req_id) {
+    const requirement = context.getDb().prepare(
+      `SELECT id, title, status, context_data, goal_key, created_at
+         FROM requirements WHERE id = ? LIMIT 1`,
+    ).get(args.req_id) as RequirementRow | undefined;
     return {
-      requirement: getActiveRequirementByIdStmt.get(args.req_id) as RequirementRow | undefined,
+      requirement: requirement?.status === "superseded" ? undefined : requirement,
       ambiguous: false,
-      active_count: 1,
+      active_count: activeCount,
+      requested_status: requirement?.status ?? null,
+      found: !!requirement,
     };
   }
   if (args.goal_key?.trim()) {
+    const requirement = context.getDb().prepare(
+      `SELECT id, title, status, context_data, goal_key, created_at
+         FROM requirements WHERE goal_key = ?
+         ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'completed' THEN 1 ELSE 2 END,
+                  updated_at DESC, id DESC
+         LIMIT 1`,
+    ).get(args.goal_key.trim()) as RequirementRow | undefined;
     return {
-      requirement: getActiveRequirementByGoalKeyStmt.get(args.goal_key.trim()) as RequirementRow | undefined,
+      requirement: requirement?.status === "superseded" ? undefined : requirement,
       ambiguous: false,
-      active_count: 1,
+      active_count: activeCount,
+      requested_status: requirement?.status ?? null,
+      found: !!requirement,
     };
-  }
-  if (sessionActiveRequirement && sessionActiveRequirement.project_root === context.getProjectRoot()) {
-    const sessionRequirement = getActiveRequirementByIdStmt.get(sessionActiveRequirement.id) as RequirementRow | undefined;
-    if (sessionRequirement) {
-      return { requirement: sessionRequirement, ambiguous: false, active_count: 1 };
-    }
-    if (sessionActiveRequirement?.project_root === context.getProjectRoot()) sessionActiveRequirement = null;
   }
   const active = listActiveRequirementsStmt.all(2) as RequirementRow[];
   return {
     requirement: active.length === 1 ? active[0] : undefined,
-    ambiguous: active.length > 1,
-    active_count: active.length,
+    ambiguous: activeCount > 1,
+    active_count: activeCount,
+    requested_status: active.length === 1 ? active[0].status : null,
+    found: active.length === 1,
   };
 }
 
@@ -193,6 +273,7 @@ export async function handleStartRequirement(
   } = context.getStatements();
 
   const args = StartRequirementArgsSchema.parse(rawArgs);
+  const shouldClosePrevious = args.close_previous || args.previous_req_id != null;
   flushPendingChangeBuffer();
   const scope_contract = buildRequirementScopeContract({
     title: args.title,
@@ -206,105 +287,168 @@ export async function handleStartRequirement(
   const development_warnings = buildRequirementStartWarnings({
     title: args.title,
     background: args.background,
-    close_previous: args.close_previous,
+    close_previous: shouldClosePrevious,
   });
 
   const explicitGoalKey = args.goal_key?.trim() ?? "";
   const goalKey = explicitGoalKey ||
     `auto:${sha256Hex(normalizeRequirementGoalIdentity(args.title, args.background)).slice(0, 24)}`;
-  const activeByGoalKey = getActiveRequirementByGoalKeyStmt.get(goalKey) as RequirementRow | undefined;
-  const activeCandidates = listActiveRequirementsStmt.all(50) as RequirementRow[];
-  const active = activeByGoalKey ?? (!explicitGoalKey
-    ? activeCandidates.find((candidate) => sameRequirement(candidate, { ...args, goal_key: goalKey }))
-    : undefined);
-  if (args.reuse_active && active && sameRequirement(active, { ...args, goal_key: goalKey })) {
-    sessionActiveRequirement = { project_root: context.getProjectRoot(), id: active.id };
-    const memoryId = (getRequirementMemoryItemIdStmt.get(active.id) as { id: number } | undefined)?.id ?? null;
-    const activeScopeContract = getRequirementScopeContract(active.id);
-    const activeRequirementItems = getRequirementItems(active.id);
-    logActivity("start_requirement", {
-      req_id: active.id,
-      title: active.title,
-      reused_active: true,
+  const background = args.background?.trim() ?? "";
+  const content = background ? `${args.title}\n\n${background}` : args.title;
+  let writeOutcome: StartRequirementWriteOutcome;
+  try {
+    const writeTransaction = context.getDb().transaction((): StartRequirementWriteOutcome => {
+      const currentByGoalKey = getActiveRequirementByGoalKeyStmt.get(goalKey) as RequirementRow | undefined;
+      const currentActiveCandidates = listActiveRequirementsStmt.all(50) as RequirementRow[];
+      const currentExactActive = !explicitGoalKey
+        ? currentActiveCandidates.find((candidate) => sameRequirement(candidate, { ...args, goal_key: goalKey }))
+        : undefined;
+      const currentActive = currentByGoalKey ?? currentExactActive;
+      const currentReuseReason = currentByGoalKey
+        ? "goal_key"
+        : currentExactActive
+          ? "same_requirement"
+          : null;
+      if (args.reuse_active && currentActive && currentReuseReason) {
+        return {
+          kind: "reused",
+          requirement: currentActive,
+          reuseReason: currentReuseReason,
+          closedPrevious: false,
+        };
+      }
+
+      if (shouldClosePrevious && !args.previous_req_id && currentActiveCandidates.length > 1) {
+        return {
+          kind: "error",
+          error: "Multiple active requirements exist. Pass previous_req_id to close one, or pass an existing goal_key to resume it.",
+          activeRequirements: currentActiveCandidates.slice(0, 10),
+          activeCount: currentActiveCandidates.length,
+        };
+      }
+
+      let closedPrevious = false;
+      const previousRequirementId = args.previous_req_id ??
+        (currentActiveCandidates.length === 1 ? currentActiveCandidates[0].id : null);
+      if (shouldClosePrevious && previousRequirementId) {
+        const completed = completeRequirementMemoryItemsByReqId(previousRequirementId);
+        if (!completed) {
+          const raced = getActiveRequirementByGoalKeyStmt.get(goalKey) as RequirementRow | undefined;
+          if (raced) {
+            return {
+              kind: "reused",
+              requirement: raced,
+              reuseReason: "concurrent_goal_key_insert",
+              closedPrevious: false,
+            };
+          }
+          return {
+            kind: "error",
+            error: `previous_req_id ${previousRequirementId} is not active and cannot be closed.`,
+          };
+        }
+        closedPrevious = true;
+      }
+
+      let id: number;
+      try {
+        const info = insertRequirementStmt.run(args.title, args.background || null, goalKey);
+        id = Number(info.lastInsertRowid);
+      } catch (err) {
+        const raced = getActiveRequirementByGoalKeyStmt.get(goalKey) as RequirementRow | undefined;
+        if (!raced) throw err;
+        return {
+          kind: "reused",
+          requirement: raced,
+          reuseReason: "concurrent_goal_key_insert",
+          closedPrevious,
+        };
+      }
+
+      const memoryInfo = insertMemoryItemStmt.run(
+        "requirement",
+        args.title,
+        content,
+        null,
+        null,
+        null,
+        id,
+        safeJson({ status: "active", goal_key: goalKey, scope_contract, requirement_items }),
+        sha256Hex(content),
+      );
+      return {
+        kind: "created",
+        id,
+        memoryId: Number(memoryInfo.lastInsertRowid),
+        closedPrevious,
+      };
     });
+    writeOutcome = writeTransaction.immediate();
+  } catch (err) {
     return {
-      content: [
-        {
-          type: "text",
-          text: toolJson({
-            ok: true,
-            requirement: { id: active.id, title: active.title },
-            goal_key: active.goal_key ?? goalKey,
-            memory_item: { id: memoryId },
-            reused: true,
-            closed_previous: false,
-            scope_contract: activeScopeContract,
-            requirement_items: activeRequirementItems,
-            development_warnings: [],
-          }),
-        },
-      ],
+      isError: true,
+      content: [{
+        type: "text",
+        text: toolJson({ ok: false, error: `Failed to start requirement atomically: ${String(err)}` }),
+      }],
     };
   }
 
-  let closedPrevious = false;
-  const previousRequirementId = args.previous_req_id ??
-    (sessionActiveRequirement?.project_root === context.getProjectRoot() ? sessionActiveRequirement.id : null);
-  if (args.close_previous && previousRequirementId) {
-    try {
-      completeRequirementMemoryItemsByReqId(previousRequirementId);
-      closedPrevious = true;
-    } catch (err) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: toolJson({ ok: false, error: `Failed to close previous requirement atomically: ${String(err)}` }) }],
-      };
-    }
-  }
-
-  let id: number;
-  try {
-    const info = insertRequirementStmt.run(args.title, args.background || null, goalKey);
-    id = Number(info.lastInsertRowid);
-  } catch (err) {
-    const raced = getActiveRequirementByGoalKeyStmt.get(goalKey) as RequirementRow | undefined;
-    if (!raced) throw err;
-    sessionActiveRequirement = { project_root: context.getProjectRoot(), id: raced.id };
+  if (writeOutcome.kind === "error") {
     return {
+      isError: true,
       content: [{
         type: "text",
         text: toolJson({
-          ok: true,
-          requirement: { id: raced.id, title: raced.title },
-          goal_key: goalKey,
-          reused: true,
-          reuse_reason: "concurrent_goal_key_insert",
-          closed_previous: closedPrevious,
+          ok: false,
+          error: writeOutcome.error,
+          ...(writeOutcome.activeRequirements
+            ? {
+                active_count: writeOutcome.activeCount ?? writeOutcome.activeRequirements.length,
+                active_requirements: writeOutcome.activeRequirements.map((candidate) => ({
+                  id: candidate.id,
+                  title: candidate.title,
+                  goal_key: candidate.goal_key,
+                })),
+              }
+            : {}),
         }),
       }],
     };
   }
 
-  const background = args.background?.trim() ?? "";
-  const content = background ? `${args.title}\n\n${background}` : args.title;
-  const memoryInfo = insertMemoryItemStmt.run(
-    "requirement",
-    args.title,
-    content,
-    null,
-    null,
-    null,
-    id,
-    safeJson({ status: "active", goal_key: goalKey, scope_contract, requirement_items }),
-    sha256Hex(content),
-  );
-  const memory_id = Number(memoryInfo.lastInsertRowid);
-  sessionActiveRequirement = { project_root: context.getProjectRoot(), id };
+  if (writeOutcome.kind === "reused") {
+    const memoryId = (getRequirementMemoryItemIdStmt.get(writeOutcome.requirement.id) as { id: number } | undefined)?.id ?? null;
+    const activeScopeContract = getRequirementScopeContract(writeOutcome.requirement.id);
+    const activeRequirementItems = getRequirementItems(writeOutcome.requirement.id);
+    logActivity("start_requirement", {
+      req_id: writeOutcome.requirement.id,
+      title: writeOutcome.requirement.title,
+      reused_active: true,
+    });
+    return {
+      content: [{
+        type: "text",
+        text: toolJson({
+          ok: true,
+          requirement: { id: writeOutcome.requirement.id, title: writeOutcome.requirement.title },
+          goal_key: writeOutcome.requirement.goal_key ?? goalKey,
+          memory_item: { id: memoryId },
+          reused: true,
+          reuse_reason: writeOutcome.reuseReason,
+          closed_previous: writeOutcome.closedPrevious,
+          scope_contract: activeScopeContract,
+          requirement_items: activeRequirementItems,
+          development_warnings: [],
+        }),
+      }],
+    };
+  }
 
   logActivity("start_requirement", {
-    req_id: id,
+    req_id: writeOutcome.id,
     title: args.title,
-    closed_previous: args.close_previous,
+    closed_previous: writeOutcome.closedPrevious,
     scope_contract,
     requirement_items,
     development_warnings: development_warnings.length,
@@ -316,10 +460,10 @@ export async function handleStartRequirement(
         type: "text",
         text: toolJson({
           ok: true,
-          requirement: { id, title: args.title },
+          requirement: { id: writeOutcome.id, title: args.title },
           goal_key: goalKey,
-          memory_item: { id: memory_id },
-          closed_previous: closedPrevious,
+          memory_item: { id: writeOutcome.memoryId },
+          closed_previous: writeOutcome.closedPrevious,
           close_previous_ignored: false,
           scope_contract,
           requirement_items,
@@ -342,6 +486,7 @@ export async function handlePreflightChangeScope(
   );
   const resolution = resolveActiveRequirement(context, args);
   const active = resolution.requirement;
+  const normalizedFiles = files.map(normalizeToDbPath);
   const explicitContract = buildRequirementScopeContract({
     title: active?.title ?? "",
     background: active?.context_data ?? "",
@@ -350,6 +495,20 @@ export async function handlePreflightChangeScope(
     allowed_paths: args.allowed_paths,
     denied_paths: args.denied_paths,
   });
+  const persistedContract = active ? getRequirementScopeContract(active.id) : null;
+  const mergedContract = mergeScopeContracts(persistedContract, explicitContract);
+  const temporaryExactFileContract = !scopeContractHasRules(mergedContract) &&
+      args.files === undefined &&
+      (args.planned_files?.length ?? 0) > 0
+    ? {
+        allow_terms: [],
+        deny_terms: [],
+        allowed_paths: Array.from(new Set(normalizedFiles)),
+        denied_paths: [],
+        inferred_from: ["preflight.planned_files"],
+      }
+    : null;
+  const scope_contract = mergeScopeContracts(mergedContract, temporaryExactFileContract);
   const explicitRequirementItems = normalizeRequirementItems(args.requirement_items);
   const requirementItems = explicitRequirementItems.length
     ? explicitRequirementItems
@@ -361,7 +520,7 @@ export async function handlePreflightChangeScope(
     ...buildDevelopmentWarnings(fileInputs, { includeUnspecified: fileInputs.length === 0 }),
     ...buildScopeDriftWarnings({
       requirement: active,
-      contract: explicitContract,
+      contract: scope_contract,
       intent: args.intent,
       files: fileInputs,
       includeMissingContractHint: true,
@@ -374,19 +533,6 @@ export async function handlePreflightChangeScope(
       change_mode: changeMode,
     }),
   ];
-  const scope_contract = mergeScopeContracts(
-    active ? getRequirementScopeContract(active.id) : null,
-    explicitContract,
-  );
-
-  logActivity("preflight_change_scope", {
-    req_id: active?.id ?? null,
-    intent_preview: makePreviewText(args.intent, 200),
-    change_mode: changeMode,
-    files: files.slice(0, 25),
-    files_total: files.length,
-    development_warnings: development_warnings.length,
-  });
 
   const hasTargetFiles = fileInputs.length > 0;
   const hugeWarnings = development_warnings.filter((w) => w.code === "huge_file_modularization_required");
@@ -411,7 +557,6 @@ export async function handlePreflightChangeScope(
   const hasBlockingWarnings = blockingWarnings.length > 0 || hugeGateBlocked;
   const hasActiveRequirement = !!active;
   const safeToEdit = hasActiveRequirement && hasTargetFiles && !hasBlockingWarnings;
-  const normalizedFiles = files.map(normalizeToDbPath);
   const relevantFixPatterns = collectRelevantFixPatterns(context, {
     intent: args.intent,
     files: normalizedFiles,
@@ -448,7 +593,7 @@ export async function handlePreflightChangeScope(
     ? (["mechanical_modularization", "bugfix", "emergency_hotfix"] as ChangeMode[])
     : undefined;
 
-  const outputValue = {
+  const baseOutputValue = {
     ok: safeToEdit,
     safe_to_edit: safeToEdit,
     advisory_only: !hasHugeFile,
@@ -484,23 +629,39 @@ export async function handlePreflightChangeScope(
       planned_changes: args.planned_changes ?? [],
     },
     scope_contract,
+    scope_contract_persistence: temporaryExactFileContract
+      ? "temporary_read_only"
+      : scopeContractHasRules(scope_contract)
+        ? "persisted_or_explicit"
+        : "none",
     development_warnings,
     quality_signals,
   };
-
-  return {
-    content: [
-      {
-        type: "text",
-        text: toolCompactOrJson(
-          "preflight_change_scope",
-          outputValue,
-          compactPreflightChangeScopeText(outputValue),
-          args.format,
-        ),
-      },
-    ],
-  };
+  const preflightIdempotencyKey = context.sha256Hex(
+    JSON.stringify(canonicalizeIdentity(baseOutputValue)),
+  );
+  const cacheKey = `${context.getProjectRoot()}\n${preflightIdempotencyKey}`;
+  const cachedPreflight = preflightResultCache.get(cacheKey);
+  const reused = !!cachedPreflight;
+  const outputValue = {
+    ...(cachedPreflight ?? baseOutputValue),
+    reused,
+    idempotency_key: preflightIdempotencyKey,
+  } as CachedPreflightValue;
+  if (!cachedPreflight) {
+    rememberPreflight(cacheKey, outputValue);
+  }
+  logActivity("preflight_change_scope", {
+    req_id: active?.id ?? null,
+    intent_preview: makePreviewText(args.intent, 200),
+    change_mode: changeMode,
+    files: files.slice(0, 25),
+    files_total: files.length,
+    development_warnings: development_warnings.length,
+    reused,
+    idempotency_key: preflightIdempotencyKey,
+  });
+  return renderPreflight(outputValue, args.format);
 }
 export async function handleSyncChangeIntent(
   rawArgs: Record<string, unknown>,
@@ -517,7 +678,6 @@ export async function handleSyncChangeIntent(
     insertMemoryItemStmt,
     listPendingChangesStmt,
     deletePendingChangeStmt,
-    deleteAllPendingChangesStmt,
   } = context.getStatements();
 
   const args = SyncChangeIntentArgsSchema.parse(rawArgs);
@@ -530,25 +690,154 @@ export async function handleSyncChangeIntent(
           : args.verification_gaps,
       })
     : null;
-  flushPendingChangeBuffer();
-  const explicitFiles = (args.files ?? args.affected_files ?? []).filter(
+  const toContainedFile = (input: string, allowMissing: boolean): { absolute: string; dbFilePath: string } => {
+    const absolute = resolvePathWithinRoot(projectRoot, input, { allowMissing });
+    const relative = path.relative(projectRoot, absolute);
+    if (!relative || relative === ".") {
+      throw new Error(`sync_change_intent file must identify an entry below project_root: ${input}`);
+    }
+    return { absolute, dbFilePath: normalizeToDbPath(relative) };
+  };
+  const explicitFileInputs = [...(args.files ?? []), ...(args.affected_files ?? [])].filter(
     (f): f is string => typeof f === "string" && f.length > 0,
   );
+  const explicitFiles = explicitFileInputs.map((rawFile) => {
+    const contained = toContainedFile(rawFile, true);
+    return { rawFile: contained.absolute, dbFilePath: contained.dbFilePath };
+  });
   const largeFileSplitDeferrals = (args.large_file_split_deferrals ?? []).map((deferral) => {
-    const absolute = path.resolve(path.isAbsolute(deferral.file) ? deferral.file : path.join(projectRoot, deferral.file));
-    const relative = path.relative(projectRoot, absolute);
-    if (relative.startsWith("..") || path.isAbsolute(relative)) {
-      throw new Error(`Large-file split deferral path must be under project_root: ${deferral.file}`);
-    }
+    const contained = toContainedFile(deferral.file, true);
     return {
-      file: normalizeToDbPath(relative),
+      file: contained.dbFilePath,
       reason: deferral.reason.trim(),
       recorded_at: new Date().toISOString(),
     };
   });
+  const syncIdempotencyKey = args.idempotency_key?.trim() || null;
+  const requestFingerprint = syncIdempotencyKey
+    ? sha256Hex(JSON.stringify(canonicalizeIdentity({
+        req_id: args.req_id ?? null,
+        goal_key: normalizeIdentityText(args.goal_key),
+        intent: normalizeIdentityText(args.intent),
+        files: explicitFiles.map((file) => file.dbFilePath).sort(),
+        verification: sortedUniqueStrings(args.verification ?? []),
+        verification_gaps: sortedUniqueStrings(args.verification_gaps ?? []),
+        fix_pattern: explicitFixPattern,
+        large_file_split_deferrals: largeFileSplitDeferrals
+          .map((deferral) => ({ file: deferral.file, reason: normalizeIdentityText(deferral.reason) }))
+          .sort((left, right) => left.file.localeCompare(right.file)),
+        pending_limit: args.pending_limit,
+        complete_requirement: args.complete_requirement,
+      })))
+    : null;
+  type ExistingSyncRow = {
+    id: number;
+    req_id: number;
+    requirement_title: string;
+    metadata_json: string | null;
+  };
+  const findExistingSync = (): ExistingSyncRow | undefined => {
+    if (!syncIdempotencyKey) return undefined;
+    return db.prepare(
+      `SELECT mi.id, mi.req_id, r.title AS requirement_title, mi.metadata_json
+         FROM memory_items mi
+         JOIN requirements r ON r.id = mi.req_id
+        WHERE mi.kind = 'change_intent'
+          AND json_valid(COALESCE(mi.metadata_json, '{}'))
+          AND json_extract(mi.metadata_json, '$.idempotency_key') = ?
+        ORDER BY mi.updated_at DESC, mi.id DESC
+        LIMIT 1`,
+    ).get(syncIdempotencyKey) as ExistingSyncRow | undefined;
+  };
+  const replayExistingSync = (existing: ExistingSyncRow): CallToolResult => {
+    const metadata = parseMetadataJson(existing.metadata_json);
+    if (metadata.request_fingerprint !== requestFingerprint) {
+      return {
+        isError: true,
+        content: [{
+          type: "text",
+          text: toolJson({
+            ok: false,
+            error: "idempotency_key conflict: the key was already used with different sync_change_intent arguments",
+            idempotency_key: syncIdempotencyKey,
+          }),
+        }],
+      };
+    }
+    const storedFiles = Array.isArray(metadata.files)
+      ? metadata.files
+          .filter((file): file is Record<string, unknown> => !!file && typeof file === "object" && !Array.isArray(file))
+          .map((file) => ({
+            file_path: String(file.file_path ?? ""),
+            event: String(file.event ?? "manual"),
+            source: file.source === "args" || file.source === "pending" || file.source === "unspecified"
+              ? file.source
+              : "unspecified" as const,
+          }))
+          .filter((file) => file.file_path.length > 0)
+      : [];
+    const changeLogId = Number(metadata.change_log_id ?? 0);
+    const developmentWarnings = buildDevelopmentWarnings(storedFiles, {
+      includeUnspecified: storedFiles.some((file) => file.file_path === "(unspecified)"),
+    });
+    const boundResponseItems = createSyncResponseBudget();
+    const boundedStoredFiles = boundResponseItems(storedFiles);
+    const storedVerification = Array.isArray(metadata.verification) ? metadata.verification : [];
+    const storedVerificationGaps = Array.isArray(metadata.verification_gaps) ? metadata.verification_gaps : [];
+    const storedDeferrals = Array.isArray(metadata.large_file_split_deferrals)
+      ? metadata.large_file_split_deferrals
+      : [];
+    const boundedVerification = boundResponseItems(storedVerification);
+    const boundedVerificationGaps = boundResponseItems(storedVerificationGaps);
+    const boundedDeferrals = boundResponseItems(storedDeferrals);
+    const boundedWarnings = boundResponseItems(developmentWarnings);
+    return {
+      content: [{
+        type: "text",
+        text: toolJson({
+          ok: true,
+          linked_to_requirement: { id: existing.req_id, title: existing.requirement_title },
+          synced_files: boundedStoredFiles.page,
+          synced_files_total: boundedStoredFiles.total,
+          synced_files_truncated: boundedStoredFiles.truncated,
+          created: [],
+          created_total: 0,
+          created_truncated: false,
+          created_change: {
+            change_log_id: changeLogId,
+            memory_item_id: existing.id,
+            file_count: Number(metadata.file_count ?? storedFiles.filter((file) => file.file_path !== "(unspecified)").length),
+          },
+          verification: boundedVerification.page,
+          verification_total: boundedVerification.total,
+          verification_truncated: boundedVerification.truncated,
+          verification_gaps: boundedVerificationGaps.page,
+          verification_gaps_total: boundedVerificationGaps.total,
+          verification_gaps_truncated: boundedVerificationGaps.truncated,
+          large_file_split_deferrals: boundedDeferrals.page,
+          large_file_split_deferrals_total: boundedDeferrals.total,
+          large_file_split_deferrals_truncated: boundedDeferrals.truncated,
+          created_fix_pattern: metadata.created_fix_pattern ?? null,
+          requirement_completed: metadata.complete_requirement === true,
+          pending_batch: metadata.pending_batch ?? null,
+          reused: true,
+          idempotency_key: syncIdempotencyKey,
+          development_warnings: boundedWarnings.page,
+          development_warnings_total: boundedWarnings.total,
+          development_warnings_truncated: boundedWarnings.truncated,
+        }),
+      }],
+    };
+  };
+  const existingBeforeResolution = findExistingSync();
+  if (existingBeforeResolution) return replayExistingSync(existingBeforeResolution);
+
+  flushPendingChangeBuffer();
   const resolution = resolveActiveRequirement(context, args);
   const active = resolution.requirement;
   if (!active) {
+    const existingAfterResolution = findExistingSync();
+    if (existingAfterResolution) return replayExistingSync(existingAfterResolution);
     return {
       isError: true,
       content: [
@@ -556,10 +845,35 @@ export async function handleSyncChangeIntent(
           type: "text",
           text: toolJson({
             ok: false,
+            code: resolution.ambiguous
+              ? "MULTIPLE_ACTIVE_REQUIREMENTS"
+              : resolution.requested_status === "superseded"
+                ? "REQUIREMENT_SUPERSEDED"
+                : resolution.found
+                  ? "REQUIREMENT_NOT_WRITABLE"
+              : "REQUIREMENT_NOT_ACTIVE_IN_PROJECT",
             error: resolution.ambiguous
               ? "Multiple active requirements exist. Pass req_id or goal_key to sync_change_intent."
-              : "No matching active requirement. Call start_requirement({ project_root, title, background }) first; optionally provide goal_key, then pass its req_id/goal_key here.",
+              : resolution.requested_status === "superseded"
+                ? "The requested requirement was superseded and cannot accept new change intent. Start a new requirement instead."
+              : "No matching active requirement exists under the resolved project root. Call start_requirement({ project_root, title, background }) for a new goal, or inspect/resume an existing requirement.",
+            project_root: context.getProjectRoot(),
+            requested: {
+              req_id: args.req_id ?? null,
+              goal_key: args.goal_key?.trim() || null,
+            },
             active_count: resolution.active_count,
+            active_requirements: (context.getStatements().listActiveRequirementsStmt.all(10) as RequirementRow[])
+              .map((requirement) => ({ id: requirement.id, title: requirement.title, goal_key: requirement.goal_key })),
+            recovery: resolution.ambiguous
+              ? { action: "pass_requirement_identity", tools: ["get_requirement_status"] }
+              : resolution.requested_status === "superseded"
+                ? { action: "start_replacement_requirement", tools: ["get_requirement_status", "start_requirement"] }
+              : {
+                  action: "inspect_or_resume_requirement",
+                  tools: ["get_requirement_status", "resume_requirement", "start_requirement"],
+                  hint: "Verify project_root matches the start_requirement call. Use project_root_mode=exact only for an intentionally independent nested project.",
+                },
           }),
         },
       ],
@@ -574,13 +888,25 @@ export async function handleSyncChangeIntent(
     memory_item_id: number;
   }> = [];
   let createdChange: { change_log_id: number; memory_item_id: number; file_count: number } | null = null;
+  const reusedSync = false;
+  let pendingBatch: {
+    limit: number;
+    total: number;
+    processed: number;
+    remaining: number;
+    truncated: boolean;
+  } | null = null;
   const fixPatternMemoryItem: { value: { id: number; kind: "fix_pattern"; title: string } | null } = { value: null };
   const synced_files: Array<{
     file_path: string;
     event: string;
     source: "args" | "pending" | "unspecified";
   }> = [];
+  let transactionReplay: ExistingSyncRow | undefined;
   const insertTx = db.transaction(() => {
+    transactionReplay = findExistingSync();
+    if (transactionReplay) return;
+    const pendingPathsToDelete = new Set<string>();
     const targets: Array<{
       rawFile: string;
       dbFilePath: string;
@@ -589,12 +915,9 @@ export async function handleSyncChangeIntent(
     }> = [];
 
     if (explicitFiles.length) {
-      for (const rawFile of explicitFiles) {
-        const dbFilePath = normalizeToDbPath(rawFile);
-        targets.push({ rawFile, dbFilePath, event: "manual", source: "args" });
-      }
-      for (const t of targets) {
-        deletePendingChangeStmt.run(t.dbFilePath);
+      for (const file of explicitFiles) {
+        targets.push({ rawFile: file.rawFile, dbFilePath: file.dbFilePath, event: "manual", source: "args" });
+        pendingPathsToDelete.add(file.dbFilePath);
       }
     } else {
       const pendingAll = listPendingChangesStmt.all() as Array<{
@@ -602,17 +925,31 @@ export async function handleSyncChangeIntent(
         last_event: string;
         updated_at: string;
       }>;
-      const merged = mergePendingWithGit(pendingAll, { offset: 0, limit: MAX_PENDING_LIMIT });
+      const merged = mergePendingWithGit(pendingAll, { offset: 0, limit: args.pending_limit });
+      pendingBatch = {
+        limit: args.pending_limit,
+        total: merged.total,
+        processed: merged.page.length,
+        remaining: merged.remaining,
+        truncated: merged.truncated,
+      };
+      if (args.complete_requirement && merged.remaining > 0) {
+        throw new Error(
+          `Cannot complete requirement while ${merged.remaining} pending change(s) remain after this bounded batch. ` +
+          "Run sync_change_intent with complete_requirement=false until pending_batch.remaining is 0, then complete it.",
+        );
+      }
       if (merged.page.length) {
         for (const p of merged.page) {
+          const contained = toContainedFile(p.file_path, p.last_event === "unlink");
           targets.push({
-            rawFile: p.file_path,
-            dbFilePath: p.file_path,
+            rawFile: contained.absolute,
+            dbFilePath: contained.dbFilePath,
             event: p.last_event,
-            source: p.source === "git" ? "pending" : "pending",
+            source: "pending",
           });
+          pendingPathsToDelete.add(p.file_path);
         }
-        deleteAllPendingChangesStmt.run();
       } else {
         targets.push({
           rawFile: "(unspecified)",
@@ -679,6 +1016,7 @@ export async function handleSyncChangeIntent(
         }
       }
     }
+    for (const pendingPath of pendingPathsToDelete) deletePendingChangeStmt.run(pendingPath);
     const primaryFilePath =
       concreteFileStates.length === 1
         ? concreteFileStates[0].file_path
@@ -709,6 +1047,10 @@ export async function handleSyncChangeIntent(
       verification: args.verification ?? [],
       verification_gaps: args.verification_gaps ?? [],
       large_file_split_deferrals: largeFileSplitDeferrals,
+      idempotency_key: syncIdempotencyKey,
+      request_fingerprint: requestFingerprint,
+      pending_batch: pendingBatch,
+      complete_requirement: args.complete_requirement,
     });
     const memoryInfo = insertMemoryItemStmt.run(
       "change_intent",
@@ -772,7 +1114,9 @@ export async function handleSyncChangeIntent(
       fixPatternMemoryItem.value = { id: Number(memoryInfo.lastInsertRowid), kind: "fix_pattern", title };
     }
     if (args.complete_requirement) {
-      completeRequirementMemoryItemsByReqId(active.id);
+      if (!completeRequirementMemoryItemsByReqId(active.id)) {
+        throw new Error(`Requirement ${active.id} is no longer active and cannot be completed.`);
+      }
     }
   });
   try {
@@ -783,11 +1127,7 @@ export async function handleSyncChangeIntent(
       content: [{ type: "text", text: toolJson({ ok: false, error: `sync_change_intent transaction failed: ${String(err)}` }) }],
     };
   }
-  if (args.complete_requirement) {
-    if (sessionActiveRequirement?.project_root === context.getProjectRoot() && sessionActiveRequirement.id === active.id) {
-      sessionActiveRequirement = null;
-    }
-  }
+  if (transactionReplay) return replayExistingSync(transactionReplay);
   const development_warnings = [
     ...buildDevelopmentWarnings(synced_files, {
       includeUnspecified: synced_files.some((f) => f.file_path === "(unspecified)"),
@@ -798,6 +1138,13 @@ export async function handleSyncChangeIntent(
       files: synced_files,
     }),
   ];
+  const boundResponseItems = createSyncResponseBudget();
+  const boundedSyncedFiles = boundResponseItems(synced_files);
+  const boundedCreated = boundResponseItems(created);
+  const boundedVerification = boundResponseItems(args.verification ?? []);
+  const boundedVerificationGaps = boundResponseItems(args.verification_gaps ?? []);
+  const boundedDeferrals = boundResponseItems(largeFileSplitDeferrals);
+  const boundedWarnings = boundResponseItems(development_warnings);
 
   logActivity("sync_change_intent", {
     req_id: active.id,
@@ -808,6 +1155,9 @@ export async function handleSyncChangeIntent(
     fix_pattern_memory_id: fixPatternMemoryItem.value?.id ?? null,
     development_warnings: development_warnings.length,
     large_file_split_deferrals: largeFileSplitDeferrals.length,
+    pending_batch: pendingBatch,
+    reused: reusedSync,
+    idempotency_key: syncIdempotencyKey,
   });
 
   return {
@@ -817,15 +1167,30 @@ export async function handleSyncChangeIntent(
         text: toolJson({
           ok: true,
           linked_to_requirement: { id: active.id, title: active.title },
-          synced_files,
-          created,
+          synced_files: boundedSyncedFiles.page,
+          synced_files_total: boundedSyncedFiles.total,
+          synced_files_truncated: boundedSyncedFiles.truncated,
+          created: boundedCreated.page,
+          created_total: boundedCreated.total,
+          created_truncated: boundedCreated.truncated,
           created_change: createdChange,
-          verification: args.verification ?? [],
-          verification_gaps: args.verification_gaps ?? [],
-          large_file_split_deferrals: largeFileSplitDeferrals,
+          verification: boundedVerification.page,
+          verification_total: boundedVerification.total,
+          verification_truncated: boundedVerification.truncated,
+          verification_gaps: boundedVerificationGaps.page,
+          verification_gaps_total: boundedVerificationGaps.total,
+          verification_gaps_truncated: boundedVerificationGaps.truncated,
+          large_file_split_deferrals: boundedDeferrals.page,
+          large_file_split_deferrals_total: boundedDeferrals.total,
+          large_file_split_deferrals_truncated: boundedDeferrals.truncated,
           created_fix_pattern: fixPatternMemoryItem.value,
           requirement_completed: args.complete_requirement,
-          development_warnings,
+          pending_batch: pendingBatch,
+          reused: reusedSync,
+          idempotency_key: syncIdempotencyKey,
+          development_warnings: boundedWarnings.page,
+          development_warnings_total: boundedWarnings.total,
+          development_warnings_truncated: boundedWarnings.truncated,
         }),
       },
     ],
@@ -907,7 +1272,6 @@ export async function handleCompleteRequirement(
       };
     }
 
-    if (sessionActiveRequirement?.project_root === context.getProjectRoot()) sessionActiveRequirement = null;
     logActivity("complete_requirement", { all_active: true, completed: updated.map((u) => u.id) });
     return { content: [{ type: "text", text: toolJson({ ok: true, completed: updated }) }] };
   }
@@ -932,17 +1296,18 @@ export async function handleCompleteRequirement(
   }
 
   try {
-    completeRequirementMemoryItemsByReqId(targetId);
+    if (!completeRequirementMemoryItemsByReqId(targetId)) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: toolJson({ ok: false, error: `Requirement ${targetId} is no longer active.` }) }],
+      };
+    }
   } catch (err) {
     return {
       isError: true,
       content: [{ type: "text", text: toolJson({ ok: false, error: `Failed to complete requirement atomically: ${String(err)}` }) }],
     };
   }
-  if (sessionActiveRequirement?.project_root === context.getProjectRoot() && sessionActiveRequirement.id === targetId) {
-    sessionActiveRequirement = null;
-  }
-
   logActivity("complete_requirement", { req_id: targetId });
   return { content: [{ type: "text", text: toolJson({ ok: true, completed: [{ id: targetId }] }) }] };
 }

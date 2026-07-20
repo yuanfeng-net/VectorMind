@@ -1,3 +1,5 @@
+#!/usr/bin/env node
+
 import crypto from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -8,6 +10,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import express from "express";
 import Database from "better-sqlite3";
 
+import { ADMIN_TOKEN_HEADER, createAdminSecurityPolicy, evaluateAdminRequest } from "./security.mjs";
+import { atomicWriteTextFile, projectPathIdentity } from "./storage.mjs";
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT_DIR = path.resolve(__dirname, "..");
@@ -16,7 +21,12 @@ const DIST_DIR = path.join(ROOT_DIR, "dist", "client");
 
 const PORT = Number.parseInt(process.env.VECTORMIND_ADMIN_PORT ?? "16860", 10) || 16860;
 const HOST = process.env.VECTORMIND_ADMIN_HOST?.trim() || "127.0.0.1";
-const ADMIN_TOKEN = process.env.VECTORMIND_ADMIN_TOKEN?.trim() || crypto.randomBytes(32).toString("hex");
+const ADMIN_SECURITY = createAdminSecurityPolicy({
+  host: HOST,
+  port: PORT,
+  configuredToken: process.env.VECTORMIND_ADMIN_TOKEN,
+});
+const ADMIN_TOKEN = ADMIN_SECURITY.token;
 const STORAGE_DIR = path.join(os.homedir(), ".vectormind-admin");
 const INDEX_FILE = path.join(STORAGE_DIR, "projects.json");
 const CURRENT_PROJECT_ROOT = path.resolve(ROOT_DIR, "..");
@@ -86,7 +96,7 @@ function writeIndex(index) {
     updatedAt: new Date().toISOString(),
     projects: Array.isArray(index.projects) ? index.projects : [],
   };
-  fs.writeFileSync(INDEX_FILE, `${JSON.stringify(normalized, null, 2)}\n`, "utf8");
+  atomicWriteTextFile(INDEX_FILE, `${JSON.stringify(normalized, null, 2)}\n`);
   return normalized;
 }
 
@@ -133,7 +143,7 @@ function realDirectoryPath(projectPath) {
 }
 
 function projectIdFor(projectPath) {
-  return `prj_${crypto.createHash("sha1").update(projectPath.toLowerCase()).digest("hex").slice(0, 12)}`;
+  return `prj_${crypto.createHash("sha1").update(projectPathIdentity(projectPath)).digest("hex").slice(0, 12)}`;
 }
 
 function folderNameFor(projectPath) {
@@ -159,7 +169,7 @@ function upsertProject(input) {
   const candidatePath = realDirectoryPath(input.path);
   const id = input.id ?? projectIdFor(candidatePath);
   const existingIndex = index.projects.findIndex(
-    (p) => p.id === id || String(p.path ?? "").toLowerCase() === candidatePath.toLowerCase(),
+    (p) => p.id === id || projectPathIdentity(String(p.path ?? "")) === projectPathIdentity(candidatePath),
   );
   const previous = existingIndex >= 0 ? index.projects[existingIndex] : { id };
   const record = toProjectRecord({ ...input, path: candidatePath }, previous);
@@ -769,29 +779,39 @@ function addCurrentProjectIfEmpty() {
   }
 }
 
-function discoverMemoryProjects(rootPath, options = {}) {
+function boundedInteger(value, fallback, min, max) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.max(min, Math.min(Math.trunc(parsed), max)) : fallback;
+}
+
+async function discoverMemoryProjects(rootPath, options = {}) {
   const root = realDirectoryPath(rootPath);
-  const maxDepth = Math.max(1, Math.min(Number(options.maxDepth ?? 5), 12));
-  const maxDirs = Math.max(100, Math.min(Number(options.maxDirs ?? 8000), 50000));
+  const maxDepth = boundedInteger(options.maxDepth, 5, 1, 12);
+  const maxDirs = boundedInteger(options.maxDirs, 8000, 100, 50000);
   const found = [];
   const queue = [{ dir: root, depth: 0 }];
+  let cursor = 0;
   let scanned = 0;
 
-  while (queue.length && scanned < maxDirs) {
-    const current = queue.shift();
+  while (cursor < queue.length && scanned < maxDirs) {
+    const current = queue[cursor];
+    cursor += 1;
     scanned += 1;
 
     const dbPath = path.join(current.dir, ".vectormind", "vectormind.db");
-    if (fs.existsSync(dbPath)) {
+    try {
+      await fsp.access(dbPath, fs.constants.F_OK);
       found.push(current.dir);
       continue;
+    } catch {
+      // Continue traversing when this directory does not contain a memory database.
     }
 
     if (current.depth >= maxDepth) continue;
 
     let entries = [];
     try {
-      entries = fs.readdirSync(current.dir, { withFileTypes: true });
+      entries = await fsp.readdir(current.dir, { withFileTypes: true });
     } catch {
       continue;
     }
@@ -804,7 +824,7 @@ function discoverMemoryProjects(rootPath, options = {}) {
     }
   }
 
-  const unique = [...new Map(found.map((p) => [p.toLowerCase(), p])).values()];
+  const unique = [...new Map(found.map((p) => [projectPathIdentity(p), p])).values()];
   return { root, scanned, found: unique };
 }
 
@@ -1154,41 +1174,51 @@ const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
 
-function isAllowedAdminOrigin(rawOrigin) {
-  if (!rawOrigin) return true;
-  try {
-    const origin = new URL(rawOrigin);
-    const loopback = origin.hostname === "localhost" || origin.hostname === "127.0.0.1" || origin.hostname === "[::1]";
-    return loopback && Number(origin.port || (origin.protocol === "https:" ? 443 : 80)) === PORT;
-  } catch {
-    return false;
-  }
-}
-
 app.use("/api", (req, res, next) => {
-  if (!isAllowedAdminOrigin(req.get("origin"))) {
-    return res.status(403).json({ ok: false, error: "管理面板仅接受同源本机请求。" });
+  const adminAuth = evaluateAdminRequest({
+    policy: ADMIN_SECURITY,
+    path: req.path,
+    origin: req.get("origin"),
+    hostHeader: req.get("host"),
+    protocol: req.protocol,
+    remoteAddress: req.socket.remoteAddress,
+    providedToken: req.get(ADMIN_TOKEN_HEADER),
+  });
+  req.adminAuth = adminAuth;
+  if (!adminAuth.originAllowed) {
+    return res.status(403).json({ ok: false, error: "管理面板仅接受同源请求。" });
   }
-  if (req.path === "/config" || req.path === "/health") return next();
-  if (req.get("x-vectormind-admin-token") !== ADMIN_TOKEN) {
+  if (!adminAuth.authorized) {
     return res.status(403).json({ ok: false, error: "管理面板会话令牌无效。" });
   }
   return next();
 });
 
-app.get("/api/config", (_req, res) => {
+app.get("/api/config", (req, res) => {
   ensureStorage();
-  res.json({
+  const automaticSession = req.adminAuth.exposeSessionToken;
+  const authenticated = automaticSession || req.adminAuth.tokenValid;
+  const config = {
     ok: true,
     host: HOST,
     port: PORT,
-    sessionToken: ADMIN_TOKEN,
-    storageDir: STORAGE_DIR,
-    indexFile: INDEX_FILE,
-    homeDir: os.homedir(),
-    currentProjectRoot: CURRENT_PROJECT_ROOT,
     platform: process.platform,
-  });
+    authentication: {
+      mode: ADMIN_SECURITY.mode,
+      authenticated,
+      requiresToken: ADMIN_SECURITY.mode === "explicit",
+    },
+  };
+  if (automaticSession) config.sessionToken = ADMIN_TOKEN;
+  if (authenticated) {
+    Object.assign(config, {
+      storageDir: STORAGE_DIR,
+      indexFile: INDEX_FILE,
+      homeDir: os.homedir(),
+      currentProjectRoot: CURRENT_PROJECT_ROOT,
+    });
+  }
+  res.json(config);
 });
 
 app.get("/api/health", (_req, res) => {
@@ -1321,10 +1351,10 @@ app.post("/api/projects/:id/memory/repair", async (req, res) => {
   }
 });
 
-app.post("/api/projects/discover", (req, res) => {
+app.post("/api/projects/discover", async (req, res) => {
   try {
     const root = req.body?.root || os.homedir();
-    const result = discoverMemoryProjects(root, {
+    const result = await discoverMemoryProjects(root, {
       maxDepth: req.body?.maxDepth,
       maxDirs: req.body?.maxDirs,
     });
@@ -1342,9 +1372,9 @@ app.post("/api/projects/discover", (req, res) => {
 });
 
 async function attachFrontend() {
-  const production = process.argv.includes("--production") || process.env.NODE_ENV === "production";
+  const development = process.argv.includes("--development") || process.env.NODE_ENV === "development";
 
-  if (!production) {
+  if (development) {
     const { createServer } = await import("vite");
     const vite = await createServer({
       root: CLIENT_DIR,
@@ -1387,6 +1417,7 @@ await attachFrontend();
 
 const server = app.listen(PORT, HOST, () => {
   console.log(`VectorMind 管理面板运行中: http://${HOST}:${PORT}`);
+  console.log(`认证模式: ${ADMIN_SECURITY.mode === "automatic" ? "回环自动会话" : "显式令牌"}`);
   console.log(`项目索引文件: ${INDEX_FILE}`);
 });
 

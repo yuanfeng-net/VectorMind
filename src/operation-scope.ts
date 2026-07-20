@@ -295,6 +295,19 @@ function tokenOverlapScore(a: string, b: string): number {
   return score;
 }
 
+function operationKeywordOverlapScore(a: string, b: string): number {
+  const aText = normalizeText(a);
+  const bText = normalizeText(b);
+  return OPERATION_WORDS.some((word) => {
+    const normalizedWord = normalizeText(word);
+    return aText.includes(normalizedWord) && bText.includes(normalizedWord);
+  }) ? 2 : 0;
+}
+
+function explicitConflictScore(planText: string, deniedText: string): number {
+  return tokenOverlapScore(planText, deniedText) + operationKeywordOverlapScore(planText, deniedText);
+}
+
 function rowPriority(row: MemoryItemRow, source: CurrentConstraint["source"]): number {
   if (source === "current_decision") return 100;
   if (source === "active_requirement") return 80;
@@ -348,7 +361,9 @@ export function buildCurrentConstraints(args: {
   const constraints = new Map<number, CurrentConstraint>();
   const add = (row: MemoryItemRow | null | undefined, source: CurrentConstraint["source"]): void => {
     if (!row) return;
-    if (isHiddenFromDefaultRecall(row)) return;
+    // The requirement table is authoritative for active work. A stale or hidden
+    // linked memory row must not make an active requirement disappear here.
+    if (source !== "active_requirement" && isHiddenFromDefaultRecall(row)) return;
     const existing = constraints.get(row.id);
     const next = toConstraint(row, source, previewChars);
     if (!existing || next.priority > existing.priority) constraints.set(row.id, next);
@@ -362,9 +377,15 @@ export function buildCurrentConstraints(args: {
   for (const item of args.activeRequirements) add(requirementToMemoryRow(item.requirement, item.memory), "active_requirement");
   for (const row of args.recentNotes) add(row, "recent_note");
 
-  return Array.from(constraints.values())
-    .sort((a, b) => b.priority - a.priority || Date.parse(b.updated_at) - Date.parse(a.updated_at) || b.id - a.id)
-    .slice(0, limit);
+  const compareConstraints = (a: CurrentConstraint, b: CurrentConstraint): number =>
+    b.priority - a.priority || Date.parse(b.updated_at) - Date.parse(a.updated_at) || b.id - a.id;
+  const sorted = Array.from(constraints.values()).sort(compareConstraints);
+  const active = sorted.filter((constraint) => constraint.source === "active_requirement");
+  const nonActive = sorted.filter((constraint) => constraint.source !== "active_requirement");
+  const boundedLimit = Math.max(1, Math.trunc(limit));
+  const effectiveLimit = Math.max(boundedLimit, active.length);
+  return [...active, ...nonActive.slice(0, Math.max(0, effectiveLimit - active.length))]
+    .sort(compareConstraints);
 }
 
 function classifyConstraintConflict(plan: OperationPlanInput, constraint: CurrentConstraint): OperationScopeWarning | null {
@@ -372,14 +393,20 @@ function classifyConstraintConflict(plan: OperationPlanInput, constraint: Curren
   if (!hasNegation(constraintText)) return null;
   const deniedText = negatedConstraintText(constraintText);
   const concreteText = concreteOperationText(plan);
-  const concreteScore = tokenOverlapScore(concreteText, deniedText);
-  const fullPlanText = operationText(plan);
-  const fullScore = tokenOverlapScore(fullPlanText, deniedText);
   const naturalPlanText = `${plan.operation}\n${plan.intent ?? ""}`;
-  const naturalPlanAlreadyAligned = hasNegation(naturalPlanText);
-  const hasConcreteDetails = concreteText.trim().length > 0;
-  if (hasConcreteDetails ? concreteScore < 5 : (fullScore < 7 || naturalPlanAlreadyAligned)) return null;
-  const score = Math.max(concreteScore, fullScore);
+  const naturalScore = explicitConflictScore(naturalPlanText, deniedText);
+  const concreteScore = explicitConflictScore(concreteText, deniedText);
+  const alignedNaturalScore = hasNegation(naturalPlanText)
+    ? explicitConflictScore(negatedConstraintText(naturalPlanText), deniedText)
+    : 0;
+  const naturalConflict = naturalScore >= 5 && alignedNaturalScore < 5;
+  const concreteConflict = concreteText.trim().length > 0 && concreteScore >= 5;
+  if (!naturalConflict && !concreteConflict) return null;
+  const conflictSources = [
+    ...(naturalConflict ? ["natural_plan"] : []),
+    ...(concreteConflict ? ["concrete_details"] : []),
+  ];
+  const score = Math.max(naturalScore, concreteScore);
   return {
     code: "operation_constraint_conflict",
     severity: constraint.source === "current_decision" || constraint.source === "active_requirement" ? "blocker" : "warning",
@@ -392,7 +419,13 @@ function classifyConstraintConflict(plan: OperationPlanInput, constraint: Curren
       source: constraint.source,
       preview: oneLine(constraint.preview, 220),
     }],
-    details: { overlap_score: score },
+    details: {
+      overlap_score: score,
+      natural_plan_overlap_score: naturalScore,
+      aligned_natural_plan_overlap_score: alignedNaturalScore,
+      concrete_overlap_score: concreteScore,
+      conflict_sources: conflictSources,
+    },
   };
 }
 

@@ -1,5 +1,4 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import type Database from "better-sqlite3";
 
 import type { ToolHandlerContext } from "./context.js";
 import type { ChangeLogRow, MemoryItemRow, PendingChangeRow, RequirementRow } from "../types.js";
@@ -10,11 +9,25 @@ import {
   RestoreCheckpointContextArgsSchema,
 } from "../tool-schemas.js";
 import { flushPendingChangeBuffer } from "../file-indexing.js";
-import { isHiddenFromDefaultRecall, parseMetadataJson, toChangeLogPreview, toMemoryItemPreview, toRequirementPreview } from "../memory-recall.js";
+import { isHiddenFromDefaultRecall, toMemoryItemPreview, toRequirementPreview } from "../memory-recall.js";
 import { mergePendingWithGit } from "../pending-changes.js";
 import { logActivity } from "../activity-log.js";
 import { oneLine, safeJson, toolJson } from "../tool-output.js";
 import { toolCompactOrJson } from "../token-savings.js";
+import {
+  CHECKPOINT_DECISION_LIMIT,
+  CHECKPOINT_RECENT_CHANGE_LIMIT,
+  checkpointSnapshotBasis,
+  checkpointSnapshotFromMetadata,
+  getVisibleCheckpointDecisions,
+  getVisibleCheckpointMemory,
+  normalizeCheckpointSnapshot,
+  toCheckpointChangePreview,
+  toCheckpointRecordPreview,
+  toCheckpointSnapshotMemoryPreview,
+} from "../checkpoint-snapshot.js";
+
+const CHECKPOINT_LIST_MAX_CHARS = 80_000;
 
 function compactTimelineText(data: {
   ok: boolean;
@@ -73,32 +86,6 @@ function compactCheckpointText(data: {
   if (cp?.preview) lines.push(oneLine(cp.preview, 220));
   lines.push("hint: checkpoints restore context only; they do not mutate active requirements or override model judgment");
   return lines.join("\n");
-}
-
-function getVisibleRecentCoreMemory(db: Database.Database, limit: number): MemoryItemRow[] {
-  if (limit <= 0) return [];
-  const pageSize = 200;
-  const scanCap = 10_000;
-  const stmt = db.prepare(
-    `SELECT id, kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at
-     FROM memory_items
-     WHERE kind IN ('requirement', 'change_intent', 'note', 'decision', 'checkpoint', 'memory_compaction', 'project_summary', 'convention')
-     ORDER BY updated_at DESC, id DESC
-     LIMIT ? OFFSET ?`,
-  );
-  const visible: MemoryItemRow[] = [];
-  let offset = 0;
-  while (visible.length < limit && offset < scanCap) {
-    const rows = stmt.all(pageSize, offset) as MemoryItemRow[];
-    if (!rows.length) break;
-    for (const row of rows) {
-      if (!isHiddenFromDefaultRecall(row)) visible.push(row);
-      if (visible.length >= limit) break;
-    }
-    offset += rows.length;
-    if (rows.length < pageSize) break;
-  }
-  return visible.slice(0, limit);
 }
 
 export async function handleMemoryTimeline(
@@ -221,41 +208,75 @@ export async function handleCreateCheckpoint(
     getProjectSummaryStmt,
     insertMemoryItemStmt,
     listChangeLogsForRequirementStmt,
-    listCurrentDecisionsStmt,
     listPendingChangesStmt,
   } = context.getStatements();
   const active = getActiveRequirementStmt.get() as RequirementRow | undefined;
   const projectSummary = getProjectSummaryStmt.get() as MemoryItemRow | undefined;
-  const decisions = (listCurrentDecisionsStmt.all(10) as MemoryItemRow[])
-    .filter((row) => !isHiddenFromDefaultRecall(row))
-    .map((row) => toMemoryItemPreview(row, false, 180, 1200));
-  const recentRows = getVisibleRecentCoreMemory(db, args.recent_limit)
-    .map((row) => toMemoryItemPreview(row, false, 180, 1200));
+  const decisionWindow = getVisibleCheckpointDecisions(db, CHECKPOINT_DECISION_LIMIT);
+  const decisions = decisionWindow.rows.map(toCheckpointSnapshotMemoryPreview);
+  const recentWindow = getVisibleCheckpointMemory(db, args.recent_limit);
+  const recentRows = recentWindow.rows.map(toCheckpointSnapshotMemoryPreview);
   const pendingRows = listPendingChangesStmt.all() as PendingChangeRow[];
-  const pending = args.pending_limit > 0
-    ? mergePendingWithGit(pendingRows, { offset: 0, limit: args.pending_limit }).page
+  const pendingResult = args.pending_limit > 0
+    ? mergePendingWithGit(pendingRows, { offset: 0, limit: args.pending_limit })
+    : { total: 0, page: [], remaining: 0, truncated: false };
+  const recentChangeRows = active
+    ? listChangeLogsForRequirementStmt.all(active.id, CHECKPOINT_RECENT_CHANGE_LIMIT + 1) as ChangeLogRow[]
     : [];
-  const recentChanges = active
-    ? (listChangeLogsForRequirementStmt.all(active.id, 10) as ChangeLogRow[]).map((row) => toChangeLogPreview(row, false, 180, 1200))
-    : [];
-  const snapshot = {
+  const recentChanges = recentChangeRows
+    .slice(0, CHECKPOINT_RECENT_CHANGE_LIMIT)
+    .map(toCheckpointChangePreview);
+  const summary = args.summary.trim();
+  const basis = checkpointSnapshotBasis(args.recent_limit, args.pending_limit);
+  const snapshot = normalizeCheckpointSnapshot({
+    snapshot_version: basis.snapshot_version,
     created_at: new Date().toISOString(),
     advisory_only: true,
     note: "Checkpoint is context evidence only; it does not mutate active requirements or override model judgment.",
+    summary,
+    basis,
     active_requirement: active ? toRequirementPreview(active, false, 180, 1200) : null,
-    project_summary: projectSummary ? toMemoryItemPreview(projectSummary, false, 180, 1200) : null,
+    project_summary: projectSummary ? toCheckpointSnapshotMemoryPreview(projectSummary) : null,
     decisions,
     recent_memory: recentRows,
     recent_changes: recentChanges,
-    pending_changes: pending,
-  };
-  const summary = args.summary.trim();
+    pending_changes: pendingResult.page,
+    collections: {
+      decisions: {
+        total: decisions.length + (decisionWindow.truncated ? 1 : 0),
+        returned: decisions.length,
+        truncated: decisionWindow.truncated,
+        window_truncated: decisionWindow.truncated,
+        total_is_lower_bound: decisionWindow.truncated,
+      },
+      recent_memory: {
+        total: recentRows.length + (recentWindow.truncated ? 1 : 0),
+        returned: recentRows.length,
+        truncated: recentWindow.truncated,
+        window_truncated: recentWindow.truncated,
+        total_is_lower_bound: recentWindow.truncated,
+      },
+      recent_changes: {
+        total: recentChangeRows.length,
+        returned: recentChanges.length,
+        truncated: recentChangeRows.length > recentChanges.length,
+        window_truncated: recentChangeRows.length > recentChanges.length,
+        total_is_lower_bound: recentChangeRows.length > recentChanges.length,
+      },
+      pending_changes: {
+        total: pendingResult.total,
+        returned: pendingResult.page.length,
+        truncated: pendingResult.truncated,
+        window_truncated: pendingResult.truncated,
+      },
+    },
+  }, { fallbackBasis: basis });
   const content = [
     args.title,
     summary ? `Summary: ${summary}` : "",
     active ? `Active requirement: #${active.id} ${active.title}` : "Active requirement: none",
     `Decisions: ${decisions.map((d) => d.title ?? `#${d.id}`).join(", ") || "none"}`,
-    `Pending: ${pending.map((p) => p.file_path).join(", ") || "none"}`,
+    `Pending: ${pendingResult.page.map((p) => p.file_path).join(", ") || "none"}`,
   ]
     .filter(Boolean)
     .join("\n");
@@ -263,6 +284,7 @@ export async function handleCreateCheckpoint(
     status: "current",
     type: "checkpoint",
     advisory_only: true,
+    snapshot_version: basis.snapshot_version,
     snapshot,
   };
   const info = insertMemoryItemStmt.run(
@@ -278,7 +300,7 @@ export async function handleCreateCheckpoint(
   );
   const checkpointId = Number(info.lastInsertRowid);
   const checkpoint = context.getStatements().getMemoryItemByIdStmt.get(checkpointId) as MemoryItemRow;
-  const checkpointPreview = toMemoryItemPreview(checkpoint, false, 180, 1200);
+  const checkpointPreview = toCheckpointRecordPreview(checkpoint, false, 180, 1200);
   const outputValue = {
     ok: true,
     checkpoint: checkpointPreview,
@@ -289,7 +311,7 @@ export async function handleCreateCheckpoint(
     checkpoint_id: checkpointId,
     title: args.title,
     active_requirement_id: active?.id ?? null,
-    pending: pending.length,
+    pending: pendingResult.page.length,
   });
 
   return {
@@ -316,12 +338,28 @@ export async function handleListCheckpoints(
        ORDER BY updated_at DESC, id DESC
        LIMIT ? OFFSET ?`,
     )
-    .all(args.limit, args.offset) as MemoryItemRow[];
-  const checkpoints = rows.map((row) => toMemoryItemPreview(row, args.include_content, args.preview_chars, args.content_max_chars));
+    .all(args.limit + 1, args.offset) as MemoryItemRow[];
+  const candidates = rows.slice(0, args.limit).map((row) =>
+    toCheckpointRecordPreview(row, args.include_content, args.preview_chars, args.content_max_chars),
+  );
+  const checkpoints: typeof candidates = [];
+  for (const checkpoint of candidates) {
+    checkpoints.push(checkpoint);
+    if (JSON.stringify(checkpoints).length > CHECKPOINT_LIST_MAX_CHARS) {
+      checkpoints.pop();
+      break;
+    }
+  }
+  const count = Number((db.prepare("SELECT COUNT(*) AS total FROM memory_items WHERE kind = 'checkpoint'").get() as { total: number }).total);
+  const truncated = rows.length > args.limit || checkpoints.length < candidates.length;
   const outputValue = {
     ok: true,
     offset: args.offset,
     limit: args.limit,
+    count,
+    returned: checkpoints.length,
+    truncated,
+    next_offset: truncated ? args.offset + checkpoints.length : null,
     checkpoints,
   };
 
@@ -366,15 +404,16 @@ export async function handleRestoreCheckpointContext(
       content: [{ type: "text", text: toolJson({ ok: false, error: "checkpoint not found" }) }],
     };
   }
-  const meta = parseMetadataJson(row.metadata_json);
-  const snapshot = (meta.snapshot && typeof meta.snapshot === "object" ? meta.snapshot : {}) as Record<string, unknown>;
-  const checkpoint = toMemoryItemPreview(row, args.include_content, args.preview_chars, args.content_max_chars);
+  const fallbackBasis = checkpointSnapshotBasis(10, 10);
+  const stored = checkpointSnapshotFromMetadata(row.metadata_json, fallbackBasis);
+  const checkpoint = toCheckpointRecordPreview(row, args.include_content, args.preview_chars, args.content_max_chars);
   const outputValue = {
     ok: true,
     restored: true,
     read_only: true,
+    snapshot_valid: stored.valid,
     checkpoint,
-    snapshot,
+    snapshot: stored.snapshot,
   };
 
   logActivity("restore_checkpoint_context", {

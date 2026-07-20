@@ -2,11 +2,13 @@
 
 VectorMind 的目标不是替代 AI，也不是接管客户端权限，而是让 AI 在长期开发里更少丢上下文、更少乱改、更少把旧需求改回来。它提供上下文证据和质量信号；普通信号是 advisory，巨量文件治理是明确且有限的 workflow gate，但仍不控制宿主运行或替代模型推理。
 
+运行时基线为 Node.js `20.19.0+`。发布验证通过 `npm run verify` 同时覆盖核心构建、管理面板和 MCP smoke；管理面板以预构建客户端随主包发布，并在非回环监听时要求显式令牌。`sync_change_intent` 对 pending 采用有界分批消费；只有调用方显式复用同一个 `idempotency_key` 时才把请求视为重试。
+
 | 能力 | 解决的问题 | 主要工具 | 当前限制 |
 | --- | --- | --- | --- |
 | 上下文恢复 | 新会话不知道项目现状、最近做过什么 | `bootstrap_context`, `get_brain_dump` | focused 只锚定 active requirement；已完成历史需显式展开 |
-| 需求边界 | 新需求顺手改到无关模块或并发任务串线 | `start_requirement`, `preflight_change_scope`, `complete_requirement` | 并发任务必须传递 `req_id` 或 `goal_key` |
-| 改动意图 | 文件变了但不知道为什么 | `sync_change_intent`, `get_pending_changes` | 需要改完后同步 |
+| 需求边界 | 新需求顺手改到无关模块或并发任务串线 | `start_requirement`, `get_requirement_status`, `resume_requirement`, `preflight_change_scope`, `complete_requirement` | 默认串行；并行时传 `close_previous=false`，并始终保留 `req_id` 或 `goal_key` |
+| 改动意图 | 文件变了但不知道为什么，或完成后出现更强验证证据 | `sync_change_intent`, `update_requirement_verification`, `get_pending_changes` | 需要改完后同步；已完成需求可补写验证但不可改写文件意图 |
 | 最新决策优先 | 旧规则被重新召回，功能被改回老版本 | `upsert_decision`, `supersede_memory` | 需要把关键决策写入 MCP |
 | 项目知识沉淀 | 构建命令、约定、架构信息散在聊天里 | `upsert_project_summary`, `add_note`, `upsert_convention` | 内容质量取决于写入是否清晰 |
 | 上下文时间线 | 不知道某个需求/决策前后发生了什么 | `memory_timeline` | 只提供证据，不替模型判断因果 |
@@ -30,9 +32,10 @@ VectorMind 的目标不是替代 AI，也不是接管客户端权限，而是让
 5. 修改文件
 6. 仅在文件列表未知或诊断范围漂移时调用 `get_pending_changes`
 7. `sync_change_intent({ project_root, req_id?, goal_key?, intent, files })`
-8. 需要时：`upsert_decision` / `supersede_memory`
-9. 需要追溯时：`memory_timeline`
-10. 长会话/交接时：`create_checkpoint` / `restore_checkpoint_context`
+8. 后续验证结果变化时调用 `update_requirement_verification({ project_root, req_id?, goal_key?, verification?, verification_gaps? })`
+9. 需要时：`upsert_decision` / `supersede_memory`
+10. 需要追溯时：`memory_timeline`
+11. 长会话/交接时：`create_checkpoint` / `restore_checkpoint_context`
 11. 怀疑记忆异常时：`analyze_memory_conflicts` / `memory_quality_report` / `compare_checkpoint_context`
 12. 完成时：`upsert_project_summary` / `complete_requirement`
 

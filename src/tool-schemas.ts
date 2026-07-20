@@ -9,8 +9,19 @@ import {
   MAINTENANCE_TOKEN_SAVINGS_RETENTION_DAYS,
   DEVELOPMENT_BLOCK_FILE_LINES,
 } from "./config.js";
+const MAX_PATH_CHARS = 4096;
+const MAX_SHORT_TEXT_CHARS = 2000;
+const MAX_LONG_TEXT_CHARS = 20_000;
+const MAX_INPUT_LIST_ITEMS = 500;
+const MAX_VERIFICATION_ITEMS = 200;
+export const MAX_SYNC_PENDING_LIMIT = 500;
+const DEFAULT_SYNC_PENDING_LIMIT = 100;
+const PathArgSchema = z.string().min(1).max(MAX_PATH_CHARS);
+const ShortTextSchema = z.string().min(1).max(MAX_SHORT_TEXT_CHARS);
+const LongTextSchema = z.string().min(1).max(MAX_LONG_TEXT_CHARS);
+
 const ProjectRootArgSchema = z.object({
-  project_root: z.string().optional(),
+  project_root: z.string().max(MAX_PATH_CHARS).optional(),
   project_root_mode: z.enum(["canonical", "exact"]).optional().default("canonical"),
 });
 const OutputFormatSchema = z.object({
@@ -19,20 +30,20 @@ const OutputFormatSchema = z.object({
 
 export type OutputFormat = z.infer<typeof OutputFormatSchema>["format"];
 
-const RequirementItemSchema = z.string().min(1);
+const RequirementItemSchema = ShortTextSchema;
 const FixPatternSchema = z.object({
-  symptom: z.string().min(1),
-  root_cause: z.string().min(1),
-  invariant: z.string().min(1),
-  applies_when: z.array(z.string().min(1)).optional(),
-  avoid_regression: z.array(z.string().min(1)).optional(),
-  verification: z.array(z.string().min(1)).optional(),
-  verification_gaps: z.array(z.string().min(1)).optional(),
+  symptom: LongTextSchema,
+  root_cause: LongTextSchema,
+  invariant: LongTextSchema,
+  applies_when: z.array(ShortTextSchema).max(MAX_VERIFICATION_ITEMS).optional(),
+  avoid_regression: z.array(ShortTextSchema).max(MAX_VERIFICATION_ITEMS).optional(),
+  verification: z.array(ShortTextSchema).max(MAX_VERIFICATION_ITEMS).optional(),
+  verification_gaps: z.array(ShortTextSchema).max(MAX_VERIFICATION_ITEMS).optional(),
 });
 const PlannedChangeSchema = z.object({
-  file: z.string().min(1).optional(),
-  change: z.string().min(1),
-  requirement_refs: z.array(z.string().min(1)).optional(),
+  file: PathArgSchema.optional(),
+  change: ShortTextSchema,
+  requirement_refs: z.array(ShortTextSchema).max(MAX_VERIFICATION_ITEMS).optional(),
   supporting_change: z.boolean().optional().default(false),
   change_type: z
     .enum(["requirement", "supporting_change", "mechanical_modularization", "validation", "formatting", "test", "build_fix"])
@@ -40,23 +51,23 @@ const PlannedChangeSchema = z.object({
     .default("requirement"),
 });
 const LargeFileSplitDeferralSchema = z.object({
-  file: z.string().min(1),
+  file: PathArgSchema,
   reason: z.string().min(1).max(1000),
 });
 
 export const StartRequirementArgsSchema = ProjectRootArgSchema.merge(
   z.object({
-    title: z.string().min(1),
-    background: z.string().optional().default(""),
+    title: z.string().min(1).max(1000),
+    background: z.string().max(MAX_LONG_TEXT_CHARS).optional().default(""),
     goal_key: z.string().min(1).max(240).optional(),
     close_previous: z.boolean().optional().default(true),
     previous_req_id: z.number().int().positive().optional(),
     reuse_active: z.boolean().optional().default(true),
-    scope_allow: z.array(z.string().min(1)).optional(),
-    scope_deny: z.array(z.string().min(1)).optional(),
-    allowed_paths: z.array(z.string().min(1)).optional(),
-    denied_paths: z.array(z.string().min(1)).optional(),
-    requirement_items: z.array(RequirementItemSchema).optional(),
+    scope_allow: z.array(ShortTextSchema).max(MAX_INPUT_LIST_ITEMS).optional(),
+    scope_deny: z.array(ShortTextSchema).max(MAX_INPUT_LIST_ITEMS).optional(),
+    allowed_paths: z.array(PathArgSchema).max(MAX_INPUT_LIST_ITEMS).optional(),
+    denied_paths: z.array(PathArgSchema).max(MAX_INPUT_LIST_ITEMS).optional(),
+    requirement_items: z.array(RequirementItemSchema).max(MAX_INPUT_LIST_ITEMS).optional(),
   }),
 );
 
@@ -64,14 +75,42 @@ export const SyncChangeIntentArgsSchema = ProjectRootArgSchema.merge(
   z.object({
     req_id: z.number().int().positive().optional(),
     goal_key: z.string().min(1).max(240).optional(),
-    intent: z.string().min(1),
-    files: z.array(z.string().min(1)).optional(),
-    affected_files: z.array(z.string().min(1)).optional(),
-    verification: z.array(z.string().min(1)).optional(),
-    verification_gaps: z.array(z.string().min(1)).optional(),
+    idempotency_key: z.string().min(1).max(240).optional(),
+    intent: LongTextSchema,
+    files: z.array(PathArgSchema).max(MAX_INPUT_LIST_ITEMS).optional(),
+    affected_files: z.array(PathArgSchema).max(MAX_INPUT_LIST_ITEMS).optional(),
+    verification: z.array(ShortTextSchema).max(MAX_VERIFICATION_ITEMS).optional(),
+    verification_gaps: z.array(ShortTextSchema).max(MAX_VERIFICATION_ITEMS).optional(),
     fix_pattern: FixPatternSchema.optional(),
     large_file_split_deferrals: z.array(LargeFileSplitDeferralSchema).max(50).optional(),
+    pending_limit: z.number().int().min(1).max(MAX_SYNC_PENDING_LIMIT).optional().default(DEFAULT_SYNC_PENDING_LIMIT),
     complete_requirement: z.boolean().optional().default(false),
+  }),
+);
+
+export const GetRequirementStatusArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
+  z.object({
+    req_id: z.number().int().positive().optional(),
+    goal_key: z.string().min(1).max(240).optional(),
+  }),
+);
+
+export const ResumeRequirementArgsSchema = ProjectRootArgSchema.merge(
+  z.object({
+    req_id: z.number().int().positive().optional(),
+    goal_key: z.string().min(1).max(240).optional(),
+  }),
+);
+
+export const UpdateRequirementVerificationArgsSchema = ProjectRootArgSchema.merge(
+  z.object({
+    req_id: z.number().int().positive().optional(),
+    goal_key: z.string().min(1).max(240).optional(),
+    verification: z.array(ShortTextSchema).max(MAX_VERIFICATION_ITEMS).optional(),
+    verification_gaps: z.array(ShortTextSchema).max(MAX_VERIFICATION_ITEMS).optional(),
+    resolved_verification_gaps: z.array(ShortTextSchema).max(MAX_VERIFICATION_ITEMS).optional(),
+    replace_verification: z.boolean().optional().default(false),
+    replace_verification_gaps: z.boolean().optional().default(true),
   }),
 );
 
@@ -498,7 +537,7 @@ export const CompareCheckpointContextArgsSchema = ProjectRootArgSchema.merge(Out
   z.object({
     checkpoint_id: z.number().int().positive().optional(),
     title: z.string().min(1).optional(),
-    recent_limit: z.number().int().min(0).max(50).optional().default(20),
+    recent_limit: z.number().int().min(0).max(50).optional().default(10),
     pending_limit: z.number().int().min(0).max(MAX_PENDING_LIMIT).optional().default(DEFAULT_PENDING_LIMIT),
     preview_chars: z.number().int().min(50).max(10_000).optional().default(DEFAULT_PREVIEW_CHARS),
     content_max_chars: z.number().int().min(0).max(200_000).optional().default(DEFAULT_CONTENT_MAX_CHARS),

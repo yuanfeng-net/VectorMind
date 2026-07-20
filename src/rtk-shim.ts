@@ -5,21 +5,25 @@ import path from "node:path";
 import https from "node:https";
 import { spawnSync } from "node:child_process";
 
+import { RTK_ASSET_SHA256, RTK_COMMIT_SHA, RTK_RELEASE_TAG, verifyFileSha256 } from "./rtk-integrity.js";
+
 const RTK_REPO = "rtk-ai/rtk";
-const RTK_DOWNLOAD_BASE = `https://github.com/${RTK_REPO}/releases/latest/download`;
+const RTK_DOWNLOAD_BASE = `https://github.com/${RTK_REPO}/releases/download/${RTK_RELEASE_TAG}`;
 const SELF_PATH = process.argv[1] ? path.resolve(process.argv[1]) : "";
 const exeName = process.platform === "win32" ? "rtk.exe" : "rtk";
 const cacheRoot =
   process.env.VECTORMIND_RTK_HOME ??
   path.join(os.homedir(), ".cache", "vector-mind", "rtk");
-const cacheBinDir = path.join(cacheRoot, "bin");
+const releaseCacheRoot = path.join(cacheRoot, RTK_RELEASE_TAG);
+const cacheBinDir = path.join(releaseCacheRoot, "bin");
 const cachedRtkPath = path.join(cacheBinDir, exeName);
 
 function pathEquals(a: string, b: string): boolean {
+  const comparable = (value: string) => process.platform === "win32" ? value.toLowerCase() : value;
   try {
-    return fs.realpathSync.native(a).toLowerCase() === fs.realpathSync.native(b).toLowerCase();
+    return comparable(fs.realpathSync.native(a)) === comparable(fs.realpathSync.native(b));
   } catch {
-    return path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+    return comparable(path.resolve(a)) === comparable(path.resolve(b));
   }
 }
 
@@ -180,12 +184,20 @@ function extractArchive(archivePath: string, extractDir: string): void {
 
 async function installFromRelease(): Promise<string> {
   const asset = platformAsset();
-  const archivePath = path.join(cacheRoot, "downloads", asset.archiveName);
-  const extractDir = path.join(cacheRoot, "extract", asset.archiveName.replace(/[^\w.-]+/g, "_"));
+  const expectedSha256 = RTK_ASSET_SHA256[asset.archiveName];
+  if (!expectedSha256) throw new Error(`No trusted SHA-256 is configured for ${asset.archiveName}`);
+  const archivePath = path.join(releaseCacheRoot, "downloads", asset.archiveName);
+  const extractDir = path.join(releaseCacheRoot, "extract", asset.archiveName.replace(/[^\w.-]+/g, "_"));
   const url = `${RTK_DOWNLOAD_BASE}/${asset.archiveName}`;
 
   console.error(`[vector-mind] RTK not found; downloading ${url}`);
   await download(url, archivePath);
+  try {
+    verifyFileSha256(archivePath, expectedSha256);
+  } catch (err) {
+    fs.rmSync(archivePath, { force: true });
+    throw err;
+  }
   extractArchive(archivePath, extractDir);
 
   const extracted = findFileRecursive(extractDir, asset.binaryName);
@@ -208,11 +220,11 @@ function installFromCargo(): string {
       "RTK auto-install failed and Cargo is unavailable. Install Rust/Cargo or set VECTORMIND_RTK_REAL to an existing rtk binary.",
     );
   }
-  const cargoRoot = path.join(cacheRoot, "cargo");
-  console.error(`[vector-mind] Falling back to Cargo install for ${RTK_REPO}...`);
+  const cargoRoot = path.join(releaseCacheRoot, "cargo");
+  console.error(`[vector-mind] Falling back to Cargo install for ${RTK_REPO}@${RTK_COMMIT_SHA}...`);
   const result = run(
     "cargo",
-    ["install", "--git", `https://github.com/${RTK_REPO}`, "--root", cargoRoot],
+    ["install", "--locked", "--git", `https://github.com/${RTK_REPO}`, "--rev", RTK_COMMIT_SHA, "--root", cargoRoot],
     { inherit: true },
   );
   if (result.status !== 0) throw new Error(`cargo install failed with status ${result.status}`);

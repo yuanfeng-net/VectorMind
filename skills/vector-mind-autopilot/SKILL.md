@@ -71,6 +71,8 @@ For concrete operation commands where stale defaults could matter (deploy/publis
 preflight_operation_scope({ project_root, operation, intent, commands?, files?, targets?, script_hints? })
 ```
 
+Call it immediately before the first concrete operation command. Do not run an exploratory `git status`, deployment inspection, publish command, build, or test first and preflight afterward; include those first commands in the single planned command set.
+
 Treat `stale_default_conflict` or `operation_constraint_conflict` as advisory quality signals: align the plan with current constraints, directly observed repo facts, or explicit user instructions before running commands.
 
 ### 2. Before editing
@@ -123,6 +125,23 @@ sync_change_intent({ project_root, req_id?, goal_key?, intent, files })
 ```
 
 The intent should say what changed, why, and any follow-up. Include `large_file_split_deferrals` when a minimal bugfix or emergency hotfix deferred a huge-file split. Call `get_pending_changes({ project_root })` first only when the changed file list is unknown or an explicit scope audit is needed.
+
+If later verification produces stronger evidence after a requirement was completed, do not reopen it only to rewrite history. Update the latest linked change intent with:
+
+```text
+update_requirement_verification({
+  project_root,
+  req_id?,
+  goal_key?,
+  verification?,
+  verification_gaps?,
+  resolved_verification_gaps?,
+  replace_verification?,
+  replace_verification_gaps?
+})
+```
+
+The tool accepts active or completed requirements, rejects superseded requirements, and writes a linked `verification_update` audit record. Verification entries merge by default; verification gaps are authoritative replacement data by default so a later passing test run can clear stale gaps.
 
 If the edit fixed a known recurring class of defect and the root cause is clear, you may include `fix_pattern` in `sync_change_intent`:
 

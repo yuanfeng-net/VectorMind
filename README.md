@@ -1,56 +1,43 @@
 # VectorMind MCP
 
-VectorMind 是给 AI 编程助手用的本地项目记忆 MCP。
-
-它会把“当前在做什么、为什么这样改、哪些决策已经更新、哪些文件不能乱动、哪些改动对应哪个需求点”保存到项目本地，帮助 AI 在长期开发里少丢上下文、少猜路径、少把旧功能改回来。
+VectorMind 是面向 AI 编程助手的本地项目记忆 MCP。它把需求、决策、改动原因、项目约定和文件状态保存在项目目录内，帮助长周期开发减少上下文丢失、跨项目串线和旧逻辑回退。
 
 当前版本：`1.1.0`
 
-## 它能做什么
+## 核心能力
 
-- **恢复上下文**：新会话可以找回项目摘要、最近需求、最近改动、决策、约定和待同步文件。
-- **守住需求边界**：修改前先确认当前需求和计划文件，减少乱改无关模块。
-- **逐条核对需求**：当需求有明确条目时，改动计划必须能对应到这些条目，避免 AI 自己扩展需求。
-- **隔离多项目上下文**：同一会话切换项目时，会提示这是另一个项目的只读参考，减少串项目、串记忆。
-- **记录改动原因**：改完后保存“改了什么、为什么改”，后续会话能接上。
-- **让新决策覆盖旧记忆**：需求反转或规则更新后，可以标记旧记忆过时，避免 AI 按旧规则回退功能。
-- **查看上下文时间线**：按需求、文件、记忆或关键词查看前后发生了什么，帮助判断新旧关系。
-- **保存会话检查点**：长会话或交接前保存 waypoint，后续只读恢复上下文，不改变模型判断。
-- **诊断记忆质量**：检查记忆冲突、重复记忆和 checkpoint 差异，只给证据，不自动修改。
-- **沉淀项目知识**：保存架构说明、构建命令、命名规则、注意事项和 TODO。
-- **定位代码和搜索文本**：帮 AI 找函数、类、配置、关键逻辑，不靠猜。
-- **安全读取文件**：按目录、按行、按大小读取，避免一次塞入过多上下文。
-- **治理巨量文件**：遇到几千行实现文件，会要求先做真实模块拆分，不继续往大文件里堆代码。
-- **维护长期记忆**：压缩过时记忆、清理无效索引，减轻大项目越用越慢的问题。
-- **减少输出占用**：默认返回简洁结果，并可配合 `rtk` 降低命令输出负担。
+- **恢复项目上下文**：按当前目标找回项目摘要、需求、决策、约定和相关记忆。
+- **约束改动范围**：编辑前核对需求条目、计划文件和巨量文件治理要求。
+- **记录改动意图**：把变更文件、实现原因、验证结果和遗留缺口归档到对应需求。
+- **管理需求生命周期**：支持串行任务、显式并行任务、恢复已完成任务和更新验证结果。
+- **更新权威决策**：新决策可以 supersede 旧需求或旧记忆，避免后续会话按过时规则实现。
+- **隔离多个项目**：记忆、pending buffer、索引和数据库都按 `project_root` 隔离。
+- **安全读取项目文件**：使用 canonical realpath 校验，拒绝通过符号链接或 junction 越过项目边界。
+- **保存长期会话检查点**：创建有界、版本化 checkpoint，并只读恢复或比较上下文。
+- **诊断记忆质量**：检查冲突、重复、过大 checkpoint、陈旧索引和孤立记忆。
+- **控制上下文体积**：默认使用精简工具集和紧凑输出，大结果会保留关键 ID 与完成状态。
 
-更完整的能力表见：`docs/capability-matrix.md`
+完整能力表见 [docs/capability-matrix.md](docs/capability-matrix.md)。
 
-## 安装后怎么用
+## 快速安装
 
-安装并配置好 MCP 后，正常跟 AI 聊天即可。
+推荐直接把项目地址发给你的 AI 编程助手，让它自动完成安装和配置：
 
-VectorMind 会在背后自动恢复上下文、记录需求、检查改动范围、保存改动原因和维护长期记忆。用户不需要记工具名，也不需要手动按步骤调用。
+```text
+请安装并配置 VectorMind MCP：
+https://github.com/yuanfeng-net/VectorMind
 
-## 巨量文件规则
+请自动识别我当前使用的 AI 编程客户端，完成安装、MCP 配置和可用性验证。
+除非缺少必要权限，否则不需要让我手动执行命令。
+```
 
-当实现文件达到巨量阈值时，VectorMind 会提示：
+通常只需要发送 GitHub 地址并说明“帮我安装”即可。AI 会根据仓库说明识别当前客户端、更新对应的 MCP 配置并验证是否可用，用户不需要记安装命令或手动编辑配置文件。
 
-- 不要继续往这个文件里加新功能。
-- 先做机械搬迁式模块化拆分。
-- 使用真实模块名和清晰目录。
-- 禁止 `*.generated.*`、`.parts`、`*.rs.parts`、`part1/part2`、`1_xxx/2_xxx` 这类假拆分或排序式命名。
-- 拆分计划和结果会被记录，后续会话知道这个文件正在或已经被治理。
+## 手动安装与配置（可选）
 
-## 它不做什么
+需要自己配置时，运行环境要求 Node.js `20.19.0` 或更高版本。
 
-VectorMind 只定义开发规范、记忆和质量约束。
-
-它的输出只是上下文证据和质量信号，不替模型做决定，不削弱模型自己的推理、判断、创造和实现能力。
-
-它不接管 Codex、Claude 或其他客户端的运行控制，也不处理客户端自己的确认弹窗、执行策略或访问设置。
-
-## 安装
+直接运行 MCP：
 
 ```bash
 npx -y @coreyuan/vector-mind
@@ -62,14 +49,15 @@ npx -y @coreyuan/vector-mind
 npm install -g @coreyuan/vector-mind
 ```
 
-全局安装后可用：
+全局安装后提供三个命令：
 
 ```text
-vector-mind
-rtk
+vector-mind        # MCP stdio 服务
+vector-mind-admin  # 生产模式管理面板
+rtk                # RTK 兼容入口
 ```
 
-## Codex 配置
+### 手动配置 Codex
 
 在 `~/.codex/config.toml` 添加：
 
@@ -80,9 +68,9 @@ command = "npx"
 args = ["-y", "@coreyuan/vector-mind"]
 ```
 
-配置后重启 Codex，并开启新会话。
+配置后重启 Codex，并在新任务中使用。
 
-## Claude Desktop 配置
+### 手动配置 Claude Desktop
 
 ```json
 {
@@ -95,48 +83,87 @@ args = ["-y", "@coreyuan/vector-mind"]
 }
 ```
 
-## 多项目使用
+## 管理面板
 
-多数情况下直接正常聊天即可。若同一窗口里同时处理多个项目，可以明确告诉 AI 当前项目路径：
+全局安装后直接启动：
 
-```text
-这个任务的项目路径是 H:\2025\YourProject，请 VectorMind 使用这个 project_root。
+```bash
+vector-mind-admin
 ```
 
-每个项目的数据默认保存在：
+默认地址为 [http://127.0.0.1:16860](http://127.0.0.1:16860)。默认只监听回环地址，并为回环请求建立当前页面会话，不需要手动输入令牌。
 
-```text
-<project>/.vectormind/
+从源码运行：
+
+```bash
+npm ci
+npm run build
+npm run admin:start
 ```
 
-如果同一个 MCP 会话里切换了 `project_root`，VectorMind 会给出跨项目提示。这个提示只说明“这是另一个项目的上下文证据”，不会接管 AI 的判断，也不会改客户端权限。
+开发模式使用 Vite 中间件和 HMR：
 
-## 背后的能力
+```bash
+npm run admin:dev
+```
 
-这些能力主要给 AI 客户端自动调用，普通用户不用手动操作。
+可用环境变量：
 
-| 能力 | 背后工具 |
-| --- | --- |
-| 恢复上下文 | `bootstrap_context`, `get_brain_dump` |
-| 需求管理 | `start_requirement`, `preflight_change_scope`, `complete_requirement` |
-| 改动记录 | `sync_change_intent`, `get_pending_changes` |
-| 决策更新 | `upsert_decision`, `supersede_memory` |
-| 项目知识 | `upsert_project_summary`, `add_note`, `upsert_convention` |
-| 时间线/检查点 | `memory_timeline`, `create_checkpoint`, `list_checkpoints`, `restore_checkpoint_context` |
-| 记忆诊断 | `analyze_memory_conflicts`, `memory_quality_report`, `compare_checkpoint_context` |
-| 代码定位 | `query_codebase`, `grep` |
-| 读项目文件 | `list_project_files`, `read_file_lines`, `read_file_text` |
-| 读 Codex 文本 | `read_codex_text_file` |
-| 巨量文件拆分 | `plan_large_file_split`, `record_large_file_split` |
-| 记忆维护 | `maintain_memory`, `prune_index` |
-| 调试/降噪 | `get_activity_summary`, `get_activity_log`, `get_token_savings`, `detect_rtk` |
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `VECTORMIND_ADMIN_HOST` | `127.0.0.1` | 管理服务监听地址 |
+| `VECTORMIND_ADMIN_PORT` | `16860` | 管理服务端口 |
+| `VECTORMIND_ADMIN_TOKEN` | 无 | 非回环监听时必须显式设置 |
+
+监听非回环地址时，服务会在启动阶段强制检查 `VECTORMIND_ADMIN_TOKEN`。令牌不会通过 `/api/config` 返回；浏览器输入的令牌只保存在当前标签页的 `sessionStorage`。受保护接口同时校验令牌和同源 `Origin`，缺失 `Origin` 不会绕过令牌验证。
+
+管理面板的完整说明见 [admin-panel/README.md](admin-panel/README.md)。
+
+## 使用方式
+
+用户不需要记忆或手动输入任何 VectorMind 工具命令。像平常一样用自然语言说明任务目标、约束和期望结果即可，AI 客户端会在需要时自动恢复相关上下文、检查改动范围并记录变更原因。
+
+如果同一会话需要同时处理多个互不相关的任务，只需向 AI 明确说明哪些任务需要并行保留，以及各自对应的项目和目标；内部需求标识和工具调用由客户端管理。
+
+VectorMind 的质量信号只是上下文证据，不替模型或用户做决定。
+
+## 巨量文件规则
+
+当实现文件达到巨量阈值时，VectorMind 会要求先做机械搬迁式模块化拆分，再继续增加职责：
+
+- 使用真实模块名和清晰目录。
+- 保持对外行为不变，并验证拆分后的模块边界。
+- 禁止 `*.generated.*`、`.parts`、`*.rs.parts`、`part1/part2`、`1_xxx/2_xxx` 等假拆分或排序式命名。
+- 拆分计划和实际结果会持久化，后续会话可以继续同一计划。
+
+## 它不做什么
+
+VectorMind 只提供本地项目记忆、开发规范和质量证据。它不会：
+
+- 接管 Codex、Claude 或其他客户端的运行控制。
+- 替模型完成推理、设计和实现决策。
+- 修改客户端权限、确认弹窗或执行策略。
+- 把 checkpoint 当作文件、数据库或模型状态回滚。
+
+当前用户指令和直接观察到的仓库事实始终高于历史记忆。
 
 ## 开发与发布
 
 ```bash
-npm install
+npm ci
 npm run build
-npm run smoke -- --roots=off --use-tool-project-root
+npm run smoke
+npm run verify
+```
+
+- `npm run smoke` 会先重建核心产物，再运行 security、checkpoint、operation 和完整 MCP smoke。
+- `npm run verify` 会运行核心构建、管理面板测试与生产构建，以及全部 smoke。
+- `prepublishOnly` 强制执行完整 `verify`。
+- 发布前可用 `npm pack --dry-run --ignore-scripts --json` 检查核心产物、管理服务和预构建客户端是否进入包。
+
+发布：
+
+```bash
 npm publish --access public
 ```
 

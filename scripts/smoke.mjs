@@ -12,6 +12,8 @@ import { runMaintenanceCases } from "./smoke/maintenance-cases.mjs";
 import { runMemoryRecallCases } from "./smoke/memory-recall-cases.mjs";
 import { runQualityGuardCases } from "./smoke/quality-guard-cases.mjs";
 import { runContextGovernanceCases } from "./smoke/context-governance-cases.mjs";
+import { runSyncRegressionCases } from "./smoke/sync-regression-cases.mjs";
+import { runStorageRegressionCases } from "./smoke/storage-regression-cases.mjs";
 import { listToolDefinitions } from "../dist/tool-catalog.js";
 import { filterFocusedSemanticResult } from "../dist/context-governance.js";
 import { compactBootstrapText, compactSemanticSearchText } from "../dist/tool-output.js";
@@ -108,10 +110,13 @@ async function main() {
     const expectedCoreTools = [
       "bootstrap_context",
       "start_requirement",
+      "get_requirement_status",
+      "resume_requirement",
       "preflight_change_scope",
       "plan_large_file_split",
       "record_large_file_split",
       "sync_change_intent",
+      "update_requirement_verification",
       "preflight_operation_scope",
       "read_memory_item",
       "upsert_decision",
@@ -153,8 +158,8 @@ async function main() {
     if (previousMaxToolOutput === undefined) delete process.env.VECTORMIND_MAX_TOOL_OUTPUT_CHARS;
     else process.env.VECTORMIND_MAX_TOOL_OUTPUT_CHARS = previousMaxToolOutput;
     const boundedJson = JSON.parse(readText(boundedJsonResult));
-    if (boundedJsonResult.isError !== true || boundedJson?.output_truncated !== true || readText(boundedJsonResult).length >= 4000) {
-      throw new Error("expected oversized structured tool output to become a bounded valid JSON error");
+    if (boundedJsonResult.isError === true || boundedJson?.ok !== true || boundedJson?.output_truncated !== true || readText(boundedJsonResult).length >= 4000) {
+      throw new Error("expected oversized successful structured output to remain a bounded success");
     }
 
     const migrationRoot = path.join(runDir, "migration-project");
@@ -293,6 +298,10 @@ async function main() {
   if (serverInstructions) {
     console.log("\n--- server instructions ---\n");
     console.log(serverInstructions);
+    if (!serverInstructions.includes("never run a concrete operation first") ||
+        !serverInstructions.includes("deploy/publish/build/test/migrate/service/git/batch")) {
+      throw new Error("expected server instructions to require operation preflight before the first concrete command");
+    }
   }
 
   const toolList = await client.listTools();
@@ -318,6 +327,7 @@ async function main() {
     "memory_quality_report",
     "compare_checkpoint_context",
     "preflight_operation_scope",
+    "update_requirement_verification",
   ]) {
     if (!toolList.tools.some((t) => t.name === toolName)) {
       console.error(`\n[smoke] expected tool list to include ${toolName}`);
@@ -336,6 +346,7 @@ async function main() {
     const qualityTool = byName.get("memory_quality_report");
     const checkpointDiffTool = byName.get("compare_checkpoint_context");
     const operationScopeTool = byName.get("preflight_operation_scope");
+    const verificationUpdateTool = byName.get("update_requirement_verification");
     if (timelineTool?.annotations?.readOnlyHint !== true) {
       throw new Error("expected memory_timeline to be annotated readOnlyHint=true");
     }
@@ -356,6 +367,10 @@ async function main() {
     }
     if (operationScopeTool?.annotations?.readOnlyHint !== true) {
       throw new Error("expected preflight_operation_scope to be annotated readOnlyHint=true");
+    }
+    if (verificationUpdateTool?.annotations?.readOnlyHint !== false ||
+        !verificationUpdateTool?._meta?.["vectormind/behavior"]?.tags?.includes("verification_evidence")) {
+      throw new Error("expected update_requirement_verification to be a verification-evidence write tool");
     }
     if (!syncTool?._meta?.["vectormind/behavior"]?.tags?.includes("fix_pattern")) {
       throw new Error("expected sync_change_intent behavior tags to include fix_pattern");
@@ -1230,6 +1245,7 @@ async function main() {
     arguments: {
       ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
       title: "Close scoped smoke requirement",
+      close_previous: true,
       background: "Close previous scoped requirement to verify requirement metadata status patching.",
     },
   });
@@ -1267,11 +1283,15 @@ async function main() {
 
   if (!(await runContextGovernanceCases({ client, useToolProjectRoot, toolProjectRoot, readText }))) return;
 
+  if (!(await runSyncRegressionCases({ client, useToolProjectRoot, toolProjectRoot, readText }))) return;
+
   if (!(await runMemoryRecallCases({ client, useToolProjectRoot, toolProjectRoot, testPath, token, readText }))) return;
 
   if (!(await runFileToolCases({ client, useToolProjectRoot, toolProjectRoot, token, skillPath, readText }))) return;
 
   if (!(await runMaintenanceCases({ client, useToolProjectRoot, toolProjectRoot, token, testPath, keepFiles, inPlace, readText }))) return;
+
+  if (!(await runStorageRegressionCases())) return;
 
 }
 

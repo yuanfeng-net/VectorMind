@@ -95,6 +95,18 @@ a:focus-visible {
   translate: 0 0;
 }
 
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .app-shell {
   min-height: 100svh;
   padding: 18px clamp(14px, 2vw, 28px);
@@ -224,6 +236,68 @@ a:focus-visible {
 
 .topbar-actions {
   justify-content: flex-end;
+}
+
+.token-access {
+  min-width: 260px;
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) auto;
+  gap: 6px;
+}
+
+.token-access label,
+.token-session {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  padding: 0 10px;
+}
+
+.token-access input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+}
+
+.token-access > button,
+.token-session button {
+  min-height: 42px;
+  border: 1px solid color-mix(in oklch, var(--green) 34%, var(--line));
+  border-radius: var(--radius-sm);
+  background: var(--green-soft);
+  color: oklch(38% 0.13 148);
+  padding: 8px 12px;
+  font-weight: 700;
+}
+
+.token-error {
+  grid-column: 1 / -1;
+  color: var(--red);
+  font-size: 0.76rem;
+  line-height: 1.25;
+}
+
+.token-session {
+  white-space: nowrap;
+  color: oklch(38% 0.13 148);
+}
+
+.token-session button {
+  min-height: 30px;
+  margin-left: 2px;
+  padding: 4px 8px;
+  border-color: var(--line);
+  background: transparent;
+  color: var(--text-soft);
+  font-size: 0.78rem;
 }
 
 .ghost-button,
@@ -1344,9 +1418,15 @@ h3 {
   }
 
   .search-box,
-  .path-pill {
+  .path-pill,
+  .token-access,
+  .token-session {
     width: 100%;
     min-width: 0;
+  }
+
+  .token-access {
+    grid-template-columns: minmax(0, 1fr) auto;
   }
 
   .log-heading {

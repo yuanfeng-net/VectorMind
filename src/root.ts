@@ -171,10 +171,8 @@ export function resolveRootFromToolArgOrThrow(
     if (options.mode === "exact" || !options.preferred_root) return exactRoot;
     const preferredRoot = path.resolve(options.preferred_root);
     if (!isPathWithin(preferredRoot, candidate)) return exactRoot;
-    const nestedVectorMindRoot = findNearestVectorMindRoot(candidate);
-    if (nestedVectorMindRoot && path.resolve(nestedVectorMindRoot) !== preferredRoot) {
-      return nestedVectorMindRoot;
-    }
+    // Canonical mode keeps a task on its current ancestor project. Callers that
+    // intentionally target an independently managed nested project use exact mode.
     return preferredRoot;
   };
   try {

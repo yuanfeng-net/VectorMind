@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 export async function runFileToolCases(ctx) {
@@ -274,6 +276,39 @@ export async function runFileToolCases(ctx) {
     return;
   }
 
+  const outsideDir = path.join(path.dirname(toolProjectRoot), `vectormind-outside-${Date.now()}`);
+  const linkPath = path.join(toolProjectRoot, `vm-outside-link-${Date.now()}`);
+  try {
+    fs.mkdirSync(outsideDir, { recursive: true });
+    fs.writeFileSync(path.join(outsideDir, "secret.txt"), "outside-project-root");
+    fs.symlinkSync(outsideDir, linkPath, process.platform === "win32" ? "junction" : "dir");
+    const escapedRead = await client.callTool({
+      name: "read_file_text",
+      arguments: {
+        ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+        path: path.relative(toolProjectRoot, path.join(linkPath, "secret.txt")),
+        max_chars: 100,
+      },
+    });
+    const escapedText = readText(escapedRead);
+    if (!escapedRead?.isError && !/outside the allowed root|under the allowed root/i.test(escapedText)) {
+      throw new Error(`expected linked path escape to be rejected, got: ${escapedText}`);
+    }
+  } catch (err) {
+    const code = err?.code;
+    if (code === "EPERM" || code === "EACCES" || code === "ENOTSUP") {
+      console.log(`\n[smoke] linked-path containment skipped: ${code}`);
+    } else {
+      console.error("\n[smoke] linked-path containment check failed:", err);
+      process.exitCode = 1;
+      return;
+    }
+  } finally {
+    try {
+      fs.unlinkSync(linkPath);
+    } catch {}
+    fs.rmSync(outsideDir, { recursive: true, force: true });
+  }
 
   return true;
 }
