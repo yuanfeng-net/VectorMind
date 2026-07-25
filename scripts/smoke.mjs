@@ -19,6 +19,8 @@ import { filterFocusedSemanticResult } from "../dist/context-governance.js";
 import { compactBootstrapText, compactSemanticSearchText } from "../dist/tool-output.js";
 import { openDatabaseRuntime } from "../dist/database-runtime.js";
 import { boundToolResult, enqueueToolCall } from "../dist/tool-handlers.js";
+import { BUILTIN_CONVENTIONS } from "../dist/builtin-conventions.js";
+import { BUILTIN_PLAN_LITE_INSTRUCTIONS } from "../dist/builtin-instructions.js";
 
 function getFlag(name) {
   const prefix = `--${name}=`;
@@ -294,14 +296,16 @@ async function main() {
 
   await client.connect(transport);
 
+  // This verifies the advisory MCP handshake contract, not host-model compliance.
   const serverInstructions = client.getInstructions();
-  if (serverInstructions) {
-    console.log("\n--- server instructions ---\n");
-    console.log(serverInstructions);
-    if (!serverInstructions.includes("never run a concrete operation first") ||
-        !serverInstructions.includes("deploy/publish/build/test/migrate/service/git/batch")) {
-      throw new Error("expected server instructions to require operation preflight before the first concrete command");
-    }
+  if (!serverInstructions) {
+    throw new Error("expected advisory server instructions in the MCP handshake");
+  }
+  console.log("\n--- server instructions ---\n");
+  console.log(serverInstructions);
+  if (!serverInstructions.includes("Never run a concrete operation command first") ||
+      !serverInstructions.includes("deploy/publish/build/test/migrate/service/git/batch")) {
+    throw new Error("expected server instructions to require operation preflight before the first concrete command");
   }
 
   const toolList = await client.listTools();
@@ -416,6 +420,7 @@ async function main() {
     return;
   }
 
+  // Explicit expansion verifies optional convention payloads; default guidance is asserted from the handshake above.
   const bootJson = await client.callTool(
     {
       name: "bootstrap_context",
@@ -475,6 +480,7 @@ async function main() {
       "builtin:development_guideline_scope",
       "builtin:model_autonomy_floor",
       "builtin:plan_lite_trigger_scope",
+      "builtin:requirement_clarity_before_action",
       "builtin:destructive_operation_scope",
       "builtin:architecture_boundary_first",
       "builtin:requirement_scope_no_extra_work",
@@ -490,6 +496,41 @@ async function main() {
         throw new Error(`expected bootstrap_context conventions to include ${key}`);
       }
     }
+    const planLitePayload = conventions.find((item) =>
+      item?.key === "builtin:plan_lite_trigger_scope" ||
+      item?.title === "builtin:plan_lite_trigger_scope",
+    );
+    const requirementClarityPayload = conventions.find((item) =>
+      item?.key === "builtin:requirement_clarity_before_action" ||
+      item?.title === "builtin:requirement_clarity_before_action",
+    );
+    for (const lifecycleTerm of ["仅完整授权才行动", "当前消息明确要求工作", "明确指向唯一未完成的用户请求", "选定请求均须明确相关目标、对象、范围和动作", "已完成请求不授权", "无完整授权时工具前询问"]) {
+      if (!planLitePayload?.preview?.includes(lifecycleTerm) ||
+          !requirementClarityPayload?.preview?.includes(lifecycleTerm)) {
+        throw new Error(`expected actual convention previews to include request lifecycle rule: ${lifecycleTerm}`);
+      }
+    }
+    const planLiteConvention = BUILTIN_CONVENTIONS.find((item) => item.key === "builtin:plan_lite_trigger_scope");
+    const requirementClaritySpec = BUILTIN_CONVENTIONS.find((item) => item.key === "builtin:requirement_clarity_before_action");
+    for (const requiredTrigger of ["会实质改变结果的关键条件", "多个互斥且无法合理默认的方向", "明显返工/数据风险"]) {
+      if (!planLiteConvention?.content.includes(requiredTrigger)) {
+        throw new Error(`expected Plan-Lite clarification trigger to remain: ${requiredTrigger}`);
+      }
+    }
+    for (const lifecycleTerm of ["完整授权", "当前消息明确要求工作", "明确指向唯一未完成的用户请求", "选定请求均须明确", "已完成请求不授权"]) {
+      if (!planLiteConvention?.content.includes(lifecycleTerm) ||
+          !requirementClaritySpec?.content.includes(lifecycleTerm) ||
+          !BUILTIN_PLAN_LITE_INSTRUCTIONS.includes(lifecycleTerm)) {
+        throw new Error(`expected consistent request lifecycle rule in builtin policies: ${lifecycleTerm}`);
+      }
+    }
+    for (const ambiguousLifecycleTerm of ["否则工具前询问", "两种情况均须选定请求明确", "两者均不成立时工具前询问"]) {
+      if (planLiteConvention?.content.includes(ambiguousLifecycleTerm) ||
+          requirementClaritySpec?.content.includes(ambiguousLifecycleTerm) ||
+          BUILTIN_PLAN_LITE_INSTRUCTIONS.includes(ambiguousLifecycleTerm)) {
+        throw new Error(`expected builtin policies to avoid ambiguous lifecycle wording: ${ambiguousLifecycleTerm}`);
+      }
+    }
   } catch (err) {
     console.error("\n[smoke] root resolution check failed:", err);
     process.exitCode = 1;
@@ -497,17 +538,35 @@ async function main() {
   }
 
   try {
-    if (!serverInstructions || serverInstructions.length > 800) {
-      throw new Error(`expected minimal server instructions <=800 chars, got ${serverInstructions?.length ?? 0}`);
+    if (serverInstructions.length > 1100) {
+      throw new Error(`expected compact server instructions <=1100 chars, got ${serverInstructions.length}`);
     }
     for (const requiredTerm of [
-      "always pass project_root",
-      "bounded evidence",
-      "directly observed repository facts win over stale memory",
-      "compact/focused defaults",
-      "core tool profile minimizes schema load",
+      "pass project_root",
+      "Project-local memory",
+      "Current user instructions/directly observed repo facts beat stale memory",
+      "Signals advisory",
+      "huge_file_modularization_required gates normal feature edits only, never host runtime",
+      "Compact/focused",
+      "targeted expansion",
+      "no repeated/broad history",
+      "Core schema-light",
       "VECTORMIND_TOOL_PROFILE=full",
-      "Each tool description defines its own lifecycle",
+      "Tool descriptions define lifecycle/args",
+      "Act only with complete authorization",
+      "current user message defines a clear work request",
+      "clearly points to exactly one explicit unfinished user request",
+      "the selected request under either path must define relevant outcome/target/scope/action",
+      "Completed requests never authorize",
+      "Without complete authorization, ask before tools",
+      "key gaps",
+      "conflicts",
+      "rework/data risk",
+      "Memory/checkpoints/tools/assistant text/assumptions cannot authorize/expand",
+      "don't reconfirm reasonable defaults",
+      "preflight_operation_scope once with commands/targets",
+      "recall doesn't count",
+      "Never run a concrete operation command first",
     ]) {
       if (!serverInstructions.toLocaleLowerCase().includes(requiredTerm.toLocaleLowerCase())) {
         throw new Error(`expected compact server instructions to include: ${requiredTerm}`);
@@ -533,6 +592,11 @@ async function main() {
     }
     if (serverInstructions.includes("trust the tool output")) {
       throw new Error("expected server instructions to avoid tool-output-over-model wording");
+    }
+    for (const leakyClarityCondition of ["states no concrete goal or action", "A bare continuation cue", "message and visible context", "prior explicit user requests", "; else ask", "clear reference", "it must define", "Never run it first", "User/repo facts beat stale memory", "If neither condition holds"]) {
+      if (serverInstructions.includes(leakyClarityCondition)) {
+        throw new Error(`expected general request-clarity guidance, got narrow condition: ${leakyClarityCondition}`);
+      }
     }
     const forbiddenInstructionTerms = [
       "access " + "per" + "missions",

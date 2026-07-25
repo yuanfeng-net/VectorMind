@@ -7,6 +7,7 @@ VectorMind 的目标不是替代 AI，也不是接管客户端权限，而是让
 | 能力 | 解决的问题 | 主要工具 | 当前限制 |
 | --- | --- | --- | --- |
 | 上下文恢复 | 新会话不知道项目现状、最近做过什么 | `bootstrap_context`, `get_brain_dump` | focused 只锚定 active requirement；已完成历史需显式展开 |
+| 需求明确性引导 | AI 在没有明确当前要求时自行理解并工作 | 默认 MCP server instructions、内置 convention | advisory guidance：仅完整授权才可行动；授权来自当前消息明确提出工作，或明确指向唯一未完成的用户请求，且选定请求须明确相关目标、对象、范围和动作；已完成请求不得授权新动作；无完整授权时先询问 |
 | 需求边界 | 新需求顺手改到无关模块或并发任务串线 | `start_requirement`, `get_requirement_status`, `resume_requirement`, `preflight_change_scope`, `complete_requirement` | 默认串行；并行时传 `close_previous=false`，并始终保留 `req_id` 或 `goal_key` |
 | 改动意图 | 文件变了但不知道为什么，或完成后出现更强验证证据 | `sync_change_intent`, `update_requirement_verification`, `get_pending_changes` | 需要改完后同步；已完成需求可补写验证但不可改写文件意图 |
 | 最新决策优先 | 旧规则被重新召回，功能被改回老版本 | `upsert_decision`, `supersede_memory` | 需要把关键决策写入 MCP |

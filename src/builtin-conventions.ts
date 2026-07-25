@@ -35,8 +35,14 @@ export const BUILTIN_CONVENTIONS: BuiltinConventionSpec[] = [
   {
     key: "builtin:plan_lite_trigger_scope",
     content:
-      `${DEVELOPMENT_GUIDELINE_SCOPE} 多步骤任务可使用轻量执行列表；只有当需求缺少会实质改变结果的关键条件、存在多个互斥且无法合理默认的方向，或继续执行可能造成明显返工/数据风险时，才进入澄清模式。目标和范围足够明确时，应直接执行。`,
+      `${DEVELOPMENT_GUIDELINE_SCOPE} 仅完整授权才行动：当前消息明确要求工作，或明确指向唯一未完成的用户请求；选定请求均须明确相关目标、对象、范围和动作。已完成请求不授权；无完整授权时工具前询问。多步骤任务可使用轻量执行列表。需求缺少会实质改变结果的关键条件、存在多个互斥且无法合理默认的方向，或执行可能造成明显返工/数据风险时，应先澄清；目标和范围足够明确、剩余实现细节可合理默认时，应直接执行，不得重复确认。`,
     tags: ["builtin", "plan-lite", "scope", "clarification"],
+  },
+  {
+    key: "builtin:requirement_clarity_before_action",
+    content:
+      `${DEVELOPMENT_GUIDELINE_SCOPE} 仅完整授权才行动：当前消息明确要求工作，或明确指向唯一未完成的用户请求；选定请求均须明确相关目标、对象、范围和动作。已完成请求不授权；无完整授权时工具前询问。不得仅凭项目记忆、工具结果、助手表述或模型推测创造、扩展用户要求；要求已经明确时应直接执行，不得重复确认合理默认项。`,
+    tags: ["builtin", "requirement", "clarity", "ambiguity", "clarification"],
   },
   {
     key: "builtin:destructive_operation_scope",
