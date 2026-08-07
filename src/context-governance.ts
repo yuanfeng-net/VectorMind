@@ -64,12 +64,14 @@ function focusedEvidenceCoverage(query: string, haystack: string): {
   matched_chars: number;
   coverage: number;
   independent_runs: number;
+  distinct_terms: number;
   technical_anchor: boolean;
 } {
   const segments = normalizeSearchText(query).match(/[a-z0-9_./:@#-]+|\p{Script=Han}+/gu) ?? [];
   let totalChars = 0;
   let matchedChars = 0;
   let independentRuns = 0;
+  const distinctTerms = new Set<string>();
   let technicalAnchor = false;
 
   for (const segment of segments) {
@@ -79,6 +81,7 @@ function focusedEvidenceCoverage(query: string, haystack: string): {
       if (!haystack.includes(segment)) continue;
       matchedChars += segment.length;
       independentRuns += 1;
+      distinctTerms.add(segment);
       if (segment.length >= 3 && (/\d/.test(segment) || /[_.\/@:#-]/.test(segment))) {
         technicalAnchor = true;
       }
@@ -91,6 +94,7 @@ function focusedEvidenceCoverage(query: string, haystack: string): {
     for (let width = maxWidth; width >= 2; width -= 1) {
       for (let index = 0; index <= segment.length - width; index += 1) {
         if (!haystack.includes(segment.slice(index, index + width))) continue;
+        distinctTerms.add(segment.slice(index, index + width));
         for (let offset = index; offset < index + width; offset += 1) covered[offset] = true;
       }
     }
@@ -105,6 +109,7 @@ function focusedEvidenceCoverage(query: string, haystack: string): {
     matched_chars: matchedChars,
     coverage: totalChars > 0 ? matchedChars / totalChars : 0,
     independent_runs: independentRuns,
+    distinct_terms: distinctTerms.size,
     technical_anchor: technicalAnchor,
   };
 }
@@ -122,8 +127,10 @@ export function focusedTextIsRelevant(
   const evidence = focusedEvidenceCoverage(query, haystack);
   if (evidence.technical_anchor) return true;
   if (evidence.total_chars <= 4) return evidence.coverage === 1;
+  if (evidence.distinct_terms < 2) return false;
   return evidence.coverage >= 0.58 ||
-    (evidence.coverage >= 0.42 && evidence.matched_chars >= 6 && evidence.independent_runs >= 2);
+    (evidence.coverage >= 0.42 && evidence.matched_chars >= 6 && evidence.independent_runs >= 2) ||
+    (evidence.matched_chars >= 8 && evidence.independent_runs >= 3 && evidence.distinct_terms >= 3);
 }
 
 function focusedMatchIsRelevant(query: string, match: SemanticMatchLike): boolean {
@@ -220,6 +227,41 @@ export function sameRequirement(
   const activeBackground = normalize(active.context_data);
   const nextBackground = normalize(next.background);
   return activeTitle === nextTitle && activeBackground === nextBackground;
+}
+
+const REQUIREMENT_STOP_WORDS = new Set([
+  "after", "before", "build", "change", "continue", "debug", "deploy", "ensure", "fix", "implement",
+  "issue", "problem", "requirement", "the", "this", "update", "with", "修复", "实现", "继续", "问题", "需求",
+]);
+
+function requirementTerms(value: string | null | undefined): Set<string> {
+  const normalized = normalizeRequirementText(value);
+  const raw = normalized.match(/[a-z0-9_./:@#-]{3,}|\p{Script=Han}{2,}/gu) ?? [];
+  const expanded = raw.flatMap((term) => {
+    if (!/\p{Script=Han}/u.test(term) || term.length <= 2) return [term];
+    return Array.from({ length: term.length - 1 }, (_, index) => term.slice(index, index + 2));
+  });
+  return new Set(expanded.filter((term) => !REQUIREMENT_STOP_WORDS.has(term)));
+}
+
+export function requirementOverlapScore(
+  active: { title: string; context_data?: string | null },
+  next: { title: string; background?: string | null },
+): number {
+  const left = requirementTerms(`${active.title}\n${active.context_data ?? ""}`);
+  const right = requirementTerms(`${next.title}\n${next.background ?? ""}`);
+  if (!left.size || !right.size) return 0;
+  const shared = [...left].filter((term) => right.has(term));
+  if (!shared.length) return 0;
+  const structuredAnchor = shared.some((term) => /[0-9_./:@#-]/u.test(term));
+  const sharedHanTerms = shared.filter((term) => /\p{Script=Han}/u.test(term));
+  if (!structuredAnchor && shared.length < 2 && sharedHanTerms.length < 2) return 0;
+  const containment = shared.length / Math.min(left.size, right.size);
+  const jaccard = shared.length / new Set([...left, ...right]).size;
+  const hanEvidence = sharedHanTerms.length >= 4
+    ? Math.min(0.8, 0.4 + sharedHanTerms.length * 0.04)
+    : 0;
+  return Math.min(1, Math.max(jaccard, containment * (structuredAnchor ? 1 : 0.8), hanEvidence));
 }
 
 function normalizeRequirementText(value: string | null | undefined): string {

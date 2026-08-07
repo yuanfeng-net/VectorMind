@@ -21,6 +21,7 @@ import {
 } from "./path-rules.js";
 import { extractSymbols } from "./symbols.js";
 import { logActivity } from "./activity-log.js";
+import { sanitizePersistentMemoryText } from "./memory-safety.js";
 import { safeJson } from "./tool-output.js";
 import { resolvePathWithinRoot } from "./path-containment.js";
 
@@ -357,13 +358,14 @@ export function indexFile(absPath: string, reason: IndexReason): void {
     return;
   }
 
-  const symbols = indexSymbols ? extractSymbols(absPath, content) : [];
+  const sanitizedContent = sanitizePersistentMemoryText(content);
+  const symbols = indexSymbols ? extractSymbols(absPath, sanitizedContent.text) : [];
   let chunkCount = 0;
   try {
     getDb().transaction(() => {
       if (indexSymbols) getIndexFileSymbolsTx()?.(filePath, symbols);
       else getDeleteSymbolsForFileStatement().run(filePath);
-      if (indexContent) chunkCount = replaceFileContentChunks(filePath, absPath, content);
+      if (indexContent) chunkCount = replaceFileContentChunks(filePath, absPath, sanitizedContent.text);
       else getDeleteFileChunkItemsStatement().run(filePath);
     })();
   } catch (err) {
@@ -377,6 +379,8 @@ export function indexFile(absPath: string, reason: IndexReason): void {
     symbols: symbols.length,
     chunks: chunkCount,
     bytes: stat.size,
+    secret_redaction_applied: sanitizedContent.redacted,
+    secret_redaction_categories: sanitizedContent.categories,
   });
 }
 

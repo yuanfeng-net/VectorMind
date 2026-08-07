@@ -9,6 +9,8 @@ import { runIndexedGrepSearch } from "../../dist/grep.js";
 import { passesPathFilters } from "../../dist/path-filters.js";
 import { RTK_COMMIT_SHA, verifyFileSha256 } from "../../dist/rtk-integrity.js";
 import { buildRtkInstallPlan } from "../../dist/rtk-tools.js";
+import { sanitizePersistentMemoryText, sanitizePersistentMemoryValue } from "../../dist/memory-safety.js";
+import { requirementOverlapScore } from "../../dist/context-governance.js";
 
 function runIndexContainmentCase() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "vectormind-index-root-"));
@@ -101,9 +103,61 @@ function runPathFilterCase() {
   assert.equal(passesPathFilters("src/foo.ts", null, ["src/Foo.ts"], "win32"), false);
 }
 
+function runPersistentMemoryRedactionCase() {
+  const prefixedPassword = "plainsecret-prefixed-password";
+  const quotedSecret = "multi word quoted secret";
+  const sanitized = sanitizePersistentMemoryText([
+    "Production domain=https://shop.example.test origin=203.0.113.9:443 deploy_dir=/srv/app",
+    "SSH credential source: ops/server.txt",
+    "GMPAY_SECRET_KEY=gms_thisMustNeverPersist123456789",
+    '"bot_token":"123456789:abcdefghijklmnopqrstuvwxyzABCDEFG"',
+    `DATABASE_PASSWORD=${prefixedPassword}`,
+    `password: "${quotedSecret}"`,
+    "Authorization: Bearer bearerSecretMustDisappear",
+  ].join("\n"));
+  assert.equal(sanitized.redacted, true);
+  assert.match(sanitized.text, /shop\.example\.test/);
+  assert.match(sanitized.text, /203\.0\.113\.9:443/);
+  assert.match(sanitized.text, /ops\/server\.txt/);
+  assert.doesNotMatch(sanitized.text, /thisMustNeverPersist|abcdefghijklmnopqrstuvwxyz|plainsecret-prefixed-password|multi word quoted secret|bearerSecretMustDisappear/);
+  assert.ok(sanitized.text.includes('password: "[REDACTED]"'));
+
+  const structured = sanitizePersistentMemoryValue({
+    root_cause: `The deployment used DATABASE_PASSWORD=${prefixedPassword}`,
+    nested: { api_key: "nestedSecretMustDisappear" },
+  });
+  assert.equal(structured.redacted, true);
+  assert.doesNotMatch(JSON.stringify(structured.value), /plainsecret-prefixed-password|nestedSecretMustDisappear/);
+}
+
+function runRequirementOverlapCase() {
+  const score = requirementOverlapScore(
+    { title: "Deploy merchant catalog refresh", context_data: "Publish merchant catalog bundle to production origin." },
+    { title: "Fix merchant catalog refresh deployment", background: "Continue production origin deployment after bundle verification." },
+  );
+  assert.ok(score >= 0.55, `expected strong lifecycle overlap, got ${score}`);
+  const isolated = requirementOverlapScore(
+    { title: "Implement transport request lifecycle", context_data: "Build request processing." },
+    { title: "Debug transport timeout retries", background: "Investigate retry timing." },
+  );
+  assert.ok(isolated < 0.55, `expected a shared technical word not to force reuse, got ${isolated}`);
+  const chineseOverlap = requirementOverlapScore(
+    { title: "修复商店数据加载失败", context_data: "部署商品介绍后线上商店无法读取数据" },
+    { title: "继续处理商店数据加载问题", background: "检查同一次部署导致的线上商家数据错误" },
+  );
+  assert.ok(chineseOverlap >= 0.55, `expected rewritten Chinese incident to overlap, got ${chineseOverlap}`);
+  const chineseIsolated = requirementOverlapScore(
+    { title: "优化商店商品加载速度", context_data: "减少列表渲染时间" },
+    { title: "修复支付回调重复通知", background: "处理网关重试事件" },
+  );
+  assert.ok(chineseIsolated < 0.55, `expected unrelated Chinese tasks to remain separate, got ${chineseIsolated}`);
+}
+
 runIndexContainmentCase();
 runUnsafeRegexCase();
 runRtkIntegrityCase();
 runRtkInstallPlanCase();
 runPathFilterCase();
+runPersistentMemoryRedactionCase();
+runRequirementOverlapCase();
 console.log("security regression cases passed");

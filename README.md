@@ -178,3 +178,4 @@ npm publish --access public
 ## 一句话
 
 VectorMind 让 AI 记住需求、决策、改动原因和项目边界，在长期开发中少丢上下文、少乱改、少回退到旧逻辑。
+Focused context recovery is explicitly relevance-filtered and full recovery remains output-bounded; neither mode claims repository or live-runtime coverage. A missing match therefore does not prove that a fact never existed. Durable operational facts such as domains, origin hosts, ports, deployment directories, and credential-file references remain recallable, while secret values are recursively redacted before long-term memory persistence, symbol extraction, and document indexing. Requirement creation also reports or rejects high-confidence overlap so an unfinished incident is not silently fragmented into a new lifecycle.

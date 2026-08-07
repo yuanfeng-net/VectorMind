@@ -161,7 +161,7 @@ export async function listToolDefinitions() {
       {
         name: "start_requirement",
         description:
-          "Call once for a new code-change goal. The default serial workflow closes the previous active requirement; pass close_previous=false only for intentional parallel work. Preserve requirement.id or goal_key because explicit identities can finish preflight/sync after another goal becomes active.",
+          "Call once for a new code-change goal. The default serial workflow closes the previous active requirement, but a high-confidence overlap is rejected unless you reuse its goal_key or explicitly pass previous_req_id to confirm replacement. Pass close_previous=false only for intentional parallel work. Preserve requirement.id or goal_key because explicit identities can finish preflight/sync after another goal becomes active. Persistent text is secret-redacted while safe topology and credential-source references remain recallable.",
         inputSchema: toJsonSchemaCompat(StartRequirementArgsSchema),
       },
       {
@@ -219,7 +219,7 @@ export async function listToolDefinitions() {
       {
         name: "bootstrap_context",
         description:
-          "Call at most once for a new project goal when historical context is needed. Default focused mode returns project summary plus query-relevant matches within a compact output budget; recent history and pending files are opt-in. When operation_preflight.required_before_commands=true, call preflight_operation_scope immediately before concrete commands; bootstrap_context does not satisfy that step.",
+          "Call at most once for a new project goal when historical context is needed. Default focused mode returns project summary plus query-relevant matches within a compact output budget; it is explicitly non-exhaustive, and no match never proves that a fact was not stored or does not exist in repository/runtime state. Recent history and pending files are opt-in. When operation_preflight.required_before_commands=true, call preflight_operation_scope immediately before concrete commands; bootstrap_context does not satisfy that step.",
         inputSchema: toJsonSchemaCompat(BootstrapContextArgsSchema),
       },
       {

@@ -7,6 +7,7 @@ import { supersedeMemoryItemIds, supersedeRequirementIds } from "../memory-mutat
 import { makePreviewText } from "../memory-recall.js";
 import { logActivity } from "../activity-log.js";
 import { safeJson, toolJson } from "../tool-output.js";
+import { sanitizePersistentMemoryText } from "../memory-safety.js";
 export async function handleUpsertProjectSummary(
   rawArgs: Record<string, unknown>,
   context: ToolHandlerContext,
@@ -15,7 +16,8 @@ export async function handleUpsertProjectSummary(
   const { getProjectSummaryStmt, upsertProjectSummaryStmt } = context.getStatements();
 
   const args = UpsertProjectSummaryArgsSchema.parse(rawArgs);
-  const summary = args.summary.trim();
+  const sanitized = sanitizePersistentMemoryText(args.summary.trim());
+  const summary = sanitized.text;
   const contentHash = sha256Hex(summary);
   upsertProjectSummaryStmt.run(summary, safeJson({ source: "assistant" }), contentHash);
 
@@ -28,6 +30,7 @@ export async function handleUpsertProjectSummary(
         text: toolJson({
           ok: true,
           project_summary: row ? { id: row.id, updated_at: row.updated_at } : null,
+          redaction: { applied: sanitized.redacted, categories: sanitized.categories },
         }),
       },
     ],
@@ -41,8 +44,10 @@ export async function handleAddNote(
   const { insertMemoryItemStmt } = context.getStatements();
 
   const args = AddNoteArgsSchema.parse(rawArgs);
-  const title = args.title?.trim() ?? "";
-  const content = args.content.trim();
+  const sanitizedTitle = sanitizePersistentMemoryText(args.title?.trim() ?? "");
+  const sanitizedContent = sanitizePersistentMemoryText(args.content.trim());
+  const title = sanitizedTitle.text;
+  const content = sanitizedContent.text;
   const info = insertMemoryItemStmt.run(
     "note",
     title || null,
@@ -60,7 +65,14 @@ export async function handleAddNote(
     content: [
       {
         type: "text",
-        text: toolJson({ ok: true, note: { id } }),
+        text: toolJson({
+          ok: true,
+          note: { id },
+          redaction: {
+            applied: sanitizedTitle.redacted || sanitizedContent.redacted,
+            categories: [...new Set([...sanitizedTitle.categories, ...sanitizedContent.categories])].sort(),
+          },
+        }),
       },
     ],
   };
@@ -75,8 +87,10 @@ export async function handleUpsertDecision(
 
   const args = UpsertDecisionArgsSchema.parse(rawArgs);
   const key = args.key.trim();
-  const title = args.title.trim() || key;
-  const content = args.content.trim();
+  const sanitizedTitle = sanitizePersistentMemoryText(args.title.trim() || key);
+  const sanitizedContent = sanitizePersistentMemoryText(args.content.trim());
+  const title = sanitizedTitle.text;
+  const content = sanitizedContent.text;
   const meta = {
     status: "current",
     key,
@@ -114,6 +128,10 @@ export async function handleUpsertDecision(
           decision: row ? { id: row.id, key, updated_at: row.updated_at } : null,
           superseded_requirements,
           superseded_memory_items,
+          redaction: {
+            applied: sanitizedTitle.redacted || sanitizedContent.redacted,
+            categories: [...new Set([...sanitizedTitle.categories, ...sanitizedContent.categories])].sort(),
+          },
         }),
       },
     ],
@@ -174,7 +192,8 @@ export async function handleUpsertConvention(
 
   const args = UpsertConventionArgsSchema.parse(rawArgs);
   const key = args.key.trim();
-  const content = args.content.trim();
+  const sanitized = sanitizePersistentMemoryText(args.content.trim());
+  const content = sanitized.text;
   const contentHash = sha256Hex(content);
   const meta = safeJson({ tags: args.tags ?? [] });
   const existing = getConventionByKeyStmt.get(key) as MemoryItemRow | undefined;
@@ -201,6 +220,7 @@ export async function handleUpsertConvention(
                 preview: makePreviewText(row.content, DEFAULT_PREVIEW_CHARS),
               }
             : null,
+          redaction: { applied: sanitized.redacted, categories: sanitized.categories },
         }),
       },
     ],

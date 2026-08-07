@@ -209,7 +209,7 @@ export function compactSemanticSearchText(data: { ok?: boolean } & CompactSemant
   const lines: string[] = [
     `semantic ${data.mode} ${data.matches.length}/${data.top_k} q="${oneLine(data.query, 100)}"`,
   ];
-  if (data.focused_no_match) lines.push("confidence: no query-relevant memory passed focused relevance filtering");
+  if (data.focused_no_match) lines.push("confidence: no query-relevant memory passed focused relevance filtering; this is not proof that the fact was never stored or does not exist");
   for (const m of data.matches.slice(0, data.top_k)) {
     lines.push(`- score=${m.score.toFixed(3)} ${compactMemoryLabel(m.item, 160)}`);
   }
@@ -487,6 +487,18 @@ export function compactBootstrapText(data: {
     max_output_chars: number;
     compact_truncated?: boolean;
   };
+  recall_coverage?: {
+    mode: "focused" | "full";
+    filtered: boolean;
+    memory_store_scope: "relevance_filtered" | "bounded_full";
+    output_bounded: boolean;
+    repository_covered: boolean;
+    runtime_covered: boolean;
+    recent_history_included: boolean;
+    pending_changes_included: boolean;
+    absence_interpretation: string;
+    next_steps: string[];
+  };
   operation_preflight?: {
     detected: boolean;
     required_before_commands: boolean;
@@ -513,12 +525,19 @@ export function compactBootstrapText(data: {
     requirement: CompactRequirementPreview;
     recent_changes: Array<CompactChangeLogPreview>;
   }>;
+  recalled_context?: Array<{
+    requirement: CompactRequirementPreview;
+    recent_changes: Array<CompactChangeLogPreview>;
+  }>;
   semantic?: CompactSemanticSearchResult | null;
 }): string {
   const lines: string[] = [];
   lines.push(
     `ok ctx ${data.root_source} mode=${data.context_policy?.mode ?? "full"} watcher=${data.index_state?.watcher ?? (data.watcher_enabled ? (data.watcher_ready ? "ready" : "warming") : "off")} semantic=${data.index_state?.semantic_search ?? "unknown"} root=${data.project_root}`,
   );
+  if (data.recall_coverage) {
+    lines.push(`recall coverage store=${data.recall_coverage.memory_store_scope} bounded=${data.recall_coverage.output_bounded} repository=${data.recall_coverage.repository_covered} runtime=${data.recall_coverage.runtime_covered}; ${oneLine(data.recall_coverage.absence_interpretation, 220)}`);
+  }
   if (data.project_summary) lines.push(`summary ${compactMemoryLabel(data.project_summary, 140)}`);
   if (data.operation_preflight?.required_before_commands) {
     lines.push(
@@ -528,7 +547,7 @@ export function compactBootstrapText(data: {
   if (data.semantic) {
     lines.push(`semantic ${data.semantic.mode} ${data.semantic.matches.length}/${data.semantic.top_k} for "${oneLine(data.semantic.query, 80)}":`);
     if (data.semantic.focused_no_match) {
-      lines.push("- no query-relevant memory passed focused filtering; continue from current repository facts");
+      lines.push("- no query-relevant memory passed focused filtering; non-exhaustive result, so inspect targeted memory, repository, or runtime before concluding absence");
     }
     for (const m of data.semantic.matches.slice(0, 5)) {
       lines.push(`- score=${m.score.toFixed(3)} ${compactMemoryLabel(m.item, 120)}`);
@@ -570,6 +589,13 @@ export function compactBootstrapText(data: {
     }
   } else if (data.context_policy?.include_recent !== false) {
     lines.push("requirements: none");
+  }
+  if (data.recalled_context?.length) {
+    lines.push("recalled context:");
+    for (const item of data.recalled_context) {
+      lines.push(`- ${compactRequirementLabel(item.requirement)}`);
+      for (const c of item.recent_changes.slice(0, 3)) lines.push(`  - ${compactChangeLabel(c)}`);
+    }
   }
   if (data.recent_notes.length) {
     lines.push("notes:");

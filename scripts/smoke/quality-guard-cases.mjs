@@ -25,6 +25,7 @@ export async function runQualityGuardCases(ctx) {
     return parsed;
   };
   const pairedFlowPath = path.join(toolProjectRoot, "src", "paired-flow", "entry.ts");
+  const structuredSecret = `structuredSecretMustDisappear${Date.now()}`;
   fs.mkdirSync(path.dirname(pairedFlowPath), { recursive: true });
   fs.writeFileSync(
     pairedFlowPath,
@@ -47,7 +48,7 @@ export async function runQualityGuardCases(ctx) {
       verification_gaps: ["manual end-to-end exercise not performed in smoke"],
       fix_pattern: {
         symptom: "A visible workflow succeeds in one path but fails in another related path.",
-        root_cause: "Related entry, validation, and commit paths used inconsistent assumptions.",
+        root_cause: `Related entry, validation, and commit paths used inconsistent assumptions. DATABASE_PASSWORD=${structuredSecret}`,
         invariant: "Keep paired workflow entry, validation, and commit paths aligned for the same visible flow.",
         applies_when: [
           "Changing any entry, validation, commit, display, or save path in a paired workflow.",
@@ -97,6 +98,9 @@ export async function runQualityGuardCases(ctx) {
       !meta?.fix_pattern?.invariant
     ) {
       throw new Error("expected stored fix_pattern advisory metadata");
+    }
+    if (readFixPatternText.includes(structuredSecret)) {
+      throw new Error("expected structured fix_pattern fields to be secret-redacted before persistence");
     }
   } catch (err) {
     console.error("\n[smoke] fix_pattern memory read check failed:", err);

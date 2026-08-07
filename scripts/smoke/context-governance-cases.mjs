@@ -6,6 +6,22 @@ export async function runContextGovernanceCases(ctx) {
   const { client, useToolProjectRoot, toolProjectRoot, readText } = ctx;
   const rootArgs = useToolProjectRoot ? { project_root: toolProjectRoot } : {};
   const token = `VM_FOCUSED_CONTEXT_${Date.now()}`;
+  const indexedSecret = `sk_symbol_secret_${Date.now()}abcdefghijkl`;
+  const indexedSecretPath = path.join(toolProjectRoot, "src", "redaction-index-smoke.ts");
+  fs.mkdirSync(path.dirname(indexedSecretPath), { recursive: true });
+  fs.writeFileSync(indexedSecretPath, `export function redactionIndexSmoke(apiKey = "${indexedSecret}") { return apiKey; }\n`, "utf8");
+  const indexedSecretSync = await client.callTool({
+    name: "sync_change_intent",
+    arguments: {
+      ...rootArgs,
+      intent: "smoke: force indexing through the production sync path for redaction verification",
+      files: ["src/redaction-index-smoke.ts"],
+    },
+  });
+  const indexedSecretSyncParsed = JSON.parse(readText(indexedSecretSync));
+  if (indexedSecretSyncParsed?.ok !== true) {
+    throw new Error(`expected explicit redaction-index sync to succeed: ${readText(indexedSecretSync)}`);
+  }
 
   const relevantNote = await client.callTool({
     name: "add_note",
@@ -151,6 +167,14 @@ export async function runContextGovernanceCases(ctx) {
     },
   });
   const focusedDomainText = readText(focusedDomain);
+  const focusedDomainParsed = JSON.parse(focusedDomainText);
+  if (focusedDomainParsed?.recall_coverage?.memory_store_scope !== "relevance_filtered" ||
+      focusedDomainParsed?.recall_coverage?.output_bounded !== true ||
+      focusedDomainParsed?.recall_coverage?.repository_covered !== false ||
+      focusedDomainParsed?.recall_coverage?.runtime_covered !== false ||
+      !String(focusedDomainParsed?.recall_coverage?.absence_interpretation ?? "").includes("does not prove")) {
+    throw new Error("expected focused bootstrap to expose non-exhaustive recall coverage and safe absence semantics");
+  }
   if (!focusedDomainText.includes(highCoverageToken) || focusedDomainText.includes(lowCoverageToken)) {
     throw new Error("expected focused recall to keep high-coverage evidence and reject a low-coverage shared phrase");
   }
@@ -176,6 +200,110 @@ export async function runContextGovernanceCases(ctx) {
   }));
   if (!technicalAnchorBootstrap.includes(technicalAnchorToken)) {
     throw new Error("expected a structured technical identifier to remain a strong focused-recall anchor");
+  }
+
+  const buriedDb = new Database(path.join(toolProjectRoot, ".vectormind", "vectormind.db"));
+  let buriedMemoryId = 0;
+  let deepContentMemoryId = 0;
+  const weakDecisionIds = [];
+  try {
+    const insertNote = buriedDb.prepare(
+      `INSERT INTO memory_items
+         (kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, updated_at)
+       VALUES ('note', ?, ?, NULL, NULL, NULL, NULL, '{}', ?, ?)`,
+    );
+    buriedMemoryId = Number(insertNote.run(
+      "余额充值与提现可用余额口径",
+      "用户充值余额完成入账后，可用余额用于提现；余额账户与提现余额采用同一口径。",
+      `buried-recall-${Date.now()}`,
+      "2000-01-01 00:00:00",
+    ).lastInsertRowid);
+    deepContentMemoryId = Number(insertNote.run(
+      "unrelated long-form note",
+      `${"prefix filler ".repeat(40)}深层正文召回证据只出现在预览边界之后。`,
+      `deep-content-recall-${Date.now()}`,
+      "2000-01-01 00:00:00",
+    ).lastInsertRowid);
+    const insertNoise = buriedDb.transaction(() => {
+      for (let index = 0; index < 850; index += 1) {
+        insertNote.run(
+          `recent unrelated memory ${index}`,
+          "Unrelated typography and deployment history.",
+          `recent-noise-${Date.now()}-${index}`,
+          "2026-01-01 00:00:00",
+        );
+      }
+    });
+    insertNoise();
+    const insertWeakDecision = buriedDb.prepare(
+      `INSERT INTO memory_items
+         (kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, updated_at)
+       VALUES ('decision', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`,
+    );
+    const insertWeakDecisions = buriedDb.transaction(() => {
+      for (let index = 0; index < 60; index += 1) {
+        weakDecisionIds.push(Number(insertWeakDecision.run(
+          `weak shared user decision ${index}`,
+          "用户界面沿用另一子系统的视觉设置。",
+          JSON.stringify({ status: "current", key: `weak-shared-user-${index}` }),
+          `weak-shared-user-${Date.now()}-${index}`,
+          "2026-01-01 00:00:00",
+        ).lastInsertRowid));
+      }
+    });
+    insertWeakDecisions();
+  } finally {
+    buriedDb.close();
+  }
+  const buriedStartedAt = Date.now();
+  const buriedRecall = JSON.parse(readText(await client.callTool({
+    name: "bootstrap_context",
+    arguments: {
+      ...rootArgs,
+      query: "排查用户充值成功后提现页显示余额为零的问题：充值入账、余额账户与提现可用余额口径",
+      top_k: 5,
+      context_mode: "focused",
+      include_recent: false,
+      format: "json",
+    },
+  })));
+  const buriedElapsedMs = Date.now() - buriedStartedAt;
+  if (!buriedRecall?.semantic?.matches?.some((match) => match?.item?.id === buriedMemoryId)) {
+    throw new Error("expected focused bootstrap to retrieve relevant Chinese memory buried beyond the recent candidate window");
+  }
+  if (buriedRecall.semantic.matches.some((match) => weakDecisionIds.includes(match?.item?.id))) {
+    throw new Error("expected focused filtering before top_k to reject 60 higher-weight weak decision matches");
+  }
+  if (buriedElapsedMs >= 2_000) {
+    throw new Error(`expected bounded memory recall to finish below 2000ms, got ${buriedElapsedMs}ms`);
+  }
+  const deepContentRecall = JSON.parse(readText(await client.callTool({
+    name: "bootstrap_context",
+    arguments: {
+      ...rootArgs,
+      query: "深层正文召回证据",
+      top_k: 3,
+      context_mode: "focused",
+      include_recent: false,
+      format: "json",
+    },
+  })));
+  if (!deepContentRecall?.semantic?.matches?.some((match) => match?.item?.id === deepContentMemoryId)) {
+    throw new Error("expected focused filtering to evaluate complete memory content beyond the output preview boundary");
+  }
+  const repeatedWeakRecall = JSON.parse(readText(await client.callTool({
+    name: "bootstrap_context",
+    arguments: {
+      ...rootArgs,
+      query: "用户，用户，用户，用户",
+      top_k: 5,
+      context_mode: "focused",
+      include_recent: false,
+      format: "json",
+    },
+  })));
+  if (repeatedWeakRecall?.semantic?.matches?.some((match) => weakDecisionIds.includes(match?.item?.id))) {
+    throw new Error("expected repeated copies of one short phrase not to manufacture distinct focused evidence");
   }
 
   const operationBootstrap = await client.callTool({
@@ -300,6 +428,18 @@ export async function runContextGovernanceCases(ctx) {
     console.error("\n[smoke] requirement isolation check failed:", err);
     process.exitCode = 1;
     return false;
+  }
+
+  const overlapGuard = JSON.parse(readText(await client.callTool({
+    name: "start_requirement",
+    arguments: {
+      ...rootArgs,
+      title: `Continue ${rootAnchor} timeout retries`,
+      background: `Continue the same ${rootAnchor} timeout retry goal after investigating retry timing.`,
+    },
+  })));
+  if (overlapGuard?.code !== "POSSIBLE_REQUIREMENT_OVERLAP" || overlapGuard?.recovery?.reuse_goal_key == null) {
+    throw new Error(`expected strong unkeyed overlap to require explicit lifecycle choice: ${JSON.stringify(overlapGuard)}`);
   }
 
   const sharedGoalKey = `smoke-goal-${Date.now()}`;
@@ -479,6 +619,9 @@ export async function runContextGovernanceCases(ctx) {
   if (focusedConcurrent?.items?.[0]?.requirement?.id !== concurrentAId) {
     throw new Error(`expected focused bootstrap to select an older relevant active requirement before truncation: ${JSON.stringify(focusedConcurrent?.items)}`);
   }
+  if (focusedConcurrent?.recalled_context?.some((item) => item?.requirement?.id === concurrentAId)) {
+    throw new Error("expected semantic requirement expansion not to duplicate the current requirement anchor");
+  }
   const ambiguousPreflight = await client.callTool({
     name: "preflight_change_scope",
     arguments: { ...rootArgs, intent: "This must not bind implicitly.", files: ["concurrent-a-smoke.txt"], format: "json" },
@@ -516,6 +659,29 @@ export async function runContextGovernanceCases(ctx) {
   });
   if (JSON.parse(readText(concurrentSync))?.linked_to_requirement?.id !== concurrentAId) {
     throw new Error("expected explicit req_id sync to remain linked to requirement A");
+  }
+  const completedFocused = JSON.parse(readText(await client.callTool({
+    name: "bootstrap_context",
+    arguments: {
+      ...rootArgs,
+      query: "Synchronize requirement A without touching requirement B.",
+      context_mode: "focused",
+      include_recent: false,
+      format: "json",
+    },
+  })));
+  const recalledRequirement = completedFocused?.recalled_context?.find((item) =>
+    item?.requirement?.id === concurrentAId,
+  );
+  const completedSemanticReqIds = (completedFocused?.semantic?.matches ?? [])
+    .map((match) => match?.item?.req_id)
+    .filter((reqId) => Number.isInteger(reqId));
+  if (new Set(completedSemanticReqIds).size !== completedSemanticReqIds.length) {
+    throw new Error("expected requirement and change_intent matches to share one semantic topic slot");
+  }
+  if (!recalledRequirement || recalledRequirement.requirement.status !== "completed" ||
+      !JSON.stringify(recalledRequirement.recent_changes ?? []).includes("Synchronize requirement A")) {
+    throw new Error("expected focused bootstrap to expand a semantic hit into its completed requirement and change context");
   }
 
   const concurrentHugePath = path.join(toolProjectRoot, "src", "concurrent-controller.ts");
@@ -585,6 +751,19 @@ export async function runContextGovernanceCases(ctx) {
 
   const db = new Database(path.join(toolProjectRoot, ".vectormind", "vectormind.db"), { readonly: true });
   try {
+    const leakedSymbol = db.prepare("SELECT signature FROM symbols WHERE signature LIKE ? LIMIT 1").get(`%${indexedSecret}%`);
+    const leakedChunk = db.prepare("SELECT content FROM memory_items WHERE content LIKE ? LIMIT 1").get(`%${indexedSecret}%`);
+    if (leakedSymbol || leakedChunk) {
+      throw new Error("expected indexed code chunks and symbol signatures to redact secret tokens");
+    }
+    const redactedSymbol = db.prepare("SELECT signature FROM symbols WHERE name = ? LIMIT 1").get("redactionIndexSmoke");
+    const redactedChunk = db.prepare("SELECT content FROM memory_items WHERE kind = 'code_chunk' AND file_path LIKE ? LIMIT 1").get(
+      "%redaction-index-smoke.ts",
+    );
+    if (!String(redactedSymbol?.signature ?? "").includes("[REDACTED") ||
+        !String(redactedChunk?.content ?? "").includes("[REDACTED")) {
+      throw new Error("expected the smoke source to be indexed positively with redacted symbol and chunk content");
+    }
     const lifecycle = db.prepare("SELECT status, goal_key FROM requirements WHERE id = ?").get(lifecycleSyncParsed?.linked_to_requirement?.id);
     if (lifecycle?.status !== "completed" || lifecycle?.goal_key !== sharedGoalKey) {
       throw new Error("expected completed goal-key requirement to persist its lifecycle state");
@@ -618,6 +797,49 @@ export async function runContextGovernanceCases(ctx) {
     }
   } finally {
     db.close();
+  }
+
+  await client.callTool({
+    name: "complete_requirement",
+    arguments: { ...rootArgs, all_active: true },
+  });
+  const supersededDb = new Database(path.join(toolProjectRoot, ".vectormind", "vectormind.db"));
+  const supersededRequirementIds = [];
+  try {
+    const insertSuperseded = supersededDb.prepare(
+      `INSERT INTO requirements (title, status, context_data, created_at, updated_at, goal_key)
+       VALUES (?, 'superseded', ?, '2099-01-01 00:00:00', '2099-01-01 00:00:00', NULL)`,
+    );
+    for (let index = 0; index < 8; index += 1) {
+      supersededRequirementIds.push(Number(insertSuperseded.run(
+        `newer superseded continuity noise ${index}`,
+        "Must not consume the completed-requirement fallback window.",
+      ).lastInsertRowid));
+    }
+  } finally {
+    supersededDb.close();
+  }
+  const continuityBootstrap = JSON.parse(readText(await client.callTool({
+    name: "bootstrap_context",
+    arguments: {
+      ...rootArgs,
+      query: `NO_MATCH_CONTINUITY_${Date.now()}`,
+      context_mode: "focused",
+      include_recent: false,
+      format: "json",
+    },
+  })));
+  const cleanupSupersededDb = new Database(path.join(toolProjectRoot, ".vectormind", "vectormind.db"));
+  try {
+    const placeholders = supersededRequirementIds.map(() => "?").join(", ");
+    cleanupSupersededDb.prepare(`DELETE FROM requirements WHERE id IN (${placeholders})`).run(...supersededRequirementIds);
+  } finally {
+    cleanupSupersededDb.close();
+  }
+  if (continuityBootstrap?.context_policy?.current_anchor_source !== "recent_completed" ||
+      !Array.isArray(continuityBootstrap?.items) || continuityBootstrap.items.length === 0 ||
+      continuityBootstrap.items.some((item) => item?.requirement?.status !== "completed")) {
+    throw new Error("expected focused bootstrap with no active requirement to retain bounded recent completed context");
   }
 
   return true;

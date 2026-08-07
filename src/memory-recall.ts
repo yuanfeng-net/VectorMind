@@ -116,6 +116,8 @@ type SemanticSearchOpts = {
   includeContent: boolean;
   previewChars: number;
   contentMaxChars: number;
+  matchFilter?: (item: { title: string | null; content: string; file_path: string | null }) => boolean;
+  dedupeByRequirement?: boolean;
 };
 
 const SEMANTIC_TOKEN_STOPWORDS = new Set([
@@ -287,29 +289,38 @@ function normalizeSearchText(input: string | null | undefined): string {
 
 function extractSearchTokens(raw: string): string[] {
   const text = normalizeSearchText(raw);
-  const tokens = new Set<string>();
+  const tokens: string[] = [];
+  const seen = new Set<string>();
+  const add = (token: string): void => {
+    if (token.length < 2 || SEMANTIC_TOKEN_STOPWORDS.has(token) || seen.has(token)) return;
+    seen.add(token);
+    tokens.push(token);
+  };
 
   for (const token of text.match(/[a-z0-9_./:@#-]{2,}/g) ?? []) {
-    if (!SEMANTIC_TOKEN_STOPWORDS.has(token)) tokens.add(token);
+    add(token);
     for (const part of token.split(/[^a-z0-9]+/).filter((p) => p.length >= 2)) {
-      if (!SEMANTIC_TOKEN_STOPWORDS.has(part)) tokens.add(part);
+      add(part);
     }
   }
 
-  for (const seq of text.match(/\p{Script=Han}+/gu) ?? []) {
-    if (seq.length >= 2 && seq.length <= 18) tokens.add(seq);
-    for (const n of [2, 3, 4]) {
-      if (seq.length < n) continue;
-      for (let i = 0; i <= seq.length - n; i++) {
-        tokens.add(seq.slice(i, i + n));
+  const hanSequences = text.match(/\p{Script=Han}+/gu) ?? [];
+  for (const seq of hanSequences) {
+    if (seq.length <= 18) add(seq);
+  }
+  // Round-robin n-grams keep later clauses represented instead of letting the
+  // first long Chinese clause consume the entire bounded token budget.
+  for (const width of [2, 3, 4]) {
+    const maxOffset = Math.max(0, ...hanSequences.map((seq) => seq.length - width));
+    for (let offset = 0; offset <= maxOffset; offset++) {
+      for (const seq of hanSequences) {
+        if (offset + width <= seq.length) add(seq.slice(offset, offset + width));
+        if (tokens.length >= 48) return tokens;
       }
     }
   }
 
-  return Array.from(tokens)
-    .filter((token) => token.length >= 2 && !SEMANTIC_TOKEN_STOPWORDS.has(token))
-    .sort((a, b) => b.length - a.length)
-    .slice(0, 48);
+  return tokens.slice(0, 48);
 }
 
 function countNeedleOccurrences(haystack: string, needle: string): number {
@@ -374,9 +385,23 @@ function mergeSemanticMatches(
       if (!prev || match.score > prev.score) best.set(match.item.id, match);
     }
   }
-  return Array.from(best.values())
-    .sort((a, b) => b.score - a.score || b.item.id - a.item.id)
-    .slice(0, opts.topK);
+  const ranked = Array.from(best.values())
+    .sort((a, b) => b.score - a.score || b.item.id - a.item.id);
+  return dedupeSemanticMatches(ranked, opts).slice(0, opts.topK);
+}
+
+function dedupeSemanticMatches(
+  matches: SemanticSearchMatch[],
+  opts: SemanticSearchOpts,
+): SemanticSearchMatch[] {
+  if (!opts.dedupeByRequirement) return matches;
+  const seen = new Set<string>();
+  return matches.filter((match) => {
+    const key = match.item.req_id != null ? `req:${match.item.req_id}` : `item:${match.item.id}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function filterAndRankSemanticRows(
@@ -385,9 +410,8 @@ function filterAndRankSemanticRows(
   opts: SemanticSearchOpts,
 ): SemanticSearchMatch[] {
   const explicitKinds = new Set(opts.kinds ?? []);
-  return rows
-    .map((r) => ({ row: r, score: adjustSemanticScore(r, scoreOf(r)) }))
-    .filter(({ row }) => {
+  const ranked = rows
+    .filter((row) => {
       if (isHiddenFromDefaultRecall(row)) return false;
       if (isObviouslyCorruptedText(row.title, row.content, row.file_path)) return false;
       if (row.kind === "fix_pattern" && !explicitKinds.has("fix_pattern")) return false;
@@ -397,13 +421,19 @@ function filterAndRankSemanticRows(
         !explicitKinds.has("large_file_split_plan")
       ) return false;
       if (shouldIgnoreDbFilePath(row.file_path) && row.kind !== "change_intent") return false;
+      if (opts.matchFilter && !opts.matchFilter({
+        title: row.title,
+        content: row.content,
+        file_path: row.file_path,
+      })) return false;
       return true;
     })
+    .map((r) => ({ row: r, score: adjustSemanticScore(r, scoreOf(r)) }))
     .sort((a, b) => b.score - a.score)
-    .slice(0, opts.topK)
     .map(({ row, score }) =>
       toSemanticMatch(row, score, opts.includeContent, opts.previewChars, opts.contentMaxChars),
     );
+  return dedupeSemanticMatches(ranked, opts).slice(0, opts.topK);
 }
 
 export function makePreviewText(content: string, max: number): string {
@@ -807,36 +837,11 @@ function tokenSearchInternal(opts: SemanticSearchOpts): SemanticSearchResult {
   if (!tokens.length) return { query: q, top_k: opts.topK, mode: "token", matches: [] };
 
   const rawLimit = Math.min(160, Math.max(opts.topK * 12, 80));
-  const searchTokens = tokens.slice(0, 8);
   const effectiveKinds = opts.kinds?.length ? opts.kinds : TOKEN_SEARCH_DEFAULT_KINDS;
-  const kindClause = effectiveKinds.length
-    ? `AND kind IN (${effectiveKinds.map(() => "?").join(", ")})`
-    : "";
-  const recencyBoost = `
-      + CASE
-          WHEN updated_at >= datetime('now', '-2 days') THEN 4
-          WHEN updated_at >= datetime('now', '-14 days') THEN 2
-          WHEN updated_at >= datetime('now', '-60 days') THEN 1
-          ELSE 0
-        END`;
-  const candidateScore = `
-      (
-        CASE kind
-          WHEN 'decision' THEN 9
-          WHEN 'memory_compaction' THEN 8
-          WHEN 'convention' THEN 7
-          WHEN 'project_summary' THEN 6
-          WHEN 'note' THEN 5
-          WHEN 'requirement' THEN 4
-          WHEN 'change_intent' THEN 3
-          ELSE 0
-        END
-        ${recencyBoost}
-      )`;
 
   const includesIndexedChunks = effectiveKinds.some((k) => k === "code_chunk" || k === "doc_chunk");
   if (!includesIndexedChunks) {
-    const candidateLimit = Math.min(1600, Math.max(rawLimit * 5, 800));
+    const placeholders = effectiveKinds.map(() => "?").join(", ");
     const stmt = getDb().prepare(`
       SELECT
         id,
@@ -850,15 +855,9 @@ function tokenSearchInternal(opts: SemanticSearchOpts): SemanticSearchResult {
         metadata_json,
         updated_at
       FROM memory_items
-      WHERE 1=1
-        ${kindClause}
-      ORDER BY
-        ${candidateScore} DESC,
-        updated_at DESC,
-        id DESC
-      LIMIT ?
+      WHERE kind IN (${placeholders})
     `);
-    const candidates = stmt.all(...effectiveKinds, candidateLimit) as MemoryItemSearchRow[];
+    const candidates = stmt.all(...effectiveKinds) as MemoryItemSearchRow[];
     const scoreMap = new Map<number, number>();
     const rows = candidates.filter((row) => {
       const score = tokenLexicalScore(row, q, tokens);
@@ -871,11 +870,10 @@ function tokenSearchInternal(opts: SemanticSearchOpts): SemanticSearchResult {
   }
 
   const memoryFirstKinds = effectiveKinds.filter((k) => k !== "code_chunk" && k !== "doc_chunk");
-  const memoryFirstLimit = Math.min(1200, Math.max(rawLimit * 4, 300));
   let memoryFirstRows: MemoryItemSearchRow[] = [];
   const memoryFirstScores = new Map<number, number>();
   if (memoryFirstKinds.length) {
-    const memoryKindClause = `AND kind IN (${memoryFirstKinds.map(() => "?").join(", ")})`;
+    const memoryKindPlaceholders = memoryFirstKinds.map(() => "?").join(", ");
     const memoryStmt = getDb().prepare(`
       SELECT
         id,
@@ -889,15 +887,9 @@ function tokenSearchInternal(opts: SemanticSearchOpts): SemanticSearchResult {
         metadata_json,
         updated_at
       FROM memory_items
-      WHERE 1=1
-        ${memoryKindClause}
-      ORDER BY
-        ${candidateScore} DESC,
-        updated_at DESC,
-        id DESC
-      LIMIT ?
+      WHERE kind IN (${memoryKindPlaceholders})
     `);
-    const candidates = memoryStmt.all(...memoryFirstKinds, memoryFirstLimit) as MemoryItemSearchRow[];
+    const candidates = memoryStmt.all(...memoryFirstKinds) as MemoryItemSearchRow[];
     memoryFirstRows = candidates.filter((row) => {
       const score = tokenLexicalScore(row, q, tokens);
       if (score <= 0) return false;
@@ -906,46 +898,23 @@ function tokenSearchInternal(opts: SemanticSearchOpts): SemanticSearchResult {
     });
   }
 
-  const conditions: string[] = [];
-  const values: string[] = [];
-  for (const token of searchTokens) {
-    const like = `%${escapeLike(token)}%`;
-    conditions.push(`content LIKE ? ESCAPE '\\'`);
-    values.push(like);
-    conditions.push(`title LIKE ? ESCAPE '\\'`);
-    values.push(like);
-    conditions.push(`file_path LIKE ? ESCAPE '\\'`);
-    values.push(like);
+  const indexedKinds = effectiveKinds.filter((k) => k === "code_chunk" || k === "doc_chunk");
+  const ftsTokens = tokens.filter((token) => token.length >= 3).slice(0, 24);
+  let rows: MemoryItemSearchRow[] = [];
+  if (indexedKinds.length && ftsTokens.length && isFtsAvailable()) {
+    const ftsQuery = ftsTokens.map((token) => `"${token.replaceAll('"', '""')}"`).join(" OR ");
+    const indexedKindPlaceholders = indexedKinds.map(() => "?").join(", ");
+    rows = getDb().prepare(`
+      SELECT m.id, m.kind, m.title, m.content, m.file_path, m.start_line, m.end_line,
+             m.req_id, m.metadata_json, m.updated_at
+        FROM ${MEMORY_ITEMS_FTS_TABLE}
+        JOIN memory_items m ON m.id = ${MEMORY_ITEMS_FTS_TABLE}.rowid
+       WHERE ${MEMORY_ITEMS_FTS_TABLE} MATCH ?
+         AND m.kind IN (${indexedKindPlaceholders})
+       ORDER BY bm25(${MEMORY_ITEMS_FTS_TABLE}) ASC
+       LIMIT ?
+    `).all(ftsQuery, ...indexedKinds, rawLimit) as MemoryItemSearchRow[];
   }
-  if (!conditions.length) return { query: q, top_k: opts.topK, mode: "token", matches: [] };
-
-  const stmt = getDb().prepare(`
-    SELECT
-      id,
-      kind,
-      title,
-      content,
-      file_path,
-      start_line,
-      end_line,
-      req_id,
-      metadata_json,
-      updated_at
-    FROM memory_items
-    WHERE (${conditions.join(" OR ")})
-      ${kindClause}
-    ORDER BY
-      ${candidateScore} DESC,
-      updated_at DESC,
-      id DESC
-    LIMIT ?
-  `);
-
-  const rows = stmt.all(
-    ...values,
-    ...effectiveKinds,
-    rawLimit,
-  ) as MemoryItemSearchRow[];
   const scoreMap = new Map<number, number>(memoryFirstScores);
   for (const row of rows) {
     if (!scoreMap.has(row.id)) scoreMap.set(row.id, tokenLexicalScore(row, q, tokens));

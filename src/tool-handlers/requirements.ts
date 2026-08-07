@@ -16,6 +16,8 @@ import { makePreviewText, parseMetadataJson } from "../memory-recall.js";
 import { logActivity } from "../activity-log.js";
 import { compactPreflightChangeScopeText, safeJson, toolJson } from "../tool-output.js";
 import { normalizeRequirementGoalIdentity, sameRequirement } from "../context-governance.js";
+import { requirementOverlapScore } from "../context-governance.js";
+import { sanitizePersistentMemoryStrings, sanitizePersistentMemoryText, sanitizePersistentMemoryValue } from "../memory-safety.js";
 import { DEVELOPMENT_HUGE_FILE_LINES } from "../config.js";
 import { hashFileContentStreaming } from "../large-file-split.js";
 import { resolvePathWithinRoot } from "../path-containment.js";
@@ -27,7 +29,7 @@ type CachedPreflightValue = Parameters<typeof compactPreflightChangeScopeText>[0
 type StartRequirementWriteOutcome =
   | { kind: "created"; id: number; memoryId: number; closedPrevious: boolean }
   | { kind: "reused"; requirement: RequirementRow; reuseReason: string; closedPrevious: boolean }
-  | { kind: "error"; error: string; activeRequirements?: RequirementRow[]; activeCount?: number };
+  | { kind: "error"; error: string; code?: string; activeRequirements?: RequirementRow[]; activeCount?: number; overlapScore?: number };
 const preflightResultCache = new Map<string, CachedPreflightValue>();
 
 function normalizeIdentityText(value: string | null | undefined): string {
@@ -275,33 +277,46 @@ export async function handleStartRequirement(
   const args = StartRequirementArgsSchema.parse(rawArgs);
   const shouldClosePrevious = args.close_previous || args.previous_req_id != null;
   flushPendingChangeBuffer();
+  const sanitizedTitle = sanitizePersistentMemoryText(args.title.trim());
+  const sanitizedBackground = sanitizePersistentMemoryText(args.background?.trim() ?? "");
+  const sanitizedItems = sanitizePersistentMemoryStrings(args.requirement_items);
+  const persistentArgs = {
+    ...args,
+    title: sanitizedTitle.text,
+    background: sanitizedBackground.text,
+    requirement_items: sanitizedItems.values,
+  };
   const scope_contract = buildRequirementScopeContract({
-    title: args.title,
-    background: args.background,
+    title: persistentArgs.title,
+    background: persistentArgs.background,
     scope_allow: args.scope_allow,
     scope_deny: args.scope_deny,
     allowed_paths: args.allowed_paths,
     denied_paths: args.denied_paths,
   });
-  const requirement_items = normalizeRequirementItems(args.requirement_items);
+  const requirement_items = normalizeRequirementItems(persistentArgs.requirement_items);
   const development_warnings = buildRequirementStartWarnings({
-    title: args.title,
-    background: args.background,
+    title: persistentArgs.title,
+    background: persistentArgs.background,
     close_previous: shouldClosePrevious,
   });
 
+  const redaction = {
+    applied: sanitizedTitle.redacted || sanitizedBackground.redacted || sanitizedItems.redacted,
+    categories: [...new Set([...sanitizedTitle.categories, ...sanitizedBackground.categories, ...sanitizedItems.categories])].sort(),
+  };
   const explicitGoalKey = args.goal_key?.trim() ?? "";
   const goalKey = explicitGoalKey ||
-    `auto:${sha256Hex(normalizeRequirementGoalIdentity(args.title, args.background)).slice(0, 24)}`;
-  const background = args.background?.trim() ?? "";
-  const content = background ? `${args.title}\n\n${background}` : args.title;
+    `auto:${sha256Hex(normalizeRequirementGoalIdentity(persistentArgs.title, persistentArgs.background)).slice(0, 24)}`;
+  const background = persistentArgs.background;
+  const content = background ? `${persistentArgs.title}\n\n${background}` : persistentArgs.title;
   let writeOutcome: StartRequirementWriteOutcome;
   try {
     const writeTransaction = context.getDb().transaction((): StartRequirementWriteOutcome => {
       const currentByGoalKey = getActiveRequirementByGoalKeyStmt.get(goalKey) as RequirementRow | undefined;
       const currentActiveCandidates = listActiveRequirementsStmt.all(50) as RequirementRow[];
       const currentExactActive = !explicitGoalKey
-        ? currentActiveCandidates.find((candidate) => sameRequirement(candidate, { ...args, goal_key: goalKey }))
+        ? currentActiveCandidates.find((candidate) => sameRequirement(candidate, { ...persistentArgs, goal_key: goalKey }))
         : undefined;
       const currentActive = currentByGoalKey ?? currentExactActive;
       const currentReuseReason = currentByGoalKey
@@ -316,6 +331,20 @@ export async function handleStartRequirement(
           reuseReason: currentReuseReason,
           closedPrevious: false,
         };
+      }
+
+      if (shouldClosePrevious && !explicitGoalKey && !args.previous_req_id && currentActiveCandidates.length === 1) {
+        const overlapScore = requirementOverlapScore(currentActiveCandidates[0], persistentArgs);
+        if (overlapScore >= 0.55) {
+          return {
+            kind: "error",
+            code: "POSSIBLE_REQUIREMENT_OVERLAP",
+            error: "The new requirement strongly overlaps the active requirement. Reuse its goal_key to continue it, or pass previous_req_id explicitly to confirm replacement.",
+            activeRequirements: currentActiveCandidates,
+            activeCount: 1,
+            overlapScore,
+          };
+        }
       }
 
       if (shouldClosePrevious && !args.previous_req_id && currentActiveCandidates.length > 1) {
@@ -352,7 +381,7 @@ export async function handleStartRequirement(
 
       let id: number;
       try {
-        const info = insertRequirementStmt.run(args.title, args.background || null, goalKey);
+        const info = insertRequirementStmt.run(persistentArgs.title, persistentArgs.background || null, goalKey);
         id = Number(info.lastInsertRowid);
       } catch (err) {
         const raced = getActiveRequirementByGoalKeyStmt.get(goalKey) as RequirementRow | undefined;
@@ -367,7 +396,7 @@ export async function handleStartRequirement(
 
       const memoryInfo = insertMemoryItemStmt.run(
         "requirement",
-        args.title,
+        persistentArgs.title,
         content,
         null,
         null,
@@ -401,7 +430,9 @@ export async function handleStartRequirement(
         type: "text",
         text: toolJson({
           ok: false,
+          code: writeOutcome.code,
           error: writeOutcome.error,
+          overlap_score: writeOutcome.overlapScore,
           ...(writeOutcome.activeRequirements
             ? {
                 active_count: writeOutcome.activeCount ?? writeOutcome.activeRequirements.length,
@@ -410,6 +441,9 @@ export async function handleStartRequirement(
                   title: candidate.title,
                   goal_key: candidate.goal_key,
                 })),
+                recovery: writeOutcome.code === "POSSIBLE_REQUIREMENT_OVERLAP"
+                  ? { action: "reuse_or_explicitly_replace", reuse_goal_key: writeOutcome.activeRequirements[0]?.goal_key, replace_with_previous_req_id: writeOutcome.activeRequirements[0]?.id }
+                  : undefined,
               }
             : {}),
         }),
@@ -440,6 +474,7 @@ export async function handleStartRequirement(
           scope_contract: activeScopeContract,
           requirement_items: activeRequirementItems,
           development_warnings: [],
+          redaction,
         }),
       }],
     };
@@ -447,7 +482,7 @@ export async function handleStartRequirement(
 
   logActivity("start_requirement", {
     req_id: writeOutcome.id,
-    title: args.title,
+    title: persistentArgs.title,
     closed_previous: writeOutcome.closedPrevious,
     scope_contract,
     requirement_items,
@@ -460,7 +495,7 @@ export async function handleStartRequirement(
         type: "text",
         text: toolJson({
           ok: true,
-          requirement: { id: writeOutcome.id, title: args.title },
+          requirement: { id: writeOutcome.id, title: persistentArgs.title },
           goal_key: goalKey,
           memory_item: { id: writeOutcome.memoryId },
           closed_previous: writeOutcome.closedPrevious,
@@ -468,6 +503,7 @@ export async function handleStartRequirement(
           scope_contract,
           requirement_items,
           development_warnings,
+          redaction,
         }),
       },
     ],
@@ -680,7 +716,27 @@ export async function handleSyncChangeIntent(
     deletePendingChangeStmt,
   } = context.getStatements();
 
-  const args = SyncChangeIntentArgsSchema.parse(rawArgs);
+  const parsedArgs = SyncChangeIntentArgsSchema.parse(rawArgs);
+  const sanitizedIntent = sanitizePersistentMemoryText(parsedArgs.intent);
+  const sanitizedVerification = sanitizePersistentMemoryStrings(parsedArgs.verification);
+  const sanitizedVerificationGaps = sanitizePersistentMemoryStrings(parsedArgs.verification_gaps);
+  const sanitizedFixPattern = sanitizePersistentMemoryValue(parsedArgs.fix_pattern);
+  const args = {
+    ...parsedArgs,
+    intent: sanitizedIntent.text,
+    verification: sanitizedVerification.values,
+    verification_gaps: sanitizedVerificationGaps.values,
+    fix_pattern: sanitizedFixPattern.value,
+  };
+  const syncRedaction = {
+    applied: sanitizedIntent.redacted || sanitizedVerification.redacted || sanitizedVerificationGaps.redacted || sanitizedFixPattern.redacted,
+    categories: [...new Set([
+      ...sanitizedIntent.categories,
+      ...sanitizedVerification.categories,
+      ...sanitizedVerificationGaps.categories,
+      ...sanitizedFixPattern.categories,
+    ])].sort(),
+  };
   const explicitFixPattern = args.fix_pattern
     ? normalizeFixPattern({
         ...args.fix_pattern,
@@ -1051,6 +1107,7 @@ export async function handleSyncChangeIntent(
       request_fingerprint: requestFingerprint,
       pending_batch: pendingBatch,
       complete_requirement: args.complete_requirement,
+      redaction: syncRedaction,
     });
     const memoryInfo = insertMemoryItemStmt.run(
       "change_intent",
@@ -1191,6 +1248,7 @@ export async function handleSyncChangeIntent(
           development_warnings: boundedWarnings.page,
           development_warnings_total: boundedWarnings.total,
           development_warnings_truncated: boundedWarnings.truncated,
+          redaction: syncRedaction,
         }),
       },
     ],

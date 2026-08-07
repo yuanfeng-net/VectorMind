@@ -17,7 +17,6 @@ import { collectCurrentConstraintsForBootstrap } from "./operations.js";
 import {
   boundCompactContext,
   detectOperationIntent,
-  filterFocusedSemanticResult,
   focusedTextIsRelevant,
   isObviouslyCorruptedText,
   resolveBootstrapContextPolicy,
@@ -104,6 +103,50 @@ function getActiveLargeFilePlanPreviews(
   return rows.map((row) => toMemoryItemPreview(row, false, previewChars, contentMaxChars));
 }
 
+function getFocusedSemanticRequirementContext(
+  db: Database.Database,
+  semantic: { matches: Array<{ item: { req_id: number | null } }> } | null,
+  includeContent: boolean,
+  previewChars: number,
+  contentMaxChars: number,
+  changesLimit: number,
+  excludedReqIds: Set<number>,
+) {
+  const reqIds = [...new Set(
+    (semantic?.matches ?? [])
+      .map((match) => match.item.req_id)
+      .filter((reqId): reqId is number =>
+        typeof reqId === "number" && Number.isInteger(reqId) && reqId > 0 && !excludedReqIds.has(reqId)
+      ),
+  )].slice(0, 8);
+  if (!reqIds.length) return [];
+
+  const placeholders = reqIds.map(() => "?").join(", ");
+  const requirements = db.prepare(
+    `SELECT id, title, status, context_data, goal_key, created_at
+       FROM requirements
+      WHERE id IN (${placeholders})
+      ORDER BY updated_at DESC, id DESC`,
+  ).all(...reqIds) as RequirementRow[];
+  const requirementById = new Map(requirements.map((requirement) => [requirement.id, requirement]));
+  const listChanges = db.prepare(
+    `SELECT id, req_id, file_path, intent_summary, files_json, file_count, timestamp
+       FROM change_logs
+      WHERE req_id = ?
+      ORDER BY timestamp DESC, id DESC
+      LIMIT ?`,
+  );
+  return reqIds.flatMap((reqId) => {
+    const requirement = requirementById.get(reqId);
+    if (!requirement) return [];
+    return [{
+      requirement: toRequirementPreview(requirement, includeContent, previewChars, contentMaxChars),
+      recent_changes: (listChanges.all(requirement.id, changesLimit) as ChangeLogRow[])
+        .map((change) => toChangeLogPreview(change, includeContent, previewChars, contentMaxChars)),
+    }];
+  });
+}
+
 export async function handleBootstrapContext(
   rawArgs: Record<string, unknown>,
   context: ToolHandlerContext,
@@ -166,7 +209,13 @@ export async function handleBootstrapContext(
       ? focusedActiveRequirements.slice(0, requirementsLimit)
       : activeRequirement
         ? [activeRequirement]
-        : [];
+        : db.prepare(
+            `SELECT id, title, status, context_data, goal_key, created_at
+               FROM requirements
+              WHERE status = 'completed'
+              ORDER BY updated_at DESC, created_at DESC, id DESC
+              LIMIT ?`,
+          ).all(requirementsLimit) as RequirementRow[];
   let items = recent.map((req) => {
     const changes = listChangeLogsForRequirementStmt.all(req.id, changesLimit) as ChangeLogRow[];
     return {
@@ -243,6 +292,10 @@ export async function handleBootstrapContext(
             includeContent,
             previewChars,
             contentMaxChars,
+            matchFilter: contextPolicy.mode === "focused"
+              ? (item) => focusedTextIsRelevant(q, item.title, item.content, item.file_path)
+              : undefined,
+            dedupeByRequirement: contextPolicy.mode === "focused",
           }),
           new Promise<null>((resolve) => setTimeout(resolve, BOOTSTRAP_SEMANTIC_TIMEOUT_MS, null)),
         ]).catch((err) => {
@@ -259,9 +312,22 @@ export async function handleBootstrapContext(
         ),
       }
     : semanticRaw;
-  const semantic = contextPolicy.mode === "focused"
-    ? filterFocusedSemanticResult(q, semanticWithoutInactiveDefaultPlans)
-    : semanticWithoutInactiveDefaultPlans;
+  const semanticCandidates = semanticWithoutInactiveDefaultPlans;
+  const semantic = semanticCandidates
+    ? { ...semanticCandidates, focused_no_match: semanticCandidates.matches.length === 0 }
+    : null;
+  const anchorRequirementIds = new Set(items.map((item) => item.requirement.id));
+  const recalled_context = contextPolicy.mode === "focused"
+    ? getFocusedSemanticRequirementContext(
+        db,
+        semantic,
+        includeContent,
+        previewChars,
+        contentMaxChars,
+        changesLimit,
+        anchorRequirementIds,
+      )
+    : [];
   const semanticSearchStatus = !q
     ? "skipped_no_query"
     : semanticRaw == null
@@ -338,6 +404,25 @@ export async function handleBootstrapContext(
       max_output_chars: contextPolicy.max_output_chars,
       compact_truncated: false,
       current_anchor_included: items.length > 0,
+      current_anchor_source: activeRequirement
+        ? "active"
+        : items.length
+          ? "recent_completed"
+          : "none",
+    },
+    recall_coverage: {
+      mode: contextPolicy.mode,
+      filtered: contextPolicy.mode === "focused",
+      memory_store_scope: (contextPolicy.mode === "focused" ? "relevance_filtered" : "bounded_full") as "relevance_filtered" | "bounded_full",
+      output_bounded: true,
+      repository_covered: false,
+      runtime_covered: false,
+      recent_history_included: contextPolicy.include_recent,
+      pending_changes_included: contextPolicy.include_pending,
+      absence_interpretation: contextPolicy.mode === "focused"
+        ? "A missing match means only that no stored item passed focused relevance and output limits; it does not prove the fact was never stored or does not exist in the project/runtime."
+        : "A missing match covers the queried memory store and selected kinds, but does not prove the fact does not exist in repository files, credential stores, or live runtime state.",
+      next_steps: ["read_memory_item", "semantic_search", "inspect_repository_or_runtime"],
     },
     operation_preflight: {
       detected: operationIntent.detected,
@@ -375,6 +460,7 @@ export async function handleBootstrapContext(
     development_warnings,
     quality_signals,
     items,
+    recalled_context,
     current_constraints,
     semantic,
   };
