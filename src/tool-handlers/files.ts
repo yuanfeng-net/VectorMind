@@ -11,6 +11,7 @@ import { buildFtsMatchQuery } from "../memory-recall.js";
 import { logActivity } from "../activity-log.js";
 import { listProjectFilesInternal, normalizeExtensionsFilter, readTextFileLines, readTextFileSlice, resolveCodexTextPath, resolveProjectPathUnderRoot, resolveReadPathUnderProjectRoot } from "../project-files.js";
 import { shouldIgnoreDbFilePath } from "../path-rules.js";
+import { scanUntrustedContent, scanUntrustedFiles, scanUntrustedFragment } from "../security-signals.js";
 import { compactGrepText, compactListProjectFilesText, compactQueryCodebaseText, compactReadFileLinesText, compactReadTextFileText, toolJson } from "../tool-output.js";
 export async function handleGrep(
   rawArgs: Record<string, unknown>,
@@ -82,6 +83,7 @@ export async function handleGrep(
       total_matches: ripgrepResult.total_matches,
       truncated: ripgrepResult.truncated,
       development_warnings: grepDevelopmentWarnings,
+      security_scan: scanUntrustedFiles(projectRoot, ripgrepResult.matches.map((match) => match.file_path)),
     };
 
     return {
@@ -196,6 +198,7 @@ export async function handleGrep(
     matches: indexedResult.matches,
     truncated: indexedResult.truncated,
     development_warnings: grepDevelopmentWarnings,
+    security_scan: scanUntrustedFiles(projectRoot, indexedResult.matches.map((match) => match.file_path)),
   };
 
   return {
@@ -349,6 +352,7 @@ export async function handleReadFileText(
     total_chars: result.totalChars,
     truncated: result.truncated,
     development_warnings,
+    security_scan: args.offset === 0 && !result.truncated ? scanUntrustedContent(result.text) : scanUntrustedFragment(result.text),
     text: result.text,
   };
 
@@ -416,6 +420,7 @@ export async function handleReadCodexTextFile(
     returned_chars: result.returnedChars,
     total_chars: result.totalChars,
     truncated: result.truncated,
+    security_scan: args.offset === 0 && !result.truncated ? scanUntrustedContent(result.text) : scanUntrustedFragment(result.text),
     text: result.text,
   };
 
@@ -510,6 +515,7 @@ export async function handleReadFileLines(
     returned: result.returned,
     truncated: result.truncated,
     development_warnings,
+    security_scan: fromLine === 1 && !result.truncated ? scanUntrustedContent(result.text) : scanUntrustedFragment(result.text),
     text: result.text,
   };
 
@@ -544,7 +550,13 @@ export async function handleQueryCodebase(
     sample: filtered.slice(0, 10).map((m) => ({ name: m.name, type: m.type, file_path: m.file_path })),
   });
 
-  const outputValue = { ok: true, query: q, matches: filtered, development_warnings };
+  const outputValue = {
+    ok: true,
+    query: q,
+    matches: filtered,
+    development_warnings,
+    security_scan: scanUntrustedContent(filtered.map((match) => `${match.name} ${match.signature ?? ""}`).join("\n")),
+  };
 
   return {
     content: [

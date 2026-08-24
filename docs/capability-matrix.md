@@ -21,6 +21,7 @@ VectorMind 的目标不是替代 AI，也不是接管客户端权限，而是让
 | 记忆维护 | 大库越用越慢、旧索引干扰检索 | `maintain_memory`, `prune_index` | 默认保守，深度清理需手动触发 |
 | 输出降噪 | 工具输出太大拖慢会话 | compact 输出、`get_token_savings`, `rtk` | 需要客户端/模型优先使用 compact |
 | 调试排查 | 不知道 MCP 最近做了什么 | `get_activity_summary`, `get_activity_log`, `clear_activity_log` | 详细日志需开启 debug |
+| 提示注入/凭据外传 | 仓库、Issue 或文档内容诱导 AI 执行命令、读取凭据并发送到外部 | 文件读取、内存读取、`grep`、符号查询返回带覆盖范围的 `security_scan`；`preflight_operation_scope` 返回 `security_risk_detected` | 文档/历史/测试样例始终为 advisory，普通本地文件上传在操作意图明确为上传/导入/发布/同步/备份/导出时不重复告警；只有高置信度敏感数据外传才 blocker。结果标明 `coverage`/`complete`，grep 多命中扫描匹配文件的受限内容。用户明确授权时必须由宿主注入 `security_authorization_token`，且与宿主配置的 `VECTORMIND_SECURITY_AUTH_TOKEN` 匹配，同时提供 `security_acknowledged=true`、20 字以上 `security_override_reason` 和目标主机 allowlist；模型自行填写参数不能绕过。MCP 仍需宿主执行 `host_enforcement_required=true`，本身不提供 OS 沙箱 |
 
 ## 推荐调用链路
 

@@ -195,7 +195,7 @@ export async function listToolDefinitions() {
       {
         name: "preflight_operation_scope",
         description:
-          "Call ONCE immediately BEFORE the first concrete deploy/publish/build/test/migrate/service/git/batch command, including commands discovered after bootstrap_context. Pass the actual planned commands and targets. bootstrap_context is historical recall and never substitutes for this operation preflight. It compares the operation against current constraints and reports advisory conflicts without controlling host execution or model reasoning.",
+          "Call ONCE immediately BEFORE the first concrete deploy/publish/build/test/migrate/service/git/batch command, including commands discovered after bootstrap_context. Pass the actual planned commands and targets. bootstrap_context is historical recall and never substitutes for this operation preflight. Routine local-data transfers are advisory when the operation intent explicitly names upload/import/publish/sync/backup/export; high-confidence sensitive-data transfer still blocks. A user-authorized exception requires security_acknowledged=true, a specific security_override_reason (20+ chars), security_allowed_hosts, and security_authorization_token injected by the host. The host must set VECTORMIND_SECURITY_AUTH_TOKEN; the model cannot self-authorize or bypass a blocker without a matching token.",
         inputSchema: toJsonSchemaCompat(PreflightOperationScopeArgsSchema),
       },
       {

@@ -352,6 +352,9 @@ function normalizedGuardSeverity(value: unknown, fallback = "info"): string {
 
 function eventForOperationWarningCode(code: string): { eventType: string; severity: string; title: string } {
   const title =
+    code === "security_risk_detected"
+      ? "检测到潜在提示注入或凭据外传风险"
+      :
     code === "stale_default_conflict"
       ? "发现过期默认操作，阻止继续执行"
       : code === "operation_constraint_conflict"
@@ -359,8 +362,16 @@ function eventForOperationWarningCode(code: string): { eventType: string; severi
         : `MCP 操作防护提示：${code}`;
   return {
     eventType: `operation_guard:${code}`,
-    severity: "warn",
+    severity: code === "security_risk_detected" ? "critical" : "warn",
     title,
+  };
+}
+
+function eventForSecurityCode(code: string, blocking = false): { eventType: string; severity: string; title: string } {
+  return {
+    eventType: `security_scan:${code || "unknown"}`,
+    severity: blocking ? "critical" : "warn",
+    title: "读取内容安全扫描发现潜在风险",
   };
 }
 
@@ -382,6 +393,20 @@ function parseCompactToolOutputEvents(toolName: string, text: string): Array<{
   if (!lines.length) return events;
   const hasDevelopmentWarnings = lines.some((line) => /^development warnings:$/i.test(line));
   const hasOperationWarnings = lines.some((line) => /^operation warnings:$/i.test(line));
+  for (const line of lines) {
+    const security = /^security scan risk=([^\s]+).*?findings=([^\s]+)$/i.exec(line);
+    if (!security) continue;
+    for (const finding of security[2].split(",")) {
+      const [, severity = "warn", code = "unknown"] = /^([^:]+):(.+)$/.exec(finding) ?? [];
+      const base = eventForSecurityCode(code, false);
+      events.push({
+        ...base,
+        severity: normalizedGuardSeverity(severity, base.severity),
+        detail: `security scan risk=${security[1]} evidence=${code}`,
+        metadata: { tool_name: toolName, compact: true, risk_level: security[1], code, coverage: "returned_fragments" },
+      });
+    }
+  }
 
   const header = lines[0] ?? "";
   const okMatch = /\bok=(true|false)\b/.exec(header);
@@ -491,6 +516,27 @@ function outputEventsForToolResult(toolName: string, result: CallToolResult): Ar
         ok: parsed.ok,
         safe_to_edit: parsed.safe_to_edit,
         safe_to_proceed: parsed.safe_to_proceed,
+      },
+    });
+  }
+
+  const securityScan = parsed.security_scan && typeof parsed.security_scan === "object" && !Array.isArray(parsed.security_scan)
+    ? parsed.security_scan as Record<string, unknown>
+    : null;
+  const securityFindings = Array.isArray(securityScan?.findings) ? securityScan.findings : [];
+  for (const finding of securityFindings) {
+    const code = warningCode(finding);
+    if (!code) continue;
+    const base = eventForSecurityCode(code, typeof (finding as Record<string, unknown>).blocking === "boolean" && (finding as Record<string, unknown>).blocking === true);
+    events.push({
+      ...base,
+      detail: warningMessage(finding),
+      metadata: {
+        tool_name: toolName,
+        finding,
+        coverage: securityScan?.coverage,
+        complete: securityScan?.complete,
+        scanned_files: securityScan?.scanned_files,
       },
     });
   }

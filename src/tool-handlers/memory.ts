@@ -14,6 +14,7 @@ import { BOOTSTRAP_DEFAULT_CONTEXT_KINDS, getConventionPreviews, getCurrentConte
 import { logActivity } from "../activity-log.js";
 import { compactBootstrapText, compactBrainDumpText, compactSemanticSearchText, toolJson } from "../tool-output.js";
 import { collectCurrentConstraintsForBootstrap } from "./operations.js";
+import { scanUntrustedContent, scanUntrustedFragment } from "../security-signals.js";
 import {
   boundCompactContext,
   detectOperationIntent,
@@ -463,6 +464,7 @@ export async function handleBootstrapContext(
     recalled_context,
     current_constraints,
     semantic,
+    security_scan: scanUntrustedContent(JSON.stringify({ project_summary, decisions, conventions, current_context, recent_notes, pending_changes, items, recalled_context, current_constraints, semantic })),
   };
 
   const compactOutput = boundCompactContext(
@@ -601,6 +603,7 @@ export async function handleGetBrainDump(
     items,
     current_constraints,
     semantic: null,
+    security_scan: scanUntrustedContent(JSON.stringify({ project_summary, decisions, conventions, current_context, recent_notes, pending_changes, items, current_constraints })),
   };
 
   return {
@@ -652,6 +655,7 @@ export async function handleReadMemoryItem(
           offset,
           limit,
           truncated,
+          security_scan: offset === 0 && !truncated ? scanUntrustedContent(row.content) : scanUntrustedFragment(chunk),
           content: chunk,
         }),
       },
@@ -685,7 +689,11 @@ export async function handleSemanticSearch(
     })),
   });
 
-  const outputValue = { ok: true, ...result };
+  const outputValue = {
+    ok: true,
+    ...result,
+    security_scan: scanUntrustedContent(JSON.stringify(result)),
+  };
 
   return {
     content: [

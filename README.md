@@ -2,7 +2,7 @@
 
 VectorMind 是面向 AI 编程助手的本地项目记忆 MCP。它把需求、决策、改动原因、项目约定和文件状态保存在项目目录内，帮助长周期开发减少上下文丢失、跨项目串线和旧逻辑回退。
 
-当前版本：`1.1.1`
+当前版本：`1.1.3`
 
 ## 核心能力
 
@@ -14,6 +14,7 @@ VectorMind 是面向 AI 编程助手的本地项目记忆 MCP。它把需求、�
 - **更新权威决策**：新决策可以 supersede 旧需求或旧记忆，避免后续会话按过时规则实现。
 - **隔离多个项目**：记忆、pending buffer、索引和数据库都按 `project_root` 隔离。
 - **安全读取项目文件**：使用 canonical realpath 校验，拒绝通过符号链接或 junction 越过项目边界。
+- **安全扫描不可信内容与操作**：文件、内存、`grep` 和符号查询结果附带 `security_scan`；高置信度敏感数据外传只在具体操作预检中阻断，普通文档、文章、测试样例和明确的普通上传保持 advisory，不改变正常分析流程。
 - **保存长期会话检查点**：创建有界、版本化 checkpoint，并只读恢复或比较上下文。
 - **诊断记忆质量**：检查冲突、重复、过大 checkpoint、陈旧索引和孤立记忆。
 - **控制上下文体积**：默认使用精简工具集和紧凑输出，大结果会保留关键 ID 与完成状态。
@@ -128,6 +129,17 @@ npm run admin:dev
 
 VectorMind 的质量信号只是上下文证据，不替模型或用户做决定。
 
+### 安全扫描边界与开销
+
+安全扫描用于识别提示注入、凭据访问、主机探测和本地敏感数据外传。它不会接管 MCP 其他工具，也不会主导 AI 的推理、设计或实现方向：
+
+- 文件、内存、`grep`、语义搜索和符号查询返回的扫描结果属于 advisory 信号，明确标记 `advisory_only`、`coverage` 和 `complete`。
+- 只有 `preflight_operation_scope` 发现高置信度敏感凭据外传时，才会对该具体操作返回 blocker；普通读取、查询、代码生成和其他 MCP 功能不受影响。
+- 用户授权例外必须由宿主配置 `VECTORMIND_SECURITY_AUTH_TOKEN` 并注入匹配的 `security_authorization_token`，同时提供原因和目标主机 allowlist；模型不能自行伪造授权。
+- 扫描只产生有界的本地 CPU、文件读取和少量输出 token 开销，不增加 AI 推理轮次。无 finding 时 compact 输出不会展开安全详情；完整字段可通过 `format=json` 查看。
+
+完整能力和边界见 [docs/capability-matrix.md](docs/capability-matrix.md)。
+
 ## 需求明确性软引导
 
 VectorMind 会在 MCP 握手中向 AI 提供需求明确性规则。AI 只有在获得完整授权后才应行动：当前消息明确提出工作，或当前消息明确指向唯一未完成的用户请求；无论采用哪条路径，选定请求都必须明确相关目标、对象、范围和动作。已完成请求不能授权新动作，无完整授权时，AI 应在调用工具或采取行动前先向用户询问。
@@ -166,6 +178,9 @@ npm run verify
 
 - `npm run smoke` 会先重建核心产物，再运行 security、checkpoint、operation 和完整 MCP smoke。
 - `npm run verify` 会运行核心构建、管理面板测试与生产构建，以及全部 smoke。
+- `security-regression-cases.mjs` 覆盖提示注入、凭据路径、普通上传、敏感外传，以及 DNS/SSH/SCP/SFTP、PowerShell、Node/Python、base64 和环境变量通道。
+- 安全回归还验证宿主授权令牌、错误令牌旁路、目标主机 allowlist、文件 advisory 语义、grep 多文件覆盖和符号链接越界保护。
+- `npm run verify` 已包含上述安全回归、checkpoint/operation 回归、管理面板测试和生产构建。
 - `prepublishOnly` 强制执行完整 `verify`。
 - 发布前可用 `npm pack --dry-run --ignore-scripts --json` 检查核心产物、管理服务和预构建客户端是否进入包。
 

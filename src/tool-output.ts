@@ -10,6 +10,22 @@ type CompactDevelopmentWarning = {
   files?: string[];
 };
 
+type CompactSecurityScan = {
+  risk_level: string;
+  untrusted_content?: boolean;
+  advisory_only?: boolean;
+  security_override_applied?: boolean;
+  findings?: Array<{ code: string; severity: string; evidence?: string }>;
+  coverage?: string;
+  complete?: boolean;
+  scanned_files?: number;
+};
+
+function compactSecurityScanText(scan: CompactSecurityScan): string {
+  const files = scan.scanned_files == null ? "" : ` files=${scan.scanned_files}`;
+  return `security scan risk=${scan.risk_level} advisory_only=${scan.advisory_only === true} override=${scan.security_override_applied === true} coverage=${scan.coverage ?? "unknown"} complete=${scan.complete !== false}${files} findings=${(scan.findings ?? []).map((f) => `${f.severity}:${f.code}`).join(",")}`;
+}
+
 type CompactChangeMode = string;
 
 type CompactRequirementScopeContract = {
@@ -214,6 +230,8 @@ export function compactSemanticSearchText(data: { ok?: boolean } & CompactSemant
     lines.push(`- score=${m.score.toFixed(3)} ${compactMemoryLabel(m.item, 160)}`);
   }
   if (!data.matches.length) lines.push("- no matches");
+  const scan = (data as typeof data & { security_scan?: CompactSecurityScan }).security_scan;
+  if (scan?.findings?.length) lines.push(compactSecurityScanText(scan));
   lines.push("hint: use format=json for full metadata; read_memory_item(id) for full content");
   return lines.join("\n");
 }
@@ -230,6 +248,7 @@ export function compactGrepText(data: {
   truncated: boolean;
   development_warnings?: CompactDevelopmentWarning[];
   candidates?: { total: number; scanned: number };
+  security_scan?: CompactSecurityScan;
 }): string {
   const total = data.total_matches ?? data.matches.length;
   const fallback = data.fallback_reason ? ` fallback=${data.fallback_reason}` : "";
@@ -238,6 +257,7 @@ export function compactGrepText(data: {
     `grep ${data.backend}${fallback} mode=${data.mode} matches=${data.matches.length}/${total} truncated=${data.truncated}${candidateText} q="${oneLine(data.query, 100)}"`,
   ];
   lines.push(...compactDevelopmentWarningsText(data.development_warnings ?? []));
+  if (data.security_scan?.findings?.length) lines.push(compactSecurityScanText(data.security_scan));
   if (data.ripgrep_error) lines.push(`ripgrep_error ${oneLine(data.ripgrep_error, 180)}`);
   for (const m of data.matches.slice(0, 80)) {
     lines.push(`${m.file_path}:${m.line}:${m.col}: ${oneLine(m.preview, 220)}`);
@@ -277,12 +297,14 @@ export function compactReadTextFileText(data: {
   truncated: boolean;
   development_warnings?: CompactDevelopmentWarning[];
   text: string;
+  security_scan?: CompactSecurityScan;
 }): string {
   const offset = data.offset != null ? ` offset=${data.offset}` : "";
   const header = `file ${data.file_path}${offset} chars=${data.returned_chars}/${data.total_chars} truncated=${data.truncated}`;
   const hint = data.truncated ? "\nhint: continue with offset or read_file_lines; use format=json for metadata fields" : "";
   const warnings = compactDevelopmentWarningsText(data.development_warnings ?? []).join("\n");
-  return `${header}${warnings ? `\n${warnings}` : ""}\n${data.text}${hint}`;
+  const security = data.security_scan?.findings?.length ? `\n${compactSecurityScanText(data.security_scan)}` : "";
+  return `${header}${warnings ? `\n${warnings}` : ""}${security}\n${data.text}${hint}`;
 }
 
 export function compactReadFileLinesText(data: {
@@ -293,20 +315,24 @@ export function compactReadFileLinesText(data: {
   truncated: boolean;
   development_warnings?: CompactDevelopmentWarning[];
   text: string;
+  security_scan?: CompactSecurityScan;
 }): string {
   const header = `lines ${data.file_path}:${data.from_line}-${data.to_line} returned=${data.returned} truncated=${data.truncated}`;
   const hint = data.truncated ? "\nhint: narrow range or raise max_lines/max_chars; use format=json for metadata fields" : "";
   const warnings = compactDevelopmentWarningsText(data.development_warnings ?? []).join("\n");
-  return `${header}${warnings ? `\n${warnings}` : ""}\n${data.text}${hint}`;
+  const security = data.security_scan?.findings?.length ? `\n${compactSecurityScanText(data.security_scan)}` : "";
+  return `${header}${warnings ? `\n${warnings}` : ""}${security}\n${data.text}${hint}`;
 }
 
 export function compactQueryCodebaseText(data: {
   query: string;
   matches: SymbolRow[];
   development_warnings?: CompactDevelopmentWarning[];
+  security_scan?: CompactSecurityScan;
 }): string {
   const lines = [`query_codebase matches=${data.matches.length} q="${oneLine(data.query, 100)}"`];
   lines.push(...compactDevelopmentWarningsText(data.development_warnings ?? []));
+  if (data.security_scan?.findings?.length) lines.push(compactSecurityScanText(data.security_scan));
   for (const m of data.matches.slice(0, 50)) {
     lines.push(`${m.file_path}: ${m.type} ${m.name}${m.signature ? ` — ${oneLine(m.signature, 160)}` : ""}`);
   }
@@ -414,9 +440,12 @@ export function compactPreflightOperationScopeText(data: {
   current_constraints: CompactCurrentConstraint[];
   warnings: CompactOperationScopeWarning[];
   recommended_action: string;
+  enforcement_mode?: string;
+  host_enforcement_required?: boolean;
+  security_override_applied?: boolean;
 }): string {
   const lines = [
-    `preflight_operation_scope ok=${data.ok} safe_to_proceed=${data.safe_to_proceed} advisory_only=${data.advisory_only === true} operation="${oneLine(data.operation, 80)}" commands=${data.planned_commands.length} files=${data.planned_files.length} targets=${data.planned_targets.length}`,
+    `preflight_operation_scope ok=${data.ok} safe_to_proceed=${data.safe_to_proceed} advisory_only=${data.advisory_only === true} enforcement=${data.enforcement_mode ?? "unknown"} host_enforcement_required=${data.host_enforcement_required === true} security_override_applied=${data.security_override_applied === true} operation="${oneLine(data.operation, 80)}" commands=${data.planned_commands.length} files=${data.planned_files.length} targets=${data.planned_targets.length}`,
     `action: ${oneLine(data.recommended_action, 200)}`,
   ];
   if (data.current_constraints.length) {
@@ -530,6 +559,7 @@ export function compactBootstrapText(data: {
     recent_changes: Array<CompactChangeLogPreview>;
   }>;
   semantic?: CompactSemanticSearchResult | null;
+  security_scan?: CompactSecurityScan;
 }): string {
   const lines: string[] = [];
   lines.push(
@@ -580,6 +610,7 @@ export function compactBootstrapText(data: {
     lines.push("pending 0");
   }
   lines.push(...compactDevelopmentWarningsText(data.development_warnings ?? []));
+  if (data.security_scan?.findings?.length) lines.push(compactSecurityScanText(data.security_scan));
   lines.push(...compactQualitySignalsText(data.quality_signals));
   if (data.items.length) {
     lines.push("requirements:");

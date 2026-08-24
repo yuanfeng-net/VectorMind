@@ -69,7 +69,12 @@ export async function handlePreflightOperationScope(
     targets: args.targets,
     script_hints: args.script_hints,
   };
-  const result = evaluateOperationScope(plan, allCurrentConstraints);
+  const result = evaluateOperationScope(plan, allCurrentConstraints, {
+    acknowledged: args.security_acknowledged,
+    reason: args.security_override_reason,
+    allowed_hosts: args.security_allowed_hosts,
+    authorization_token: args.security_authorization_token,
+  });
   const operationQuery = [
     args.operation,
     args.intent,
@@ -97,6 +102,7 @@ export async function handlePreflightOperationScope(
   });
 
   return {
+    isError: !result.ok,
     content: [
       {
         type: "text",
