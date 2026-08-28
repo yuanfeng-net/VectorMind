@@ -72,6 +72,8 @@ import {
   SERVER_NAME,
   SERVER_VERSION,
 } from "./config.js";
+import { canonicalProjectRootKey, readEnvironmentDeploymentTarget, type ConfiguredSshTarget } from "./secure-ssh.js";
+import { scheduleAdminProjectRegistration, startAdminPanelIfEnabled } from "./admin-launcher.js";
 
 
 
@@ -82,6 +84,8 @@ let rootSource: RootSource = "cwd";
 let projectRoot = "";
 let dbPath = "";
 let pendingProjectContextAdvisory: ProjectContextAdvisory | null = null;
+let configuredDeploymentTarget: ConfiguredSshTarget | undefined;
+const configuredDeploymentTargetSnapshots = new Map<string, ConfiguredSshTarget | null>();
 
 configureActivityLogProjectRoot(() => projectRoot);
 
@@ -317,6 +321,19 @@ async function initializeIfNeeded(forced?: { root: string; source: RootSource })
   const resolved = forced ?? (await resolveProjectRoot());
   projectRoot = resolved.root;
   rootSource = resolved.source;
+  const deploymentTargetKey = canonicalProjectRootKey(projectRoot);
+  const environmentDeploymentTarget = readEnvironmentDeploymentTarget();
+  if (!configuredDeploymentTargetSnapshots.has(deploymentTargetKey)) {
+    // Repository files are model/repository-controlled input, so server.txt is
+    // only a preparation source and never an initial trust root.
+    configuredDeploymentTargetSnapshots.set(deploymentTargetKey, environmentDeploymentTarget ?? null);
+  }
+  // An explicit host environment registration may be added after startup and
+  // safely replaces an initial null snapshot without trusting a new repo file.
+  if (environmentDeploymentTarget && configuredDeploymentTargetSnapshots.get(deploymentTargetKey) == null) {
+    configuredDeploymentTargetSnapshots.set(deploymentTargetKey, environmentDeploymentTarget);
+  }
+  configuredDeploymentTarget = configuredDeploymentTargetSnapshots.get(deploymentTargetKey) ?? undefined;
 
   try {
     fs.mkdirSync(projectRoot, { recursive: true });
@@ -335,6 +352,7 @@ async function initializeIfNeeded(forced?: { root: string; source: RootSource })
       initWatcher();
     }
     initialized = true;
+    scheduleAdminProjectRegistration(projectRoot);
     console.error(
       `[vectormind] project_root=${projectRoot} source=${rootSource} db=${dbPath} watcher=${watcher ? "on" : "off"}`,
     );
@@ -348,6 +366,7 @@ async function initializeIfNeeded(forced?: { root: string; source: RootSource })
     } catch {}
     // reset for retry
     initialized = false;
+    configuredDeploymentTarget = undefined;
     throw err;
   }
 }
@@ -388,6 +407,7 @@ async function switchProjectRootIfNeeded(next: { root: string; source: RootSourc
   }
 
   initialized = false;
+  configuredDeploymentTarget = undefined;
   initializationPromise = null;
   await ensureInitialized(next);
   if (previousProjectRoot && path.resolve(previousProjectRoot) !== path.resolve(projectRoot)) {
@@ -443,6 +463,11 @@ registerToolHandlers(server, {
   consumeProjectContextAdvisory,
   getDb: () => db,
   getProjectRoot: () => projectRoot,
+  getConfiguredDeploymentTarget: () => {
+    const hasEnvironmentTarget = !!process.env.VECTORMIND_DEPLOYMENT_HOST?.trim();
+    const target = hasEnvironmentTarget ? readEnvironmentDeploymentTarget() : configuredDeploymentTarget;
+    return target ? { ...target } : undefined;
+  },
   getRootSource: () => rootSource,
   getDbPath: () => dbPath,
   isWatcherEnabled: () => !!watcher,
@@ -459,6 +484,10 @@ registerToolHandlers(server, {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
+const adminLaunch = startAdminPanelIfEnabled();
+if (!adminLaunch.started && !["disabled", "missing_entry"].includes(adminLaunch.reason)) {
+  console.error(`[vectormind] admin panel auto-start failed (${adminLaunch.reason})`);
+}
 
 async function shutdown(signal: string): Promise<void> {
   try {

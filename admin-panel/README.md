@@ -6,6 +6,16 @@
 
 ## 启动
 
+通过 npm 包配置 `vector-mind` MCP 后，生产面板会自动在后台启动，默认打开：
+
+```text
+http://127.0.0.1:16860
+```
+
+需要关闭自动启动时设置 `VECTORMIND_ADMIN_AUTO_START=false`。也可以使用全局命令 `vector-mind-admin` 手动启动并查看启动错误。
+
+面板加载项目列表时会自动只读同步 Codex 桌面端 `$CODEX_HOME/.codex-global-state.json` 的 `local-projects`，并遵循 Codex 的 `project-order`。同步不会修改 Codex 状态文件；无效或已经不存在的项目路径会被跳过。
+
 ```bash
 cd ..
 npm install

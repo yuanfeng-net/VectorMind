@@ -1,7 +1,7 @@
 import type { MemoryItemRow, RequirementRow } from "./types.js";
 import { isHiddenFromDefaultRecall, metadataStatus, toMemoryItemPreview } from "./memory-recall.js";
 import { oneLine } from "./tool-output.js";
-import { scanOperationPlanSecurity, type SecurityOverride } from "./security-signals.js";
+import { scanOperationPlanSecurity, type SecurityTargetPolicy } from "./security-signals.js";
 
 export type CurrentConstraint = {
   id: number;
@@ -46,6 +46,7 @@ export type OperationScopeResult = {
   enforcement_mode: "preflight_blocker";
   host_enforcement_required: true;
   security_override_applied: boolean;
+  trusted_deployment_target_applied: boolean;
   does_not_control_model_reasoning: true;
   does_not_control_host_runtime: true;
   does_not_replace_model_judgment: true;
@@ -313,8 +314,11 @@ function explicitConflictScore(planText: string, deniedText: string): number {
 }
 
 function rowPriority(row: MemoryItemRow, source: CurrentConstraint["source"]): number {
-  if (source === "current_decision") return 100;
+  // Persisted memory is written through model-generated MCP arguments. Until
+  // the host supplies authenticated user-message provenance, it may guide
+  // recall but must not outrank the current user request or block work.
   if (source === "active_requirement") return 80;
+  if (source === "current_decision") return 75;
   if (source === "convention") return 70;
   return 35;
 }
@@ -413,7 +417,7 @@ function classifyConstraintConflict(plan: OperationPlanInput, constraint: Curren
   const score = Math.max(naturalScore, concreteScore);
   return {
     code: "operation_constraint_conflict",
-    severity: constraint.source === "current_decision" || constraint.source === "active_requirement" ? "blocker" : "warning",
+    severity: "warning",
     message:
       "The planned operation appears related to a current constraint that contains a deny/avoid/no-longer rule. Re-check the plan against the current user requirement before running commands.",
     evidence: [{
@@ -445,7 +449,7 @@ function classifyStaleDefaultConflict(plan: OperationPlanInput, constraint: Curr
   if (score < 4) return null;
   return {
     code: "stale_default_conflict",
-    severity: constraint.source === "current_decision" ? "blocker" : "warning",
+    severity: "warning",
     message:
       "A script/default/fallback mentioned in the operation overlaps with a newer current constraint. Treat repository defaults as possibly stale until aligned with the current decision or requirement.",
     evidence: [{
@@ -462,11 +466,12 @@ function classifyStaleDefaultConflict(plan: OperationPlanInput, constraint: Curr
 export function evaluateOperationScope(
   plan: OperationPlanInput,
   currentConstraints: CurrentConstraint[],
-  securityOverride?: SecurityOverride,
+  _unsupportedSecurityOverride?: undefined,
+  securityTargetPolicy?: SecurityTargetPolicy,
 ): OperationScopeResult {
   const text = operationText(plan);
   const warnings: OperationScopeWarning[] = [];
-  const security = scanOperationPlanSecurity(plan, securityOverride);
+  const security = scanOperationPlanSecurity(plan, undefined, securityTargetPolicy);
   for (const finding of security.findings) {
     warnings.push({
       code: "security_risk_detected",
@@ -522,6 +527,7 @@ export function evaluateOperationScope(
     enforcement_mode: "preflight_blocker",
     host_enforcement_required: true,
     security_override_applied: security.security_override_applied === true,
+    trusted_deployment_target_applied: security.trusted_deployment_target_applied === true,
     does_not_control_model_reasoning: true,
     does_not_control_host_runtime: true,
     does_not_replace_model_judgment: true,

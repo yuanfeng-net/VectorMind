@@ -551,6 +551,18 @@ h3 {
   color: var(--text-muted);
 }
 
+.project-source {
+  justify-self: start;
+  padding: 2px 5px;
+  border: 1px solid color-mix(in oklch, var(--red) 24%, var(--line));
+  border-radius: 4px;
+  color: var(--red);
+  background: color-mix(in oklch, var(--red-soft) 48%, var(--surface));
+  font-size: 0.68rem;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
 .project-count {
   min-width: 28px;
   height: 28px;

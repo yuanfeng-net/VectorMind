@@ -9,6 +9,8 @@ import { toolCompactOrJson } from "../token-savings.js";
 import { flushPendingChangeBuffer } from "../file-indexing.js";
 import { logActivity } from "../activity-log.js";
 import { focusedTextIsRelevant, isObviouslyCorruptedText } from "../context-governance.js";
+import { defaultSshConfigurationTargetsHost, listPreparedSshTargets } from "../secure-ssh.js";
+import { defaultSshValidationArguments, isPlainOpenSshTransport, operationNeedsDefaultSshValidation } from "../security-signals.js";
 
 function memoryForRequirement(context: ToolHandlerContext, req: RequirementRow): MemoryItemRow | undefined {
   const { getRequirementMemoryItemIdStmt, getMemoryItemByIdStmt } = context.getStatements();
@@ -69,11 +71,23 @@ export async function handlePreflightOperationScope(
     targets: args.targets,
     script_hints: args.script_hints,
   };
-  const result = evaluateOperationScope(plan, allCurrentConstraints, {
-    acknowledged: args.security_acknowledged,
-    reason: args.security_override_reason,
-    allowed_hosts: args.security_allowed_hosts,
-    authorization_token: args.security_authorization_token,
+  const configuredDeploymentHost = context.getConfiguredDeploymentTarget()?.host;
+  const defaultSshValidationArgs = defaultSshValidationArguments(plan);
+  const defaultSshConfigMatchesHost = configuredDeploymentHost
+    && operationNeedsDefaultSshValidation(plan)
+    && defaultSshValidationArgs.length > 0
+    && defaultSshValidationArgs.length <= 4
+    ? defaultSshValidationArgs.every((sshArgs) =>
+      defaultSshConfigurationTargetsHost(configuredDeploymentHost, sshArgs),
+    )
+    : false;
+  const rsyncEnvironmentTransportSafe = !process.env.RSYNC_RSH
+    || isPlainOpenSshTransport(process.env.RSYNC_RSH);
+  const result = evaluateOperationScope(plan, allCurrentConstraints, undefined, {
+    configured_deployment_host: configuredDeploymentHost,
+    prepared_ssh_targets: listPreparedSshTargets(context.getProjectRoot()),
+    default_ssh_config_matches_host: defaultSshConfigMatchesHost,
+    rsync_environment_transport_safe: rsyncEnvironmentTransportSafe,
   });
   const operationQuery = [
     args.operation,
@@ -97,6 +111,7 @@ export async function handlePreflightOperationScope(
     operation: args.operation,
     warnings: result.warnings.length,
     blockers: result.warnings.filter((w) => w.severity === "blocker").length,
+    trusted_deployment_target_applied: result.trusted_deployment_target_applied,
     constraints_checked: allCurrentConstraints.length,
     constraints_returned: result.current_constraints.length,
   });

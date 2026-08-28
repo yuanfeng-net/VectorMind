@@ -15,6 +15,7 @@ type CompactSecurityScan = {
   untrusted_content?: boolean;
   advisory_only?: boolean;
   security_override_applied?: boolean;
+  trusted_deployment_target_applied?: boolean;
   findings?: Array<{ code: string; severity: string; evidence?: string }>;
   coverage?: string;
   complete?: boolean;
@@ -23,7 +24,7 @@ type CompactSecurityScan = {
 
 function compactSecurityScanText(scan: CompactSecurityScan): string {
   const files = scan.scanned_files == null ? "" : ` files=${scan.scanned_files}`;
-  return `security scan risk=${scan.risk_level} advisory_only=${scan.advisory_only === true} override=${scan.security_override_applied === true} coverage=${scan.coverage ?? "unknown"} complete=${scan.complete !== false}${files} findings=${(scan.findings ?? []).map((f) => `${f.severity}:${f.code}`).join(",")}`;
+  return `security scan risk=${scan.risk_level} advisory_only=${scan.advisory_only === true} override=${scan.security_override_applied === true} trusted_deployment_target=${scan.trusted_deployment_target_applied === true} coverage=${scan.coverage ?? "unknown"} complete=${scan.complete !== false}${files} findings=${(scan.findings ?? []).map((f) => `${f.severity}:${f.code}`).join(",")}`;
 }
 
 type CompactChangeMode = string;
@@ -443,9 +444,10 @@ export function compactPreflightOperationScopeText(data: {
   enforcement_mode?: string;
   host_enforcement_required?: boolean;
   security_override_applied?: boolean;
+  trusted_deployment_target_applied?: boolean;
 }): string {
   const lines = [
-    `preflight_operation_scope ok=${data.ok} safe_to_proceed=${data.safe_to_proceed} advisory_only=${data.advisory_only === true} enforcement=${data.enforcement_mode ?? "unknown"} host_enforcement_required=${data.host_enforcement_required === true} security_override_applied=${data.security_override_applied === true} operation="${oneLine(data.operation, 80)}" commands=${data.planned_commands.length} files=${data.planned_files.length} targets=${data.planned_targets.length}`,
+    `preflight_operation_scope ok=${data.ok} safe_to_proceed=${data.safe_to_proceed} advisory_only=${data.advisory_only === true} enforcement=${data.enforcement_mode ?? "unknown"} host_enforcement_required=${data.host_enforcement_required === true} security_override_applied=${data.security_override_applied === true} trusted_deployment_target=${data.trusted_deployment_target_applied === true} operation="${oneLine(data.operation, 80)}" commands=${data.planned_commands.length} files=${data.planned_files.length} targets=${data.planned_targets.length}`,
     `action: ${oneLine(data.recommended_action, 200)}`,
   ];
   if (data.current_constraints.length) {

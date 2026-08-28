@@ -1,0 +1,136 @@
+VectorMind Source-Available License 1.0
+
+Copyright (c) 2025-2026 the VectorMind Licensor, publishing as
+yuanfeng-net. All rights reserved.
+
+1. Definitions
+
+"Licensor" means the individual or legal entity that owns the applicable
+copyright in VectorMind, publishes it under the identifier "yuanfeng-net", and
+controls the official source repository and npm package identified in NOTICE.
+
+"Software" means the VectorMind source code, object code, documentation, and
+other original materials distributed with this license. Software excludes
+Outputs and Third-Party Materials.
+
+"You" means the individual or legal entity exercising permissions under this
+license.
+
+"Authorized Users" means Your employees, officers, Affiliates, contractors,
+and infrastructure or service providers who access the Software solely on Your
+behalf for Your internal use and are bound by confidentiality and use
+restrictions at least as protective as this license. "Affiliate" means an
+entity that controls, is controlled by, or is under common control with You.
+
+"Outputs" means notes, memories, reports, scan results, code, documentation,
+and other work product created by You through use of the Software. Outputs do
+not include the Software itself, modifications to the Software, or copied or
+substantial portions of the Software.
+
+"Third-Party Materials" means software or other materials whose copyright is
+owned by a third party and that are distributed with, used by, or referenced
+by the Software.
+
+2. Limited License Grant
+
+Subject to this license, the Licensor grants You a non-exclusive,
+non-transferable license, irrevocable except as provided in Section 7, to:
+
+a. download, reproduce, install, and run the Software for personal use or
+   internal use within Your organization;
+b. allow Authorized Users to access the Software for that internal use,
+   including through private development systems, cloud infrastructure,
+   continuous-integration systems, virtual machines, and containers;
+c. make and internally deploy private modifications for Your own personal or
+   internal use; and
+d. make reasonable backup, cache, and internal deployment copies.
+
+You are responsible for Authorized Users' compliance with this license.
+Internal commercial use is permitted. No ownership rights are transferred.
+All rights not expressly granted are reserved by the Licensor.
+
+3. Outputs and Independent Work
+
+As between You and the Licensor, You retain all rights You may have in Outputs
+and independent work created using the Software. The Licensor claims no
+copyright or license rights in those Outputs merely because the Software was
+used to create or process them. You may use, modify, distribute, license, sell,
+or deliver Outputs for any lawful purpose, including professional and client
+work, provided the Outputs do not contain the Software or a substantial portion
+of it.
+
+4. Restrictions
+
+Unless You first obtain separate written permission from the Licensor, You may
+not:
+
+a. publicly publish, distribute, sublicense, sell, rent, transfer, mirror, or
+   otherwise make the Software or any substantial portion of it available to a
+   third party, whether in source or object form;
+b. publicly publish or distribute a modified, translated, derived, repackaged,
+   renamed, or rebranded version of the Software;
+c. upload or publish the Software or a derivative of it as a package, release,
+   downloadable archive, container image, repository mirror, marketplace
+   listing, or hosted product;
+d. provide the Software or its substantial functionality to third parties as a
+   standalone product or hosted service, whether paid or unpaid;
+e. remove, hide, alter, or replace copyright notices, license terms, author
+   attribution, provenance information, or links identifying the official
+   project;
+f. claim or imply that You created, own, maintain, or officially represent the
+   Software or the VectorMind project; or
+g. use the VectorMind name, logo, package names, or other project identifiers
+   except for truthful identification of the unmodified official Software.
+
+Using the Software internally to create independent work or perform
+professional services is permitted when the client or other third party does
+not receive, access, or operate the Software or its substantial functionality.
+
+A repository host may technically reproduce or display the Software as needed
+to operate its standard viewing and forking features. Such platform operation
+does not grant You permission to publish a renamed or modified release,
+redistribute the Software outside those features, or represent a fork as an
+original or official product.
+
+5. Redistribution and Additional Licensing
+
+Public redistribution, inclusion in another distributed product, operation as
+a third-party service, OEM use, resale, and other rights not granted above
+require a separate written license from the Licensor. Instructions for
+requesting additional rights are provided in LICENSING.md. A request or public
+discussion is not permission by itself.
+
+6. Notices and Third-Party Materials
+
+Every permitted copy must retain this license and the NOTICE file. Third-Party
+Materials remain subject exclusively to their respective license terms. This
+license does not claim ownership of, replace, restrict, or reduce rights granted
+directly by a third-party license.
+
+7. Termination
+
+Your rights under this license terminate automatically upon a material breach.
+Except for intentional public redistribution, rebranding, false authorship, or
+repeat breach, Your rights are automatically reinstated if You cure the breach
+within 30 days after discovering it. Any other reinstatement requires written
+confirmation from the Licensor. Upon an uncured termination, You must stop
+using the Software and delete all copies under Your control, except copies that
+must be retained by law.
+
+8. Disclaimer of Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT.
+
+9. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE LICENSOR WILL NOT BE LIABLE FOR ANY
+CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM OR RELATED TO THE SOFTWARE OR
+ITS USE, WHETHER IN CONTRACT, TORT, OR OTHERWISE.
+
+10. Entire License
+
+This license states the complete permissions granted for the Software unless a
+separate written agreement authorized by the Licensor applies. If any term is
+unenforceable, the remaining terms continue in effect.

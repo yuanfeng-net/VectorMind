@@ -402,7 +402,7 @@ export async function handleStartRequirement(
         null,
         null,
         id,
-        safeJson({ status: "active", goal_key: goalKey, scope_contract, requirement_items }),
+        safeJson({ source: "assistant_generated", status: "active", goal_key: goalKey, scope_contract, requirement_items }),
         sha256Hex(content),
       );
       return {

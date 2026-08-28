@@ -12,10 +12,12 @@ import Database from "better-sqlite3";
 
 import { ADMIN_TOKEN_HEADER, createAdminSecurityPolicy, evaluateAdminRequest } from "./security.mjs";
 import { atomicWriteTextFile, projectPathIdentity } from "./storage.mjs";
+import { readCodexLocalProjects, syncCodexProjectRecords } from "./codex-projects.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT_DIR = path.resolve(__dirname, "..");
+const PACKAGE_ROOT = path.resolve(ROOT_DIR, "..");
 const CLIENT_DIR = path.join(ROOT_DIR, "client");
 const DIST_DIR = path.join(ROOT_DIR, "dist", "client");
 
@@ -29,7 +31,7 @@ const ADMIN_SECURITY = createAdminSecurityPolicy({
 const ADMIN_TOKEN = ADMIN_SECURITY.token;
 const STORAGE_DIR = path.join(os.homedir(), ".vectormind-admin");
 const INDEX_FILE = path.join(STORAGE_DIR, "projects.json");
-const CURRENT_PROJECT_ROOT = path.resolve(ROOT_DIR, "..");
+const CURRENT_PROJECT_ROOT = path.resolve(process.env.VECTORMIND_ADMIN_PROJECT_ROOT?.trim() || process.cwd());
 
 const SKIP_SCAN_DIRS = new Set([
   ".git",
@@ -784,6 +786,38 @@ function boundedInteger(value, fallback, min, max) {
   return Number.isFinite(parsed) ? Math.max(min, Math.min(Math.trunc(parsed), max)) : fallback;
 }
 
+function syncCodexProjectsIntoIndex() {
+  const discovered = readCodexLocalProjects();
+  if (!discovered.available || discovered.error) {
+    return {
+      available: discovered.available,
+      statePath: discovered.statePath,
+      imported: 0,
+      skipped: discovered.skipped,
+      added: 0,
+      updated: 0,
+      removed: 0,
+      error: discovered.error,
+    };
+  }
+  const index = readIndex();
+  const synced = syncCodexProjectRecords(index.projects, discovered.projects);
+  if (synced.changed) {
+    index.projects = synced.projects;
+    writeIndex(index);
+  }
+  return {
+    available: true,
+    statePath: discovered.statePath,
+    imported: discovered.projects.length,
+    skipped: discovered.skipped,
+    added: synced.added,
+    updated: synced.updated,
+    removed: synced.removed,
+    error: null,
+  };
+}
+
 async function discoverMemoryProjects(rootPath, options = {}) {
   const root = realDirectoryPath(rootPath);
   const maxDepth = boundedInteger(options.maxDepth, 5, 1, 12);
@@ -1137,7 +1171,7 @@ async function repairProjectMemory(project) {
 
   const before = readMemoryAudit(project);
   const backupPath = await backupSqliteDatabase(dbPath);
-  const runtimePath = path.join(CURRENT_PROJECT_ROOT, "dist", "database-runtime.js");
+  const runtimePath = path.join(PACKAGE_ROOT, "dist", "database-runtime.js");
   if (!fs.existsSync(runtimePath)) {
     const error = new Error("核心修复模块尚未构建，请先运行 npm run build");
     error.status = 500;
@@ -1233,6 +1267,7 @@ app.get("/api/health", (_req, res) => {
 
 app.get("/api/projects", (_req, res) => {
   try {
+    const codexSync = syncCodexProjectsIntoIndex();
     addCurrentProjectIfEmpty();
     const index = readIndex();
     res.json({
@@ -1242,6 +1277,7 @@ app.get("/api/projects", (_req, res) => {
         file: INDEX_FILE,
         updatedAt: index.updatedAt,
       },
+      codexSync,
       projects: index.projects.map(summarizeProject),
     });
   } catch (err) {
@@ -1416,9 +1452,17 @@ ensureStorage();
 await attachFrontend();
 
 const server = app.listen(PORT, HOST, () => {
-  console.log(`VectorMind 管理面板运行中: http://${HOST}:${PORT}`);
-  console.log(`认证模式: ${ADMIN_SECURITY.mode === "automatic" ? "回环自动会话" : "显式令牌"}`);
-  console.log(`项目索引文件: ${INDEX_FILE}`);
+  if (!process.argv.includes("--auto-started")) {
+    console.log(`VectorMind 管理面板运行中: http://${HOST}:${PORT}`);
+    console.log(`认证模式: ${ADMIN_SECURITY.mode === "automatic" ? "回环自动会话" : "显式令牌"}`);
+    console.log(`项目索引文件: ${INDEX_FILE}`);
+  }
+});
+
+server.on("error", (error) => {
+  if (error?.code === "EADDRINUSE" && process.argv.includes("--auto-started")) return;
+  console.error(`VectorMind 管理面板启动失败: ${error?.message ?? String(error)}`);
+  process.exitCode = 1;
 });
 
 globalThis.__vectormindAdminServer = server;

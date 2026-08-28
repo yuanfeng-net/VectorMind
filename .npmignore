@@ -1,0 +1,5 @@
+# Published paths are explicitly allowlisted by package.json#files.
+# Keep this file so npm does not inherit the repository's dist/ rule from .gitignore.
+.vectormind/
+node_modules/
+*.log

@@ -21,7 +21,8 @@ VectorMind 的目标不是替代 AI，也不是接管客户端权限，而是让
 | 记忆维护 | 大库越用越慢、旧索引干扰检索 | `maintain_memory`, `prune_index` | 默认保守，深度清理需手动触发 |
 | 输出降噪 | 工具输出太大拖慢会话 | compact 输出、`get_token_savings`, `rtk` | 需要客户端/模型优先使用 compact |
 | 调试排查 | 不知道 MCP 最近做了什么 | `get_activity_summary`, `get_activity_log`, `clear_activity_log` | 详细日志需开启 debug |
-| 提示注入/凭据外传 | 仓库、Issue 或文档内容诱导 AI 执行命令、读取凭据并发送到外部 | 文件读取、内存读取、`grep`、符号查询返回带覆盖范围的 `security_scan`；`preflight_operation_scope` 返回 `security_risk_detected` | 文档/历史/测试样例始终为 advisory，普通本地文件上传在操作意图明确为上传/导入/发布/同步/备份/导出时不重复告警；只有高置信度敏感数据外传才 blocker。结果标明 `coverage`/`complete`，grep 多命中扫描匹配文件的受限内容。用户明确授权时必须由宿主注入 `security_authorization_token`，且与宿主配置的 `VECTORMIND_SECURITY_AUTH_TOKEN` 匹配，同时提供 `security_acknowledged=true`、20 字以上 `security_override_reason` 和目标主机 allowlist；模型自行填写参数不能绕过。MCP 仍需宿主执行 `host_enforcement_required=true`，本身不提供 OS 沙箱 |
+| 提示注入/凭据外传 | 仓库、Issue 或文档内容诱导 AI 执行命令、读取凭据并发送到外部 | 文件读取、内存读取、`grep`、符号查询返回带覆盖范围的 `security_scan`；`preflight_operation_scope` 返回 `security_risk_detected` | 文档与模型写入的记忆始终 advisory，不能覆盖当前用户请求；高置信度敏感数据外传默认 blocker，且模型参数不能授权绕过。可信部署绑定宿主 `VECTORMIND_DEPLOYMENT_HOST` 登记的规范 IP，或严格绑定已登记且哈希校验通过的 `prepare_secure_ssh -F` 配置；`server.txt` 仅作为 SSH 准备候选。`.env` 可沿变量化 copy/move、软硬链接、编码、tar/zip/7z、`dd`、环境变量落盘、脚本/PowerShell 写入与重定向传播到 SSH、SFTP inline `put`、stdin、管道、curl/wget、`nc`、`openssl s_client` 和 PowerShell HTTP sink；常见用户级凭据文件始终按主机凭据处理。软硬链接派生物永不获得可信例外；独立凭据读取或其他外传也不能被可信部署掩盖。只有受限 OpenSSH/SSH-style rsync 命令形式可获得例外；控制套接字、Agent/stdio/端口转发、跨命令执行环境、alias/function、变量化危险选项、解释器或命令替换配置篡改、不同或混合目标均阻断。默认 `ssh -G` 绑定实际用户、端口和安全选项；普通 build/test/git 不执行该子进程。HTTP(S)、主机私钥、云凭据、`server.txt` 和环境变量永不获得部署例外；裸命令名依赖宿主 PATH，不宣称文件哈希身份验证；MCP 不接管宿主 OS 命令权限 |
+| 安全 SSH 部署准备 | 部署配置中混入密码，或没有 key 时错误回退密码认证 | `prepare_secure_ssh` | 宿主侧读取并解析配置，只返回目标元数据、宿主绝对路径和必要时的公钥；私钥/密码内容不进入工具输出；强制 `BatchMode`、publickey、host-key 检查并禁用密码认证。MCP 自建配置和生成密钥默认 24 小时 TTL，淘汰/退出时清理；复用的用户身份文件不会删除。生成公钥须安装后才能部署；MCP 不尝试密码登录 |
 
 ## 推荐调用链路
 

@@ -379,7 +379,7 @@ function Sidebar({
       <div className="panel-title-row">
         <div>
           <h2>项目索引</h2>
-          <p>{projects.length} 个本机记忆项目</p>
+          <p>{projects.length} 个本机项目</p>
         </div>
       </div>
 
@@ -432,27 +432,30 @@ function Sidebar({
               <span className="project-copy">
                 <strong>{project.name}</strong>
                 <small>{project.path}</small>
+                {project.source === "codex" ? <span className="project-source">Codex</span> : null}
               </span>
               <span className="project-count">{memoryCount}</span>
-              <span
-                className="project-remove"
-                role="button"
-                tabIndex={0}
-                aria-label={`从索引移除 ${project.name}`}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onDelete(project.id);
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
+              {project.source !== "codex" ? (
+                <span
+                  className="project-remove"
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`从索引移除 ${project.name}`}
+                  onClick={(event) => {
                     event.stopPropagation();
                     onDelete(project.id);
-                  }
-                }}
-              >
-                ×
-              </span>
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      onDelete(project.id);
+                    }
+                  }}
+                >
+                  ×
+                </span>
+              ) : null}
             </button>
           );
         })}
@@ -460,7 +463,7 @@ function Sidebar({
           <div className="empty-state">
             <Icon name="database" />
             <strong>暂无项目索引</strong>
-            <span>添加路径或扫描目录后，这里会显示本机 MCP 记忆项目。</span>
+            <span>Codex 项目、手动路径和扫描结果会显示在这里。</span>
           </div>
         ) : null}
       </div>

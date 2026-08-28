@@ -13,6 +13,7 @@ import { handleGetActivityLog, handleGetActivitySummary, handleClearActivityLog,
 import { handleCreateCheckpoint, handleListCheckpoints, handleMemoryTimeline, handleRestoreCheckpointContext } from "./tool-handlers/context-recovery.js";
 import { handleAnalyzeMemoryConflicts, handleCompareCheckpointContext, handleMemoryQualityReport } from "./tool-handlers/memory-diagnostics.js";
 import { handlePreflightOperationScope } from "./tool-handlers/operations.js";
+import { handlePrepareSecureSsh } from "./tool-handlers/secure-ssh.js";
 import { runAutoMaintenanceIfDue, withAutoMaintenanceSuppressed } from "./memory-maintenance/runner.js";
 import { isToolReadOnly } from "./tool-catalog.js";
 import { oneLine, toolJson } from "./tool-output.js";
@@ -26,6 +27,7 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
   maintain_memory: handleMaintainMemory,
   preflight_change_scope: handlePreflightChangeScope,
   preflight_operation_scope: handlePreflightOperationScope,
+  prepare_secure_ssh: handlePrepareSecureSsh,
   plan_large_file_split: handlePlanLargeFileSplit,
   record_large_file_split: handleRecordLargeFileSplit,
   sync_change_intent: handleSyncChangeIntent,

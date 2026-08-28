@@ -146,12 +146,19 @@ export const PreflightOperationScopeArgsSchema = ProjectRootArgSchema.merge(Outp
     files: z.array(z.string().min(1)).optional(),
     targets: z.array(z.string().min(1)).optional(),
     script_hints: z.array(z.string().min(1)).optional(),
-    security_acknowledged: z.boolean().optional().default(false),
-    security_override_reason: z.string().min(20).max(1000).optional(),
-    security_allowed_hosts: z.array(z.string().min(1).max(253)).max(50).optional(),
-    security_authorization_token: z.string().min(16).max(4096).optional(),
     constraints_limit: z.number().int().min(1).max(50).optional().default(12),
     preview_chars: z.number().int().min(50).max(10_000).optional().default(180),
+  }),
+);
+
+export const PrepareSecureSshArgsSchema = ProjectRootArgSchema.merge(OutputFormatSchema).merge(
+  z.object({
+    config_path: PathArgSchema.optional().default("server.txt"),
+    host: z.string().min(1).max(253).optional(),
+    user: z.string().min(1).max(128).optional(),
+    port: z.number().int().min(1).max(65535).optional(),
+    identity_file: PathArgSchema.optional(),
+    generate_key: z.boolean().optional().default(true),
   }),
 );
 

@@ -56,7 +56,7 @@ export async function handleAddNote(
     null,
     null,
     null,
-    safeJson({ tags: args.tags ?? [] }),
+    safeJson({ source: "assistant_generated", tags: args.tags ?? [] }),
     sha256Hex(content),
   );
   const id = Number(info.lastInsertRowid);
@@ -92,6 +92,7 @@ export async function handleUpsertDecision(
   const title = sanitizedTitle.text;
   const content = sanitizedContent.text;
   const meta = {
+    source: "assistant_generated",
     status: "current",
     key,
     title,
@@ -195,7 +196,7 @@ export async function handleUpsertConvention(
   const sanitized = sanitizePersistentMemoryText(args.content.trim());
   const content = sanitized.text;
   const contentHash = sha256Hex(content);
-  const meta = safeJson({ tags: args.tags ?? [] });
+  const meta = safeJson({ source: "assistant_generated", tags: args.tags ?? [] });
   const existing = getConventionByKeyStmt.get(key) as MemoryItemRow | undefined;
   if (existing) {
     updateConventionByIdStmt.run(content, meta, contentHash, existing.id);

@@ -39,10 +39,11 @@ function operationConstraint() {
 
 function assertOperationConflict(plan, expectedSource) {
   const result = evaluateOperationScope(plan, [operationConstraint()]);
-  assert.equal(result.ok, false);
-  assert.equal(result.safe_to_proceed, false);
+  assert.equal(result.ok, true);
+  assert.equal(result.safe_to_proceed, true);
   const conflict = result.warnings.find((warning) => warning.code === "operation_constraint_conflict");
   assert.ok(conflict, "expected an operation_constraint_conflict warning");
+  assert.equal(conflict.severity, "warning");
   assert.ok(conflict.details?.conflict_sources?.includes(expectedSource));
 }
 

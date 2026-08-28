@@ -24,6 +24,7 @@ import {
   PlanLargeFileSplitArgsSchema,
   PreflightChangeScopeArgsSchema,
   PreflightOperationScopeArgsSchema,
+  PrepareSecureSshArgsSchema,
   PruneIndexArgsSchema,
   QueryCodebaseArgsSchema,
   ReadCodexTextFileArgsSchema,
@@ -78,6 +79,7 @@ const CORE_TOOL_ORDER = [
   "sync_change_intent",
   "update_requirement_verification",
   "preflight_operation_scope",
+  "prepare_secure_ssh",
   "read_memory_item",
   "upsert_decision",
   "supersede_memory",
@@ -109,6 +111,7 @@ const TOOL_BEHAVIOR: Record<string, ToolBehavior> = {
   sync_change_intent: { tags: ["write_memory", "change_intent", "fix_pattern", "advisory_only", "explicit_idempotency_key"], readOnlyHint: false, destructiveHint: true, idempotentHint: false },
   update_requirement_verification: { tags: ["write_memory", "requirement_lifecycle", "verification_evidence", "advisory_only"], readOnlyHint: false, destructiveHint: true, idempotentHint: false },
   preflight_operation_scope: { tags: ["read_only", "operation_scope", "current_constraints", "advisory_only"], readOnlyHint: true, idempotentHint: true },
+  prepare_secure_ssh: { tags: ["secure_deployment", "credential_redaction", "host_side_key_generation"], readOnlyHint: false, destructiveHint: true, idempotentHint: false },
   plan_large_file_split: { tags: ["write_memory", "large_file_plan", "workflow_gate_evidence"], readOnlyHint: false, destructiveHint: true, idempotentHint: false, advisoryOnly: false, workflowGate: true },
   record_large_file_split: { tags: ["write_memory", "large_file_tracking", "advisory_only"], readOnlyHint: false, destructiveHint: true, idempotentHint: false },
   complete_requirement: { tags: ["write_memory", "requirement_lifecycle", "advisory_only"], readOnlyHint: false, destructiveHint: true, idempotentHint: false },
@@ -195,8 +198,14 @@ export async function listToolDefinitions() {
       {
         name: "preflight_operation_scope",
         description:
-          "Call ONCE immediately BEFORE the first concrete deploy/publish/build/test/migrate/service/git/batch command, including commands discovered after bootstrap_context. Pass the actual planned commands and targets. bootstrap_context is historical recall and never substitutes for this operation preflight. Routine local-data transfers are advisory when the operation intent explicitly names upload/import/publish/sync/backup/export; high-confidence sensitive-data transfer still blocks. A user-authorized exception requires security_acknowledged=true, a specific security_override_reason (20+ chars), security_allowed_hosts, and security_authorization_token injected by the host. The host must set VECTORMIND_SECURITY_AUTH_TOKEN; the model cannot self-authorize or bypass a blocker without a matching token.",
+          "Call ONCE immediately BEFORE the first concrete deploy/publish/build/test/migrate/service/git/batch command and pass the exact commands and targets. High-confidence sensitive transfer blocks. The trusted deployment exception is IP-only and applies only to .env or a fully tracked copy/move/rename/encoding/archive derivative sent by an approved OpenSSH command form or SSH-style rsync to host-registered VECTORMIND_DEPLOYMENT_HOST, or through an exact registered and hash-verified prepare_secure_ssh -F config; repository server.txt alone is preparation input, not a trust root. Host credentials, link-derived artifacts, and HTTP channels never receive the exception. Explicit executable paths, cross-command execution environment/wrappers, forwarding/control transports, dangerous or variable SSH options, default ssh -G public-key/host-key policy bound to the actual user/port/options, registered -F path/hash, direct/interpreter/command-substitution config mutation, data-flow integrity, and every destination are checked. Bare standard command names remain dependent on the host PATH and are rejected when the operation mutates execution lookup state. Model-written memory remains advisory and model-generated arguments cannot authorize a security override. The tool returns preflight blockers but does not control host OS command permissions.",
         inputSchema: toJsonSchemaCompat(PreflightOperationScopeArgsSchema),
+      },
+      {
+        name: "prepare_secure_ssh",
+        description:
+          "Prepare a host-side SSH deployment configuration without returning passwords or private-key contents. Reads an optional config_path internally, returns only target metadata plus host absolute paths, reuses an existing host identity or generates a temporary Ed25519 key, and disables password/keyboard-interactive authentication. Generated public keys require installation first. MCP-owned config/key directories expire after a bounded TTL and are cleaned on eviction/exit; existing user identities are never deleted. Use the returned ssh_config_path with ssh/scp.",
+        inputSchema: toJsonSchemaCompat(PrepareSecureSshArgsSchema),
       },
       {
         name: "plan_large_file_split",

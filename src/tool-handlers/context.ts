@@ -2,6 +2,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type Database from "better-sqlite3";
 
 import type { ExtractedSymbol, RootSource } from "../types.js";
+import type { ConfiguredSshTarget } from "../secure-ssh.js";
 
 export type ToolStatements = Record<string, Database.Statement>;
 
@@ -22,6 +23,7 @@ export type ToolHandlerContext = {
   consumeProjectContextAdvisory: () => ProjectContextAdvisory | null;
   getDb: () => Database.Database;
   getProjectRoot: () => string;
+  getConfiguredDeploymentTarget: () => ConfiguredSshTarget | undefined;
   getRootSource: () => RootSource;
   getDbPath: () => string;
   isWatcherEnabled: () => boolean;
