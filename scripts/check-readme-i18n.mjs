@@ -4,8 +4,8 @@ import path from "node:path";
 
 const packageJson = JSON.parse(fs.readFileSync("package.json", "utf8"));
 const languages = [
-  { label: "简体中文", file: "README.md" },
-  { label: "English", file: "README.en.md" },
+  { label: "简体中文", file: "README.zh-CN.md" },
+  { label: "English", file: "README.md" },
   { label: "日本語", file: "README.ja.md" },
   { label: "한국어", file: "README.ko.md" },
   { label: "繁體中文", file: "README.zh-TW.md" },
@@ -73,8 +73,11 @@ for (const { file } of languages) {
   verifyLocalLinks(file, text);
 }
 
-for (const { file } of languages.slice(1)) {
+for (const { file } of languages) {
+  if (file === "README.md") continue;
   assert.equal(packageJson.files?.includes(file), true, `${file} must be included in the npm package`);
 }
+
+assert.equal(packageJson.files?.includes("README.en.md"), true, "README.en.md compatibility entry must be included in the npm package");
 
 console.log("README language checks: ok");

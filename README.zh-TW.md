@@ -1,4 +1,4 @@
-[简体中文](README.md) | [English](README.en.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | **繁體中文**
+[简体中文](README.zh-CN.md) | [English](README.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | **繁體中文**
 
 # VectorMind MCP
 
